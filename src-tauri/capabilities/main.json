@@ -1,0 +1,11 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main-local-service",
+  "description": "只允许本机投资札记页面调用桌面命令。",
+  "windows": ["main"],
+  "remote": {
+    "urls": ["http://127.0.0.1:*"]
+  },
+  "platforms": ["macOS", "windows", "linux"],
+  "permissions": ["core:default", "allow-save-export", "opener:default"]
+}

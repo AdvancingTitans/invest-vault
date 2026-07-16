@@ -1,0 +1,32 @@
+{
+  "symbol": "600519",
+  "market": "a",
+  "trade_date": "20260711",
+  "quote": {
+    "value": 1500.0,
+    "currency": "CNY",
+    "period": "20260711",
+    "source": "tencent-kline",
+    "source_type": "market_quote"
+  },
+  "financial_facts": [
+    {
+      "metric": "revenue",
+      "period": "20260331",
+      "value": 50600000000,
+      "currency": "CNY",
+      "source": "eastmoney_datacenter",
+      "source_type": "structured_public_disclosure"
+    }
+  ],
+  "modules": {
+    "C2": {"available": true, "gaps": []},
+    "C4": {"available": false, "gaps": ["retention evidence is not structured"]}
+  },
+  "_meta": {
+    "source_events": [
+      {"source": "tencent-kline", "status": "ok"},
+      {"source": "eastmoney_datacenter", "status": "ok"}
+    ]
+  }
+}

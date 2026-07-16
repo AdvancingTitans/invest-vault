@@ -1,0 +1,25 @@
+# 桌面端打包
+
+“投资札记”把 FastAPI/SQLite 服务打包为目标平台原生的 PyInstaller sidecar。Tauri 为每次启动分配独立回环端口，并通过一次性令牌和 API 协议校验服务身份；退出应用时停止该服务。用户无需安装 Python 或其他源码项目。
+
+## Local macOS build
+
+```bash
+cd apps/invest-vault
+npm ci --prefix web
+npm run build --prefix web
+uv run --extra dev --with pyinstaller python scripts/build_sidecar.py
+npx --yes @tauri-apps/cli@latest build --bundles app
+codesign --force --deep --sign - \
+  "src-tauri/target/release/bundle/macos/投资札记.app"
+hdiutil create -volname "投资札记" \
+  -srcfolder "src-tauri/target/release/bundle/macos/投资札记.app" \
+  -ov -format UDZO \
+  "src-tauri/target/release/bundle/dmg/投资札记_0.1.9_aarch64.dmg"
+```
+
+The `hdiutil` step intentionally creates a plain DMG. It avoids Finder/AppleScript automation and is suitable for an unsigned local build. Public distribution still requires Apple signing and notarization.
+
+## Windows build
+
+Run `.github/workflows/invest-vault-desktop.yml` on a Windows runner. It builds the sidecar on Windows and then lets Tauri produce NSIS `.exe` and MSI installers. Do not copy a macOS sidecar into a Windows package or claim acceptance before install/launch/upgrade/restore has run on Windows.

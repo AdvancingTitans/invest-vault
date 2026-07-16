@@ -1,0 +1,1 @@
+{"main-local-service":{"identifier":"main-local-service","description":"只允许本机投资札记页面调用桌面命令。","remote":{"urls":["http://127.0.0.1:*"]},"local":true,"windows":["main"],"permissions":["core:default","allow-save-export","opener:default"],"platforms":["macOS","windows","linux"]}}

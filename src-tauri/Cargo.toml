@@ -1,0 +1,14 @@
+[package]
+name = "invest-vault"
+version = "0.1.9"
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-single-instance = "2"
+tauri-plugin-shell = "2"
+tauri-plugin-opener = "2"
+rfd = "0.15"

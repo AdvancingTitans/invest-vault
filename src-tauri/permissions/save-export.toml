@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-save-export"
+description = "允许本机投资札记页面打开原生另存为窗口。"
+commands.allow = ["save_export"]

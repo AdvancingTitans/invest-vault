@@ -1,0 +1,95 @@
+name: Desktop packages
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  macos-package:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install and test
+        run: uv sync --extra dev && uv run pytest -q
+      - name: Build web assets
+        run: npm ci --prefix web && npm run build --prefix web
+      - name: Build target-native sidecar
+        run: uv run --extra dev --with pyinstaller python scripts/build_sidecar.py
+      - name: Build and ad-hoc sign macOS app
+        run: |
+          npx --yes @tauri-apps/cli@latest build --bundles app
+          codesign --force --deep --sign - "src-tauri/target/release/bundle/macos/投资札记.app"
+          codesign --verify --deep --strict "src-tauri/target/release/bundle/macos/投资札记.app"
+      - name: Create DMG and checksum
+        run: |
+          VERSION=$(uv version --short)
+          ARCH=$(uname -m)
+          mkdir -p src-tauri/target/release/bundle/dmg
+          hdiutil create -volname "投资札记" -srcfolder "src-tauri/target/release/bundle/macos/投资札记.app" -ov -format UDZO "src-tauri/target/release/bundle/dmg/投资札记_${VERSION}_${ARCH}.dmg"
+          hdiutil verify "src-tauri/target/release/bundle/dmg/投资札记_${VERSION}_${ARCH}.dmg"
+          cd src-tauri/target/release/bundle/dmg
+          shasum -a 256 *.dmg > SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: invest-vault-macos
+          path: |
+            src-tauri/target/release/bundle/dmg/*.dmg
+            src-tauri/target/release/bundle/dmg/SHA256SUMS.txt
+          if-no-files-found: error
+
+  windows-package:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - run: uv sync --extra dev && uv run pytest -q
+      - run: npm ci --prefix web && npm run build --prefix web
+      - run: uv run --extra dev --with pyinstaller python scripts/build_sidecar.py
+      - run: npx --yes @tauri-apps/cli@latest build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: invest-vault-windows-unverified
+          path: |
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/msi/*.msi
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [macos-package]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: invest-vault-macos
+          path: release
+      - name: Publish verified macOS assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release create "${GITHUB_REF_NAME}" --title "投资札记 ${GITHUB_REF_NAME}" --notes "macOS 包使用 ad-hoc 签名，未经过 Apple 公证。安装前请核对 SHA256SUMS.txt，并按 README 的‘隐私与安全性 → 仍要打开’步骤授权。Windows 构建尚未完成真机验收，因此不随本次 Release 发布。"
+          fi
+          gh release upload "${GITHUB_REF_NAME}" release/* --clobber

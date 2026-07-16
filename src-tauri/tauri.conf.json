@@ -1,0 +1,13 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "投资札记",
+  "version": "0.1.9",
+  "identifier": "com.investvault.notebook",
+  "build": { "frontendDist": "../web/dist", "beforeBuildCommand": "cd ../web && npm run build" },
+  "app": { "windows": [] },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "externalBin": ["binaries/invest-vault-service"]
+  }
+}

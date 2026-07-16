@@ -1,0 +1,10 @@
+{
+  "symbol": "600519",
+  "market": "a",
+  "price": 1500.0,
+  "currency": "CNY",
+  "trade_date": "20260711",
+  "source": "tencent-kline",
+  "source_chain": ["tencent-kline"],
+  "quality_flags": []
+}
