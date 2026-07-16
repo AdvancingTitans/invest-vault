@@ -53,6 +53,8 @@ jobs:
           if-no-files-found: error
 
   windows-package:
+    # Windows 安装包尚未完成真机验收；保留预构建反馈，但不得阻塞 macOS 发布。
+    continue-on-error: true
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
