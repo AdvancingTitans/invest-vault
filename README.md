@@ -17,7 +17,7 @@
 
 | 平台 | 文件 | 状态 |
 |---|---|---|
-| macOS Apple Silicon（M1/M2/M3/M4） | `投资札记_0.1.9_aarch64.dmg` | 已完成本机启动、退出和数据保存验证 |
+| macOS Apple Silicon（M1/M2/M3/M4） | `Invest-Vault_0.1.9_aarch64.dmg` | 已完成本机启动、退出和数据保存验证 |
 | macOS Intel | 暂无 | 尚未构建原生 x86_64 sidecar |
 | Windows | 暂无正式公开包 | 工作流可构建，但仍需 Windows 真机验收 |
 
@@ -26,13 +26,13 @@
 0.1.9 的 SHA-256：
 
 ```text
-30eceb93b953d4a05f02ee8005c178799ddc3d1f25da0a637b25a27878898d2e  投资札记_0.1.9_aarch64.dmg
+30eceb93b953d4a05f02ee8005c178799ddc3d1f25da0a637b25a27878898d2e  Invest-Vault_0.1.9_aarch64.dmg
 ```
 
 在“终端”中执行：
 
 ```bash
-shasum -a 256 ~/Downloads/投资札记_0.1.9_aarch64.dmg
+shasum -a 256 ~/Downloads/Invest-Vault_0.1.9_aarch64.dmg
 ```
 
 只有输出与上面的值完全一致时才继续安装。SHA-256 用于确认下载文件与本项目发布的文件一致，但它不能替代 Apple 公证或恶意软件检测。

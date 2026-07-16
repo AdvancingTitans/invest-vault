@@ -39,8 +39,8 @@ jobs:
           VERSION=$(uv version --short)
           ARCH=$(uname -m)
           mkdir -p src-tauri/target/release/bundle/dmg
-          hdiutil create -volname "投资札记" -srcfolder "src-tauri/target/release/bundle/macos/投资札记.app" -ov -format UDZO "src-tauri/target/release/bundle/dmg/投资札记_${VERSION}_${ARCH}.dmg"
-          hdiutil verify "src-tauri/target/release/bundle/dmg/投资札记_${VERSION}_${ARCH}.dmg"
+          hdiutil create -volname "投资札记" -srcfolder "src-tauri/target/release/bundle/macos/投资札记.app" -ov -format UDZO "src-tauri/target/release/bundle/dmg/Invest-Vault_${VERSION}_${ARCH}.dmg"
+          hdiutil verify "src-tauri/target/release/bundle/dmg/Invest-Vault_${VERSION}_${ARCH}.dmg"
           cd src-tauri/target/release/bundle/dmg
           shasum -a 256 *.dmg > SHA256SUMS.txt
       - uses: actions/upload-artifact@v4
