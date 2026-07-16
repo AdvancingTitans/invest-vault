@@ -13,9 +13,8 @@ jobs:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
-        with:
-          enable-cache: true
+      - name: Install uv
+        run: python3 -m pip install uv==0.9.26
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -55,9 +54,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
-        with:
-          enable-cache: true
+      - name: Install uv
+        run: python -m pip install uv==0.9.26
       - uses: actions/setup-node@v4
         with:
           node-version: 22
