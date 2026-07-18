@@ -10,6 +10,10 @@ from pathlib import Path
 
 def main() -> None:
     root = Path(__file__).parents[1]
+    npm = shutil.which("npm")
+    if not npm:
+        raise RuntimeError("npm is required to build the bundled Web UI before freezing the sidecar")
+    subprocess.run([npm, "run", "build"], cwd=root / "web", check=True)
     subprocess.run(
         [sys.executable, "-m", "PyInstaller", "--clean", "--noconfirm", "sidecar.spec"],
         cwd=root,

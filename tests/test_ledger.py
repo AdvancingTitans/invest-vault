@@ -123,7 +123,7 @@ def test_entry_validates_timestamp_and_record_shape() -> None:
         _entry(security_id="", kind="trade")
 
 
-def test_holding_corrections_and_deletions_are_append_only(tmp_path: Path) -> None:
+def test_holding_corrections_remain_revisioned_but_deletion_is_permanent(tmp_path: Path) -> None:
     with Vault(tmp_path / "vault.sqlite3") as vault:
         original = HoldingRecord("record-1", "CN:SSE:600519:STOCK", "a_share", "10000", "2026-07-09", holding_id="holding-1")
         vault.import_holdings([original])
@@ -132,4 +132,30 @@ def test_holding_corrections_and_deletions_are_append_only(tmp_path: Path) -> No
         assert vault.connection.execute("SELECT COUNT(*) FROM holding_records").fetchone()[0] == 2
         vault.delete_holding("holding-1")
         assert vault.holding_entries() == []
-        assert vault.connection.execute("SELECT COUNT(*) FROM holding_records").fetchone()[0] == 3
+        assert vault.connection.execute("SELECT COUNT(*) FROM holding_records").fetchone()[0] == 0
+
+
+def test_permanent_delete_migration_purges_legacy_holding_tombstones(tmp_path: Path) -> None:
+    database = tmp_path / "vault.sqlite3"
+    with Vault(database) as vault:
+        vault.import_holdings(
+            [
+                HoldingRecord("record-1", "CN:SSE:600519:STOCK", "a_share", "10000", "2026-07-09", holding_id="holding-1"),
+                HoldingRecord(
+                    "record-2",
+                    "CN:SSE:600519:STOCK",
+                    "a_share",
+                    "10000",
+                    "2026-07-09",
+                    holding_id="holding-1",
+                    revision_number=2,
+                    is_deleted=True,
+                ),
+            ]
+        )
+        vault.connection.execute("DELETE FROM schema_migrations WHERE version = 11")
+        vault.connection.commit()
+
+    with Vault(database) as migrated:
+        assert migrated.connection.execute("SELECT COUNT(*) FROM holding_records").fetchone()[0] == 0
+        assert migrated.connection.execute("SELECT 1 FROM schema_migrations WHERE version = 11").fetchone()

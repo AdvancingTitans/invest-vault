@@ -95,7 +95,7 @@ class ResearchStore:
             raise
         return revision
 
-    def add_note(self, *, security_id: str, body: str) -> str:
+    def add_note(self, *, security_id: str, body: str, commit: bool = True) -> str:
         if not body.strip():
             raise ValueError("note body cannot be empty")
         note_id, created_at = str(uuid4()), _now()
@@ -103,7 +103,8 @@ class ResearchStore:
             "INSERT INTO notes VALUES (?, ?, ?, ?)", (note_id, security_id, body.strip(), created_at)
         )
         self._timeline(security_id, "note", note_id, created_at, "已添加研究笔记")
-        self.vault.connection.commit()
+        if commit:
+            self.vault.connection.commit()
         return note_id
 
     def revise_note(self, note_id: str, *, security_id: str, body: str) -> str:
@@ -131,16 +132,36 @@ class ResearchStore:
 
     def delete_note(self, note_id: str) -> None:
         current = self._current_note(note_id)
-        if current is None or int(current["is_deleted"]):
+        if current is None:
             raise ValueError("笔记不存在或已删除")
-        revision_number = int(current["revision_number"]) + 1
-        revision_id, created_at = str(uuid4()), _now()
-        self.vault.connection.execute(
-            "INSERT INTO note_revisions VALUES (?, ?, ?, ?, 1, ?)",
-            (revision_id, note_id, revision_number, str(current["body"]), created_at),
-        )
-        self._timeline(str(current["security_id"]), "note_deleted", revision_id, created_at, "研究笔记已删除")
-        self.vault.connection.commit()
+        attachment_paths = [
+            Path(str(row["storage_path"]))
+            for row in self.vault.connection.execute(
+                "SELECT storage_path FROM attachments WHERE note_id = ?", (note_id,)
+            )
+        ]
+        connection = self.vault.connection
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            connection.execute("DELETE FROM ai_quick_notes WHERE accepted_note_id = ?", (note_id,))
+            connection.execute("DELETE FROM attachments WHERE note_id = ?", (note_id,))
+            connection.execute("DELETE FROM note_material_refs WHERE note_id = ?", (note_id,))
+            connection.execute(
+                """DELETE FROM timeline_events WHERE reference_id = ? OR reference_id IN
+                (SELECT revision_id FROM note_revisions WHERE note_id = ?)""",
+                (note_id, note_id),
+            )
+            connection.execute("DELETE FROM note_revisions WHERE note_id = ?", (note_id,))
+            connection.execute("DELETE FROM notes WHERE note_id = ?", (note_id,))
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        for path in attachment_paths:
+            if connection.execute(
+                "SELECT 1 FROM attachments WHERE storage_path = ? LIMIT 1", (str(path),)
+            ).fetchone() is None:
+                path.unlink(missing_ok=True)
 
     def _current_note(self, note_id: str):
         return self.vault.connection.execute(
@@ -161,13 +182,22 @@ class ResearchStore:
         ).fetchone()
         if row is None:
             raise ValueError("投资观点不存在")
-        created_at, event_id = _now(), str(uuid4())
-        self.vault.connection.execute(
-            "INSERT INTO thesis_status_events VALUES (?, ?, 1, ?)",
-            (event_id, thesis_id, created_at),
-        )
-        self._timeline(str(row["security_id"]), "thesis_deleted", event_id, created_at, "投资观点已删除")
-        self.vault.connection.commit()
+        connection = self.vault.connection
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            connection.execute(
+                """DELETE FROM timeline_events WHERE reference_id IN
+                (SELECT revision_id FROM thesis_revisions WHERE thesis_id = ?)
+                OR reference_id IN (SELECT event_id FROM thesis_status_events WHERE thesis_id = ?)""",
+                (thesis_id, thesis_id),
+            )
+            connection.execute("DELETE FROM thesis_status_events WHERE thesis_id = ?", (thesis_id,))
+            connection.execute("DELETE FROM thesis_revisions WHERE thesis_id = ?", (thesis_id,))
+            connection.execute("DELETE FROM theses WHERE thesis_id = ?", (thesis_id,))
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
 
     def add_material(
         self,

@@ -24,7 +24,7 @@ System UI sans: `ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", s
 
 ## Layout
 
-Desktop is a three-rail workbench: 208px navigation, flexible holding workspace, and a 248px daily-task rail above 1280px. Below 1280px the task rail is removed from the reading path; below 960px navigation collapses to a horizontally scrollable top row. Tables retain their columns through horizontal scrolling instead of becoming card lists.
+Desktop uses a 176px navigation rail and a flexible evidence workspace. Daily archive provenance sits in a compact in-flow rail instead of a separate task column, keeping the primary reading path wide and stable. Security evidence and the research assistant stack below 1184px; below 960px navigation becomes a horizontally scrollable top row. Tables retain their columns through horizontal scrolling instead of becoming card lists.
 
 ## Components
 

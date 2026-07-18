@@ -2,13 +2,16 @@
 
 from PyInstaller.utils.hooks import collect_submodules
 
-hiddenimports = collect_submodules("uvicorn")
+hiddenimports = collect_submodules("uvicorn") + collect_submodules("stock_analysis")
 
 a = Analysis(
     ["sidecar_entry.py"],
     pathex=["src"],
     binaries=[],
-    datas=[("web/dist", "web/dist")],
+    datas=[
+        ("web/dist", "web/dist"),
+        ("skills/stock-analysis", "skills/stock-analysis"),
+    ],
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},

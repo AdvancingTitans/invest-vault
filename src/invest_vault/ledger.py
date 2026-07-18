@@ -151,6 +151,12 @@ class Vault:
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (portfolio_id) REFERENCES portfolios(portfolio_id)
             );
+            CREATE TABLE IF NOT EXISTS portfolio_preferences (
+                portfolio_id TEXT PRIMARY KEY,
+                max_drawdown_percent TEXT,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (portfolio_id) REFERENCES portfolios(portfolio_id)
+            );
             CREATE TABLE IF NOT EXISTS securities (
                 security_id TEXT PRIMARY KEY,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -183,9 +189,6 @@ class Vault:
             ON holding_records(security_id, bought_on, record_id);
             CREATE TRIGGER IF NOT EXISTS holding_records_no_update
             BEFORE UPDATE ON holding_records
-            BEGIN SELECT RAISE(ABORT, 'holding_records is append-only'); END;
-            CREATE TRIGGER IF NOT EXISTS holding_records_no_delete
-            BEFORE DELETE ON holding_records
             BEGIN SELECT RAISE(ABORT, 'holding_records is append-only'); END;
             CREATE TRIGGER IF NOT EXISTS ledger_entries_no_update
             BEFORE UPDATE ON ledger_entries
@@ -382,6 +385,61 @@ class Vault:
                 observed_at TEXT NOT NULL,
                 UNIQUE(security_id, cutoff_date)
             );
+            CREATE TABLE IF NOT EXISTS ai_quick_notes (
+                draft_id TEXT PRIMARY KEY,
+                security_id TEXT NOT NULL,
+                raw_text TEXT NOT NULL,
+                draft_json TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('draft', 'accepted', 'discarded')),
+                accepted_note_id TEXT,
+                created_at TEXT NOT NULL,
+                accepted_at TEXT,
+                FOREIGN KEY (accepted_note_id) REFERENCES notes(note_id)
+            );
+            CREATE INDEX IF NOT EXISTS ai_quick_notes_security_created
+            ON ai_quick_notes(security_id, created_at DESC);
+            CREATE TABLE IF NOT EXISTS ai_provider_settings (
+                provider_id TEXT PRIMARY KEY, provider_type TEXT NOT NULL, enabled INTEGER NOT NULL,
+                model_config_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS research_threads (
+                thread_id TEXT PRIMARY KEY, thread_type TEXT NOT NULL, title TEXT NOT NULL,
+                security_id TEXT, portfolio_id TEXT, provider_type TEXT NOT NULL,
+                provider_thread_ref TEXT, role_id TEXT NOT NULL, status TEXT NOT NULL,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS research_threads_security_updated
+            ON research_threads(security_id, updated_at DESC);
+            CREATE TABLE IF NOT EXISTS research_runs (
+                run_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, workflow_version TEXT NOT NULL,
+                status TEXT NOT NULL, current_stage TEXT NOT NULL, user_request_json TEXT NOT NULL,
+                plan_json TEXT, started_at TEXT NOT NULL, completed_at TEXT, failure_json TEXT,
+                FOREIGN KEY (thread_id) REFERENCES research_threads(thread_id)
+            );
+            CREATE TABLE IF NOT EXISTS research_events (
+                event_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, run_id TEXT,
+                sequence_number INTEGER NOT NULL, event_type TEXT NOT NULL, actor_type TEXT NOT NULL,
+                actor_id TEXT, payload_json TEXT NOT NULL, created_at TEXT NOT NULL,
+                UNIQUE(thread_id, sequence_number),
+                FOREIGN KEY (thread_id) REFERENCES research_threads(thread_id)
+            );
+            CREATE TABLE IF NOT EXISTS research_tasks (
+                task_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, parent_task_id TEXT,
+                assigned_role TEXT NOT NULL, task_type TEXT NOT NULL, input_json TEXT NOT NULL,
+                output_json TEXT, status TEXT NOT NULL, attempt INTEGER NOT NULL,
+                started_at TEXT, completed_at TEXT,
+                FOREIGN KEY (run_id) REFERENCES research_runs(run_id)
+            );
+            CREATE TABLE IF NOT EXISTS research_evidence_links (
+                run_id TEXT NOT NULL, task_id TEXT, evidence_id TEXT NOT NULL, relation TEXT NOT NULL,
+                PRIMARY KEY(run_id, task_id, evidence_id, relation)
+            );
+            CREATE TABLE IF NOT EXISTS research_reports (
+                report_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, version INTEGER NOT NULL,
+                report_json TEXT NOT NULL, rendered_markdown TEXT NOT NULL,
+                frozen_at TEXT, created_at TEXT NOT NULL,
+                UNIQUE(run_id, version), FOREIGN KEY (run_id) REFERENCES research_runs(run_id)
+            );
             """
         )
         columns = {str(row["name"]) for row in self.connection.execute("PRAGMA table_info(holding_records)")}
@@ -395,6 +453,8 @@ class Vault:
         self.connection.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS holding_records_revision ON holding_records(holding_id, revision_number)"
         )
+        # Holding corrections remain revisioned, but an explicit user delete is permanent.
+        self.connection.execute("DROP TRIGGER IF EXISTS holding_records_no_delete")
         self.connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (1)")
         self.connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (2)")
         self.connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (3)")
@@ -402,7 +462,115 @@ class Vault:
         self.connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (5)")
         self.connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (6)")
         self.connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (7)")
+        self.connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (8)")
+        self.connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (9)")
+        self.connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (10)")
+        if self.connection.execute(
+            "SELECT 1 FROM schema_migrations WHERE version = 11"
+        ).fetchone() is None:
+            self._purge_legacy_deleted_records()
+            self.connection.execute("INSERT INTO schema_migrations(version) VALUES (11)")
         self.connection.commit()
+
+    def _purge_legacy_deleted_records(self) -> None:
+        """Remove tombstones created before explicit deletion became permanent."""
+        connection = self.connection
+        attachment_paths = [
+            Path(str(row["storage_path"]))
+            for row in connection.execute(
+                """SELECT a.storage_path FROM attachments a WHERE a.note_id IN (
+                SELECT n.note_id FROM notes n JOIN note_revisions r ON r.revision_id = (
+                    SELECT revision_id FROM note_revisions WHERE note_id = n.note_id
+                    ORDER BY revision_number DESC LIMIT 1
+                ) WHERE r.is_deleted = 1)"""
+            )
+        ]
+        deleted_notes = [
+            str(row["note_id"])
+            for row in connection.execute(
+                """SELECT n.note_id FROM notes n JOIN note_revisions r ON r.revision_id = (
+                SELECT revision_id FROM note_revisions WHERE note_id = n.note_id
+                ORDER BY revision_number DESC LIMIT 1
+                ) WHERE r.is_deleted = 1"""
+            )
+        ]
+        for note_id in deleted_notes:
+            connection.execute("DELETE FROM ai_quick_notes WHERE accepted_note_id = ?", (note_id,))
+            connection.execute("DELETE FROM attachments WHERE note_id = ?", (note_id,))
+            connection.execute("DELETE FROM note_material_refs WHERE note_id = ?", (note_id,))
+            connection.execute(
+                """DELETE FROM timeline_events WHERE reference_id = ? OR reference_id IN
+                (SELECT revision_id FROM note_revisions WHERE note_id = ?)""",
+                (note_id, note_id),
+            )
+            connection.execute("DELETE FROM note_revisions WHERE note_id = ?", (note_id,))
+            connection.execute("DELETE FROM notes WHERE note_id = ?", (note_id,))
+
+        deleted_theses = [
+            str(row["thesis_id"])
+            for row in connection.execute(
+                """SELECT t.thesis_id FROM theses t JOIN thesis_status_events s ON s.event_id = (
+                SELECT event_id FROM thesis_status_events WHERE thesis_id = t.thesis_id
+                ORDER BY created_at DESC LIMIT 1
+                ) WHERE s.is_deleted = 1"""
+            )
+        ]
+        for thesis_id in deleted_theses:
+            connection.execute(
+                """DELETE FROM timeline_events WHERE reference_id IN
+                (SELECT revision_id FROM thesis_revisions WHERE thesis_id = ?)
+                OR reference_id IN (SELECT event_id FROM thesis_status_events WHERE thesis_id = ?)""",
+                (thesis_id, thesis_id),
+            )
+            connection.execute("DELETE FROM thesis_status_events WHERE thesis_id = ?", (thesis_id,))
+            connection.execute("DELETE FROM thesis_revisions WHERE thesis_id = ?", (thesis_id,))
+            connection.execute("DELETE FROM theses WHERE thesis_id = ?", (thesis_id,))
+
+        deleted_holdings = [
+            str(row["logical_id"])
+            for row in connection.execute(
+                """SELECT COALESCE(h.holding_id, h.record_id) AS logical_id
+                FROM holding_records h JOIN (
+                    SELECT COALESCE(holding_id, record_id) AS logical_id,
+                    MAX(revision_number) AS latest_revision
+                    FROM holding_records GROUP BY COALESCE(holding_id, record_id)
+                ) latest ON COALESCE(h.holding_id, h.record_id) = latest.logical_id
+                AND h.revision_number = latest.latest_revision WHERE h.is_deleted = 1"""
+            )
+        ]
+        for holding_id in deleted_holdings:
+            connection.execute(
+                "DELETE FROM holding_records WHERE COALESCE(holding_id, record_id) = ?",
+                (holding_id,),
+            )
+
+        archived_threads = [
+            str(row["thread_id"])
+            for row in connection.execute("SELECT thread_id FROM research_threads WHERE status = 'archived'")
+        ]
+        for thread_id in archived_threads:
+            connection.execute(
+                "DELETE FROM research_reports WHERE run_id IN (SELECT run_id FROM research_runs WHERE thread_id = ?)",
+                (thread_id,),
+            )
+            connection.execute(
+                "DELETE FROM research_evidence_links WHERE run_id IN (SELECT run_id FROM research_runs WHERE thread_id = ?)",
+                (thread_id,),
+            )
+            connection.execute(
+                "DELETE FROM research_tasks WHERE run_id IN (SELECT run_id FROM research_runs WHERE thread_id = ?)",
+                (thread_id,),
+            )
+            connection.execute("DELETE FROM research_events WHERE thread_id = ?", (thread_id,))
+            connection.execute("DELETE FROM research_runs WHERE thread_id = ?", (thread_id,))
+            connection.execute("DELETE FROM research_threads WHERE thread_id = ?", (thread_id,))
+
+        connection.commit()
+        for path in attachment_paths:
+            if connection.execute(
+                "SELECT 1 FROM attachments WHERE storage_path = ? LIMIT 1", (str(path),)
+            ).fetchone() is None:
+                path.unlink(missing_ok=True)
 
     def append(self, entry: LedgerEntry) -> bool:
         """Append an entry; repeat imports skip only an exactly identical record."""
@@ -519,24 +687,14 @@ class Vault:
         return self._holding_dict(corrected)
 
     def delete_holding(self, holding_id: str) -> None:
-        current = self._latest_holding_row(holding_id)
-        if current is None or int(current["is_deleted"]):
-            raise ValueError("持仓记录不存在或已删除")
-        revision = int(current["revision_number"]) + 1
-        self.import_holdings(
-            [
-                HoldingRecord(
-                    record_id=f"{holding_id}-r{revision}-{uuid4()}",
-                    security_id=str(current["security_id"]),
-                    asset_type=str(current["asset_type"]),
-                    invested_amount_cny=str(current["invested_amount_cny"]),
-                    bought_on=str(current["bought_on"]),
-                    holding_id=holding_id,
-                    revision_number=revision,
-                    is_deleted=True,
-                )
-            ]
+        cursor = self.connection.execute(
+            "DELETE FROM holding_records WHERE COALESCE(holding_id, record_id) = ?",
+            (holding_id,),
         )
+        if cursor.rowcount == 0:
+            self.connection.rollback()
+            raise ValueError("持仓记录不存在或已删除")
+        self.connection.commit()
 
     def _latest_holding_row(self, holding_id: str) -> sqlite3.Row | None:
         return self.connection.execute(
@@ -634,6 +792,58 @@ class Vault:
             currency = row["currency"]
             balances[currency] = balances.get(currency, Decimal("0")) + Decimal(row["cash_amount"])
         return {currency: self._decimal_text(amount) for currency, amount in sorted(balances.items())}
+
+    def portfolio_profile(self) -> dict[str, str | None]:
+        cash = sum(
+            (Decimal(amount) for row in self.connection.execute("SELECT account_id FROM accounts")
+             for currency, amount in self.project_cash(str(row["account_id"])).items() if currency == "CNY"),
+            Decimal("0"),
+        )
+        preference = self.connection.execute(
+            "SELECT max_drawdown_percent FROM portfolio_preferences WHERE portfolio_id = 'default'"
+        ).fetchone()
+        return {
+            "cash_balance_cny": self._decimal_text(cash),
+            "max_drawdown_percent": str(preference["max_drawdown_percent"]) if preference else None,
+        }
+
+    def set_portfolio_profile(
+        self, *, cash_balance_cny: str, max_drawdown_percent: str
+    ) -> dict[str, str | None]:
+        try:
+            cash = Decimal(cash_balance_cny)
+            threshold = Decimal(max_drawdown_percent)
+        except (InvalidOperation, ValueError) as error:
+            raise ValueError("现金余额和最大可承受回撤必须是数字") from error
+        if cash < 0:
+            raise ValueError("现金余额不能小于0")
+        if threshold <= 0 or threshold > 100:
+            raise ValueError("最大可承受回撤必须大于0且不超过100%")
+        current = Decimal(str(self.portfolio_profile()["cash_balance_cny"] or "0"))
+        delta = cash - current
+        if delta:
+            event_id = str(uuid4())
+            self.append(LedgerEntry(
+                record_id=f"cash-profile-{event_id}",
+                idempotency_key=f"cash-profile:{event_id}",
+                kind="cash",
+                account_id="manual-cash",
+                security_id="",
+                occurred_at=datetime.now().astimezone().isoformat(),
+                quantity="0",
+                cash_amount=self._decimal_text(delta),
+                currency="CNY",
+                action="set_cash_balance_adjustment",
+            ))
+        self.connection.execute("INSERT OR IGNORE INTO portfolios(portfolio_id) VALUES ('default')")
+        self.connection.execute(
+            "INSERT INTO portfolio_preferences VALUES ('default', ?, ?) "
+            "ON CONFLICT(portfolio_id) DO UPDATE SET max_drawdown_percent = excluded.max_drawdown_percent, "
+            "updated_at = excluded.updated_at",
+            (self._decimal_text(threshold), datetime.now().astimezone().isoformat()),
+        )
+        self.connection.commit()
+        return self.portfolio_profile()
 
     def _import(self, entries: Iterable[LedgerEntry]) -> dict[str, int]:
         inserted = skipped = 0

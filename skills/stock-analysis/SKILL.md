@@ -1,0 +1,400 @@
+---
+name: stock-analysis
+description: 全球股市深度复盘技能。用于 A股、港股、美股、基金的当前行情、盘前/盘中/盘后复盘、6 模块证据驱动分析、trading 入口持仓分析、默认 committee 投委会、内置投资专家 lens、单股速览、基金画像、精选资讯雷达、缺失指标补充和数据源诊断；执行腾讯/新浪优先、东财独有数据限流、证据质量评分和浏览器接管策略。
+metadata:
+  version: "4.12.0"
+  author: "Hermes Agent + yjw"
+  platforms: "linux, macos, windows"
+---
+
+# 全球股市深度复盘
+
+先取数、校验交易日和字段完整性，再形成判断。所有强弱结论必须能回到成交额、放量倍数、资金流、涨跌家数或指数比较。
+
+## 执行入口
+
+```bash
+uv run python -m stock_analysis --market daily
+uv run python -m stock_analysis --market daily --format full
+uv run python -m stock_analysis --market a --format full --emit-evidence
+uv run python -m stock_analysis --market stock --symbol 600519
+uv run python -m stock_analysis --market fund --symbol 161725
+uv run python -m stock_analysis --market screen --fiscal-year 2025 --universe-file official_universe.json --filter roe_weighted:gt:8% --sort roe_weighted:desc --limit 20 --emit-evidence
+uv run python -m stock_analysis --market diagnose
+uv run python -m stock_analysis --market stock-review --symbol 600519 --emit-evidence
+uv run python -m stock_analysis --market earnings --symbol 600519 --emit-evidence
+uv run python -m stock_analysis --market price-move --symbol 600519 --emit-evidence
+uv run python -m stock_analysis --market thesis-create --symbol 600519
+uv run python -m stock_analysis --market thesis-review --symbol 600519
+uv run python -m stock_analysis --market research --symbol 600519
+uv run python -m stock_analysis --market research --symbol 512480 --asset-type fund
+```
+
+- 默认 `--format auto`：根据当前北京时间自动选择 `summary`、`key-points` 或 `full`。
+- 默认输出投委会（committee）统一报告结构（执行摘要 + M1–M6 + 建议/风险提示）；正文不输出证据附录，审计数据只通过 `--emit-evidence` 文件保留。`--report-style classic` 仅为兼容别名。
+- 所有报告类型（盘前、盘中、午间、盘后、个股、基金）及其专家视角必须优先使用 Evidence Pack 中的补充证据、精选资讯和稳定公开数据源；仍不可得的指标必须保留缺口，不得补零或外推。
+- `--date YYYYMMDD` 仅在用户明确指定日期时使用；未指定时自动解析最近 A股交易日。
+- `--emit-evidence` 保留 `evidence_YYYYMMDD.json` 与 6 个模块 JSON。
+- trading 入口按“用户完整持仓输入 → 本技能投资记忆 → 无持仓”的优先级决定是否输出持仓分析；用户完整输入会覆盖写入 `~/.stock_analysis/profile.json` 或 `STOCK_ANALYSIS_PROFILE`。
+- `--market stock --symbol <代码>` 与 `--market fund --symbol <代码>` 是确定性速览入口，不触发 LLM；A股单股速览会补充东财 datacenter 已披露财务快照和 Sina 盘口价差快照，基金速览会补充公开长期业绩、前端费率、规模和基金经理画像，缺字段保留空值并提示缺口。
+- `stock-review`、`earnings`、`price-move` 与 `thesis-*` 是公司场景入口：先生成独立的 C1–C8 Company Evidence Pack，绝不把 M1–M6 市场证据当作公司事实。`stock-review` 只能给出已验证事实、明确缺口和观察条件；`earnings` 只复核已披露结构化财务事实；`price-move` 区分价格/量价/新闻样本与未解释部分，不能把相关性断言为主因。
+- `thesis-create` 和 `thesis-review` 只在用户明确请求时读写 `~/.stock_analysis/theses`（可由 `STOCK_ANALYSIS_THESIS_DIR` 覆盖）。论文保存支持事实、反证和失效条件的结构，自动 diff 只比较结构化 Evidence，不能替代一手披露复核。
+- `research` 在用户明确请求深度股票或基金研究时创建或恢复 Research Workspace。默认路径为 `~/.stock_analysis/research/<symbol>/<trade_date>/`，可由 `STOCK_ANALYSIS_RESEARCH_DIR` 或 `--workspace-dir` 覆盖；股票冻结 C1–C8 Company Evidence，基金冻结 F1–F8 Fund Evidence。各自 lens opinions 与 committee synthesis 必须消费同一个 `snapshot_id`，并保存研究计划、证据摘要、决策 memo 和机构报告。人工修改过的阶段文件不得被静默覆盖。
+- `--asset-type auto|company|fund` 控制 `research` 路由；`auto` 识别常见 A股场内基金前缀。Fund Research 独立评估产品契约、指数暴露、集中度、业绩、折溢价、tracking quality、风险和运营，不把 Company C1–C8 套到 ETF，也不以 ETF 单价替代底层成分估值。
+- Research 机构报告沿用中文投委会骨架：执行摘要 → 核心矛盾/产品契约 → 财务或持仓 → 资本配置或业绩风险 → 估值与交易实现 → 投委会审议 → 风险催化 → 条件化动作。`Coverage`、`Missing`、`manual_review`、快照 ID 与内部审计结果只进入 JSON/Workspace，不得出现在用户报告或替代投资分析。
+- 机构报告不得把模块覆盖率直接写成“证据不足，维持观察”。执行摘要必须综合已验证的质量、增长、估值和风险事实；尚未覆盖的内容只在确实影响结论时改写为用户可理解的研究边界或后续跟踪重点。Company 估值可以用已披露年度 EPS/BPS 生成静态 PE/PB proxy 与敏感性情景，但必须明确不是目标价。
+- Company Evidence 可从财务历史派生净利率、经营现金转化和年度毛利稳定性，作为商业经济性与护城河代理；一手年报事实通过 PDF 文本抽取与 JSON 规则目录进入 C1–C8，新增发行人不得在 Python 报告逻辑中硬编码数值。所有派生项必须保留公式和状态。
+- Fund Research 应优先读取指数公司官方样本、月末权重、每日指数估值和标的指数日线；日线与 ETF 严格按交易日对齐后重算相关系数、beta、tracking error 与主动收益。任一官方文件不可用时只降级对应指标，不得让估值文件失败吞掉仍可取得的指数日线。
+- 股票、基金与持仓场景统一调用交易成本情景模型：至少包含实时买卖价差、20 日平均成交额、波动率冲击、订单参与率、券商佣金假设、交易所经手费、适用的过户费/卖出印花税，以及基金管理费/托管费和折溢价观察。默认给出 10 万、100 万、500 万元三档；这是可校准情景，不得冒充用户真实成本。
+- 问题驱动的 6 人投委会适用于 Research 与市场/持仓报告的所有 committee 入口。市场持仓中的发行人一手披露、结构化财务、基金标的指数和交易成本也要进入公共证据契约；每位入选委员必须消费所有公共指标，再按框架区分核心证据与背景证据。
+- Company Evidence 对已接入源补充财报/业绩预告/快报、PE/PB/市值、融资现金流，以及公告索引中的治理和资本配置事件。东财/Futu 聚合内容仍标为 secondary；未回查交易所或公司原文时不得写成已验证的一手原文。
+- 每条 Company evidence 必须有稳定 `evidence_id` 和 `validation_status`；Company lens 只能引用冻结快照中的 ID。committee 必须拒绝混用不同 `snapshot_id` 的 opinions，只输出 `observe` 或 `manual_review`，不得自动推导仓位或买卖动作。
+- `mootdx` 默认关闭；只有明确需要五档、逐笔或深度分钟 K 时才使用 `--enable-mootdx`。
+- 专用能力由 `sources/mootdx_adapter.py` 执行；依赖缺失、TCP 失败或返回空数据时自动回普通腾讯/新浪报价并记录原因。
+
+入口纪律：先给 deterministic evidence，再决定是否升级为深度复盘；浏览器和慢源只作降级或 Agent 接管，不把缺失数据猜成结论。
+
+### CLI 入口可用性检查
+
+SKILL.md 示例中的 `uv run python -m stock_analysis` 入口在只安装了 skill 元数据、未部署对应 Python 包的环境中可能不存在。执行前应先验证模块可导入；若不可用，直接通过腾讯/新浪/同花顺公开 HTTP 接口或浏览器提取获取 deterministic evidence，并在 evidence `_meta.source_events` 中记录 fallback 原因。禁止因 CLI 缺失而虚构数据或跳过证据收集。
+
+## A股确定性选股
+
+可根据已披露年度报告做可复现的条件筛选。此能力只回答“哪些股票满足明确条件”，不是优质公司评定、估值判断或投资建议。
+
+可直接提出：
+
+- “按 2025 年报筛选加权 ROE 严格大于 8%，按 ROE 从高到低取前 20。”
+- “找 2025 年报中 ROE 大于 8% 且营收同比大于 8% 的 A股，按营收同比降序。”
+- “用条件筛选，不要主观评价；给我结果和 Evidence。”
+- “为什么某只股票没有进入结果？”（查看 `PASS` / `FAIL` / `UNKNOWN` 逐股判定。）
+
+执行口径固定如下：
+
+- 支持字段只有 `roe_weighted`（加权 ROE）和 `revenue_growth_yoy`（营收同比）；可各写作带 `_pct` 的别名。数值 `8` 与 `8%` 都表示 8 个百分点。
+- 条件只支持至多两个 `field:gt:value` 的 AND，且 `gt` 为严格大于；相等即 `FAIL`。排序只支持这两个字段的 `asc` / `desc`。
+- 年报横截面来自东财 `RPT_LICO_FN_CPD`，需核对全部分页、服务端总数和唯一代码数；不完整结果不会缓存或执行筛选。
+- 必须同时提供三所官方名单生成并通过总数、页数、去重校验的当前 Security Master JSON。没有完整名单时，明确说明无法声称“全市场”，不得拿部分列表降级输出。
+- 不在当前名单或字段缺失的记录标为 `UNKNOWN`；结果只列 `PASS`。`--emit-evidence` 生成一份 `screen_evidence_<query_id>.json`，保留请求、Universe、分页质量和逐股理由。
+
+本地仓库验证示例：
+
+```bash
+cd /path/to/stock-analysis
+uv run stock-analysis --market screen \
+  --fiscal-year 2025 \
+  --universe-file /absolute/path/to/official_universe.json \
+  --filter roe_weighted:gt:8% \
+  --filter revenue_growth_yoy:gt:8% \
+  --sort roe_weighted:desc \
+  --limit 20 \
+  --emit-evidence
+```
+
+`official_universe.json` 最小契约为 `complete: true`、`reported_total`、`pages_fetched`、`unique_symbols`、`universe_as_of` 与 `records:[{symbol:"600000"}]`；所有计数必须与记录实际值一致。官方名单入口为上交所股票列表、深交所上市公司披露页和北交所上市公司列表。不要用年报集合替代当前 Universe。
+
+## 数据路由
+
+### A股
+
+1. 实时报价、估值、指数、基础 K 线：腾讯 → 新浪。
+2. 五档、逐笔、高精度分钟/深度 K：按需 mootdx；失败后回腾讯/新浪并记录原因。
+3. 板块归属、资金流、涨跌停池、龙虎榜、解禁、两融、大宗、股东户数、研报和新闻：东财独有接口；个股日级资金流需要完整 `ut`/字段契约并在传输失败后退避重试，仍失败必须保留缺口。
+4. 行业/概念板块榜：东财 `clist` → 同花顺公开行业/概念页 → Camofox → Hermes browser 由 Agent 接管 → Playwright。
+5. 东财失败或页面数据不完整：先走可用公开 HTTP fallback，再由浏览器链路接管。
+
+### 精选资讯与缺失指标补充
+
+- 资讯雷达只作为证据增强，不替代行情、成交、资金流和交易日校验；默认抓宏观、全球市场和持仓/标的相关赛道，`rich-source` 或明确深度需求才扩展到全量赛道。
+- 资讯源必须保留 `source/url/time/title`，进入模型或正文前先做去重、同事件聚合、红线过滤、时间窗过滤和摘要截断；不得把未去重原文整包交给模型。
+- 缺失模块写入 `_meta.supplemental_evidence`，为 M1-M6 分别列出候选补充来源：
+  - M1：腾讯/新浪/东方财富指数、北向资金快照、精选宏观与全球市场资讯。
+  - M2：行业/概念板块榜、同花顺公开板块页、板块资金流。
+  - M3：东财涨停池、成交额 Top 榜、短线情绪扩散指标。
+  - M4：东财跌停池/炸板池、融资融券与风险事件、公告风险日历。
+  - M5：持仓行情、基金重仓股行情、股东户数/大宗交易/风格暴露。
+  - M6：抗跌板块、公告/研报/精选资讯、持仓相关行业资讯雷达。
+- 若补充来源仍不可得，正文只能写“相关指标当日未披露”或“历史数据不可得”，禁止显示误导性 0、猜测值或用相邻指标替代。
+
+### 港美股
+
+- 行情：新浪/腾讯互补 → 东财 searchapi 解析 secid 后 `stock/get`。
+- 港股历史 K 线：腾讯 K 线；美股历史 K 线：新浪。
+- 单股速览只输出可核验行情、交易日、成交字段和质量提示；需要观点时再切到 full evidence pack 或本 skill 内置 lens。
+- 当前持仓的公开信息脉冲：Futu 免登录新闻搜索 + 个股解读。
+- Yahoo 不属于推荐路径，不在报告或示例中使用。
+
+### 基金
+
+- 天天基金/东财基金估值 → 新浪基金备用。
+- 天天基金公开评估页 `pingzhongdata` 补充长期业绩、前端费率、规模、业绩评价和现任基金经理画像；该路径免登录、无需 API key。
+- 基金重仓股统一走股票行情路由，并参与重复暴露分析；基金深度分析还应基于前 10 大重仓股构造持仓股精选资讯雷达。
+- 基金速览输出估值/净值、涨跌幅、长期业绩、费率、规模、经理、交易日和前 5 大重仓股报价；6 位场内基金在腾讯前复权 K 线、官方历史净值分页和公司行为校验齐全时，还输出折溢价序列。基金 `--llm` 深度分析应额外纳入基金画像、持仓结构、重仓股行情和持仓股精选资讯。
+
+详细字段与路由见 `references/data-source-strategy.md`。
+本地源码仓库直接调用食谱见 `references/local-repo-direct-invocation.md`。手工取数 fallback 食谱与缺失数据源处理见 `references/fallback-recipes.md`。
+
+## 强制规则
+
+### 代码与字段
+
+- 缓存、合并、持仓匹配前执行 `normalize_code(symbol, source)`。
+- 腾讯/新浪响应强制按 GB2312 解码，必要时允许 GBK 兼容，禁止依赖自动编码检测。
+- 价格 `<= 0` 自动过滤；字段空值保留 `None`，报告中留空，不显示误导性的 `0.00`。
+- 指数涨跌额和涨跌幅同时为零或空时，必须切换来源重取；仍失败则不展示该行，并在 evidence 记录失败。
+- 异常成交量写入 `quality_flags`；来源、交易日、来源链和失败原因写入 evidence。
+
+### 东财
+
+- 本包内东财请求统一走 `em_get()`：无代理、Session 复用、串行、最小间隔 1 秒、随机抖动、指数退避、最多 3 次。
+- 风控经验阈值：`>5 次/秒`、并发 `>=10`、1 分钟 `>=200`、5 分钟 `>=300`。
+- 部分大陆住宅 IP 可能出现 HTTP 000/空响应；先重试，再换网络或代理，不得把空响应当成零值。
+
+### 浏览器
+
+- Camofox 使用前检查 `http://localhost:9377/json/version`，3 秒无响应即不可用。
+- Python CLI 当前自动调用 Camofox；Hermes browser 和本地 Playwright 由执行本 skill 的 Agent 接管，diagnose 负责暴露可用性。
+- 全部浏览器路径不可用时，在 evidence/diagnose 标记 `数据源不可用`，不得静默跳过。
+
+## 时段与报告
+
+北京时间：
+
+- A股/港股 09:00-09:30：早盘，轻量版。
+- 09:30-11:30、13:00-15:00：盘中，中量版。
+- 11:30-13:00：午间，中量版。
+- 15:00 后：盘后，完整版。
+- 美股 21:30-次日 04:00：夜盘，中量版；其他时段为盘后版。
+
+用户明确要求“复盘、深度复盘、6 模块、证据驱动复盘”时，优先输出 `full`。
+
+默认 committee 市场复盘固定顺序：
+
+1. 执行摘要
+2. 大盘指数概览
+3. 持仓分析（仅当本地投资记忆完整，或用户主动提供并确认完整持仓信息）
+4. 六模块深度复盘：M1-M6
+5. 综合持仓建议与风险提示；无持仓时为通用市场建议与风险提示
+
+早盘、盘中、午间、盘后报告正文均不得追加“证据附录”章节。证据审计材料只进入 evidence JSON 和诊断输出。
+
+综合持仓建议与通用市场建议固定包含：现状总结、基准跑赢/跑输、条件化仓位动作、下一交易日观察清单、风险提示。
+
+single 或 adversarial 模式不强制套用 committee 固定顺序，应以对应专家投资风格组织正文。
+
+## Evidence Pack
+
+生成：
+
+- `evidence_YYYYMMDD.json`
+- `m1_YYYYMMDD.json` 至 `m6_YYYYMMDD.json`
+
+基础评分权重：M1 20、M2 20、M3 20、M4 15、M5 15、M6 10。
+
+- `>=80`：完整报告。
+- `60-79`：完整报告，并列出缺失模块。
+- `<60`：full 复盘仍保留固定章节顺序；缺失模块在对应 M1-M6 章节内标注“证据暂缺”，summary/key-points 可按格式裁剪但必须保留免责声明。
+
+`_meta` 至少包含 `trade_date`、`session`、`quality_score`、`missing_modules`、`source_events`。
+
+每次 `quality()` 后，Evidence Pack 还必须写入可审计的可用性与采用状态：
+
+- `source_health`：按来源汇总 `ok/unavailable`，保留 `source_events` 证据链。
+- `field_health`：按关键字段组标注 `available/missing`，覆盖指数成交、板块榜、资金流、涨跌停池、财务质量、组合暴露和资讯样本。
+- `conditional_evidence`：把已采纳但需条件满足的证据写成 `available/conditional/unavailable`，至少覆盖量价行为、板块轮动与龙头、涨跌停池、风险流动性、财务质量、估值安全边际、组合风险、资讯样本和基金画像。
+- `M1.breadth`：仅当前交易日从东财 `clist` 全分页核对得到的上涨、下跌、平盘家数可标为 A 股全市场；东财连接失败时，Sina `hs_a` 必须分页至空页/短页并核对唯一代码和有效行数。历史日期或两路失败必须是不可用，行业板块成分汇总不能替代。
+- `M1.northbound`：同花顺 `hsgtApi` 只可作为当前交易日的北向分钟流向候选；必须覆盖至 14:50 后、至少 200 个样本、时间严格递增且开盘后 10 分钟累计基线合理，才可展示净流入绝对值。历史日期、半截序列、字段错位、未验证旧缓存一律 `unavailable`。
+- `market_price_volume`：腾讯指数日 K 线样本达到 61 个有效交易日时，写入 5d/20d/60d 收益、成交量 z-score 与 14 日 ATR；样本不足仍是 `conditional`，不得升级为稳健交易信号。
+- `stock/fund` 速览：6 位 A 股或场内基金的腾讯日 K 线样本达到 61 个有效交易日时，也输出 5d/20d/60d 收益、成交量 z-score 与 14 日 ATR；这不是指数层或完整交易成本模型的替代。
+- `listed_fund_premium_discount`：场内基金的折溢价仅可由腾讯前复权收盘价与天天基金官方历史净值逐日匹配得到；官方净值必须分页至短页/空页。公开份额拆分需归一到前复权口径；无法解析的分红/拆分事件不得产出序列。跟踪标的、业绩比较基准和年化跟踪误差可从公开基金档案补充，但页面披露的年化值不是日频重算 tracking error。
+- `fund_profiles`：完整持仓中的基金以公开 `pingzhongdata` / FundMob 画像补充长期业绩、规模、费率和经理；按每只基金、每个字段单独核验，空对象或全 `null` 不算可用。任一产品缺费率时，汇总项必须为 `conditional` 并写出 coverage。
+- `M2` 板块榜：必须记录 `source` 和 `taxonomy`；东方财富 BK、同花顺等不同分类体系不能在跨会话叙事中直接比较名次或推断风格切换。
+- `lens_readiness`：按内置专家 lens 列出 `required_evidence`、`available`、`conditional`、`missing` 和 `status`；证据不足时只降级为观察清单，不用专家口吻补数据。
+- `portfolio_exposure`：有完整持仓时进入 `_meta`，先提供权重、HHI、市场/风格暴露；相关性、beta 和回撤贡献必须等完整持仓与足够历史 K 线满足后再升级。
+- `stock_microstructure`：A股持仓可进入 `_meta`，通过 Sina 公开盘口快照提供买一、卖一、价差 bps 和五档手数；这是快照级证据，不是历史订单簿。
+- `stock_trading_costs`：基于盘口价差、20 日平均成交额、60 日波动率和订单参与率生成 10 万/100 万/500 万元成本情景；按股票/ETF 区分经手费、过户费和卖出印花税。逐笔成交与用户实际佣金不可用时保留校准边界，但不得再退回只有流动性分桶的 proxy。
+- `crowding_proxy` / `slippage_sensitivity`：Simons 等量化 lens 可引用板块排名、涨停主题集中度、行业资金流和价差/成交额 proxy；消费拥挤度完整指标、机构持仓拥挤和超短线滑点模型不得用 proxy 冒充。
+
+若存在缺失模块或补充资讯，`_meta` 还应包含：
+
+- `supplemental_evidence`：缺失模块、候选补充来源和“不补零”规则。
+- `news_radar`：原始资讯数、聚合事件数、是否截断；正文只引用压缩后的 `events`。
+- `risk_calendar`：公告、解禁、分红、融资融券等时间敏感风险事件（如有）。
+
+单股 Evidence 可以包含 `STOCK.news_radar`、`STOCK.a_share_extensions`、`STOCK.global_market`；基金 Evidence 可以包含 `FUND.profile` 和 `FUND.holding_news_radar`。这些字段是研报可引用证据，不是买卖信号。
+
+6 模块方法见 `references/methodology/`，报告模板见 `references/template/`，输出纪律见 `references/output_discipline.md`。
+
+`stock-analysis` 固定负责 M1-M6 的证据包、评分和研报正文；内置投资专家 lens、默认 committee 成员和综合规则来自本 skill 的固定文件：`config/lenses/*.json` 与 `scripts/lens_registry.py`。本 skill 不要求用户安装任何外部行情 CLI，也不得为了 lens 或 committee 流程安装、调用或转交给外部工具；不得假设本机存在任何外部行情命令。
+
+## 本地源码仓库调用
+
+当用户明确要求使用某个本地仓库路径（如 `/path/to/stock-analysis/src/stock_analysis`）的技能或代码时，不要假设必须全局安装 `stock_analysis` 包或重新克隆仓库。直接：
+
+1. `cd` 到仓库根目录；
+2. 激活 `.venv/bin/activate`；
+3. 用 `python -m stock_analysis.app --date YYYYMMDD --market daily --format full --with-holdings` 生成报告。
+
+具体命令与证据降级处理见 `references/local-repo-direct-invocation.md`。
+
+对于历史日期（非今天），接受数据缺失导致的自动降级报告，不要虚构或补零。
+
+## LensEngine 与自然语言调用
+
+LensEngine 是报告生成的核心编排器。LLM 或上层 Agent 可以用自然语言触发能力，再归一化为 `mode`、`lens`、`lenses` 参数调用 `stock_analysis.reporting.generate_report()`；CLI 的 full report 也走同一条 LensEngine 报告路径，并在 evidence `_meta.report_metadata` 中写入结构化结果。
+
+- Research 默认使用 committee 模式：根据用户的研究问题，从 15 个内置 lens 中确定性选择最相关且互补的 6 位委员；不得把固定 6 人名单伪装成动态选择。用户显式指定专家时以用户选择为准。
+- 每位入选委员都必须消费同一研究时点的全部结构化指标，再按自身框架解释；Company 至少验证净利率与经营现金转化，Fund 至少验证底层估值、最大回撤、波动、指数约束和费率。消费明细与一致性检查只保存在 JSON/Workspace，用户报告用自然语言和关键数值呈现。
+- committee 模式会自动做 m1/m6 综合深度分析。
+- m1/m6 综合深度分析：m1 做多 lens 交叉验证、趋势一致性分析、异常点识别；m6 做多视角风险汇总、冲突点调和、最终风险评分。
+- single 模式：单一 lens 深度模式。自然语言例子：“用巴菲特模式分析 茅台”“按段永平视角看 腾讯”。可识别 `buffett`、`巴菲特`、`巴菲特模式` 等常见写法。
+- committee 模式：多 lens 综合模式，也是默认模式。自然语言例子：“用投委会模式分析 NVDA”“多专家综合复盘今天市场”。
+- adversarial 模式：两个 lens 对抗辩论模式。自然语言例子：“用 adversarial 模式让巴菲特和芒格辩论 腾讯”。必须提供两个 lens。
+- committee 失败时降级为 single：优先使用用户给出的第一个有效 lens；没有有效 lens 时降级到 `buffett`。降级原因必须写入报告 metadata 的 `fallback` 字段。
+
+## 内置投资专家 lens
+
+当用户明确提出想用哪位投资专家的风格生成报告时，必须识别专家名称、英文名、中文名、别名或 lens id，并完全以相关专家的视角输出报告。这里的“完全以相关专家的视角”指整篇报告的证据优先级、判断顺序、风险表达、持仓建议和观察清单都服从该专家框架，不得只在结尾追加专家点评，也不得先写 balanced 普通报告再附一段专家口吻。
+
+专家视角不能忽略补充证据：若数据包提供补充证据、资讯事件、基金画像、持仓股精选资讯、公告/研报/资金流/短线情绪等内容，必须按该专家框架纳入对应章节的证据、风险或观察清单；不得用专家口吻补全缺失数字，确实影响判断的边界应改写为可理解的跟踪条件。
+
+A股个股或 A股持仓若有 `STOCK.financial_snapshot` / `_meta.stock_financials`，single lens 报告必须先评估财务证据覆盖：ROE、毛利率、资产负债率、经营现金流、自由现金流-lite，以及业绩预告/快报是否已披露。东财 datacenter 可以提供已披露财务摘要、资产负债表、现金流量表；业绩预告/快报只在公司披露时有数据，空返回必须写成缺口，不得说成“已获取”。
+
+其他投资框架也会遇到证据包不足：Graham 需要更完整资产质量和下行价值，Munger/Duan Yongping 需要治理、激励和文化证据，Zhang Kun 需要 ROIC、现金流和长期竞争格局，Lynch/O'Neil 需要季度增长、机构需求和量价确认，Wood 需要研发、渗透率和融资风险，Simons 需要样本、因子、买卖价差、滑点与拥挤。当前 Evidence Pack 只能覆盖其中一部分；缺少的框架专属证据必须显式列为缺口，不得用市场涨跌、板块热度或专家风格替代。
+
+支持 15 个 stock-analysis 内置投资专家 lens；结构化定义以 `config/lenses/*.json` 为准，表格只作快速索引：
+
+| lens id | 中文名 | 框架要点 | 证据优先级 |
+|---|---|---|---|
+| `buffett` | 巴菲特 | 商业质量、护城河、管理层、资本配置、安全边际 | ROE、自由现金流、利润率、负债、估值与长期持仓事实 |
+| `munger` | 芒格 | 多元思维模型、反向思考、激励与错配、机会成本 | 商业模式、治理与激励、现金流、关键反例 |
+| `graham` | 格雷厄姆 | 资产负债表、盈利稳定性、估值纪律、下行保护 | 资产负债表、盈利稳定性、估值分位、清算与下行价值 |
+| `klarman` | 卡拉曼 | 绝对回报、复杂性折价、催化剂、永久损失风险 | 折价来源、资产质量、催化剂日历、永久损失情景 |
+| `lynch` | 彼得·林奇 | 可理解增长故事、公司类型、PEG 与盈利兑现 | 收入和利润增速、用户或同店指标、估值增长匹配、持仓可理解度 |
+| `o_neil` | 欧奈尔 | 盈利加速、行业龙头、机构需求、价格强度 | 季度财务、相对强弱、成交量、机构与资金变化 |
+| `wood` | 伍德 | 颠覆式创新、长期渗透率、技术成本曲线 | 研发和产品进展、渗透率、单位成本、融资与估值风险 |
+| `dalio` | 达利欧 | 宏观周期、情景分析、分散化、风险平衡 | 利率与信用、政策流动性、行业 beta、组合暴露 |
+| `soros` | 索罗斯 | 反身性、预期差、政策拐点、仓位非对称性 | 预期差、资金与价格反馈、政策事件、仓位风险 |
+| `livermore` | 利弗莫尔 | 顺势、关键点确认、风险控制、亏损仓不摊平 | 趋势结构、量价、突破失败、持仓成本与止损空间 |
+| `minervini` | 米勒维尼 | 趋势模板、盈利加速、强势领导者、风险收益比 | 均线和相对强度、VCP 形态、盈利加速、成交量 |
+| `simons` | 西蒙斯 | 数据定义、可重复信号、样本外稳健性、交易成本 | 历史分布、因子暴露、样本量、滑点与拥挤 |
+| `duan_yongping` | 段永平 | 本分、商业模式、企业文化、长期现金创造、合理价格 | 产品与用户心智、现金流、管理层文化、长期估值 |
+| `zhang_kun` | 张坤 | 高质量商业模式、长期自由现金流、竞争格局、机会成本 | ROIC 与现金流、行业格局、治理、长期估值 |
+| `feng_liu` | 冯柳 | 市场认知、赔率、困境反转、边际变化 | 预期与价格、催化剂、资金异动、反方证据 |
+
+### 专家视角触发
+
+- 用户没有明确指定专家时，默认使用 committee 模式，不主动询问要不要选择专家。
+- 用户明确说“用巴菲特/芒格/彼得·林奇/索罗斯/段永平/张坤/冯柳等风格”“按 buffett/munger/lens 风格”“以某投资专家视角”等，切换为 single 模式。
+- 识别到单个专家时，单专家视角不输出机构化综合判断，也不输出“交易计划草案”“风险管理意见”“组合经理最终意见”等委员会小节。
+- 单专家报告最后章节标题必须按中文名写成 `## {专家中文名}持仓建议与风险提示`；若没有完整持仓信息，可写成 `## {专家中文名}市场建议与风险提示`，但不得伪造持仓。
+- 不得模仿身份声明或虚构专家发言：不要写“我是巴菲特本人”“芒格会说”，也不要编造历史人物未说过的话；可以写“按巴菲特框架看”“以芒格式反向检查”。
+- 专家框架不能覆盖数据纪律：所有结论仍必须回到 evidence、行情、成交、资金流、财务或公开信息；证据不足时明确写“证据不足，维持观察”。
+- 若用户同时指定多个专家，除非明确要求 `all` 或“多专家综合”，否则只执行用户最后明确指定的一个专家；明确要求 `all`、`committee` 或“多专家综合”时，使用 `scripts/lens_registry.py` 的默认 committee 成员和各 JSON 的 `committee_role`、`committee_synthesis_rules` 做压缩综合，不输出逐轮辩论过程。
+
+## Trading 入口与持仓完整性
+
+市场复盘统一走 trading 入口：先判断用户意图是否是行情分析，再判断盘前、盘中或盘后，任务调度层控制报告结构；LensEngine 控制分析方法，用户未指定专家或对抗辩论时默认使用 committee 模式。
+
+持仓来源优先级固定为：
+
+1. 用户本次输入的完整持仓；
+2. 本技能投资记忆；
+3. 无完整持仓时不输出持仓分析。
+
+用户本次输入只要包含持仓语义，就必须先判断完整性。若本次输入完整，优先以用户新提供的信息为准，覆盖写入投资记忆，并用于本次持仓分析；若本次输入不完整，必须先只提问一次补齐缺失项，不得回退使用旧投资记忆，也不得覆盖旧投资记忆。用户没有提供持仓时，才读取本地投资记忆；投资记忆不存在或不完整时，输出普通市场复盘，不插入持仓绩效。
+
+投资记忆路径：
+
+- 默认：`~/.stock_analysis/profile.json`
+- 覆盖：`STOCK_ANALYSIS_PROFILE`
+
+若用户主动提供持仓但信息不完整，必须等待用户交互输入并只提问一次，要求补齐缺失项。
+
+### 完整性判断
+
+完整投资记忆或完整用户输入必须同时具备：
+
+1. 股票代码或基金代码；
+2. 买入日期；
+3. 买入数量或买入金额。
+
+这三项的判断口径固定为“股票代码、买入日期、买入数量或买入金额”。缺失任意一项，不得进行收益计算、浮盈亏计算、年化表现或组合绩效分析。
+
+只有以下情况进入确认流程：
+
+- 用户主动提供持仓相关内容但缺失核心字段；
+- 用户主动修改已有投资记忆。
+- 用户新提供的信息与之前保存的投资记忆不一致。
+
+### 买入信息
+
+- 买入数量：用户明确说明“多少股、多少份、多少手”等数量单位时成立。
+- 买入金额：用户明确说明“买入金额、本金、投入金额”等金额语义时成立；买入金额必须确认币种。
+- 如果用户只给出一个数字，且没有说明这是数量还是金额，必须只提问一次，要求用户确认“这是买入数量还是买入金额”，并确认币种是人民币、港币还是美元。
+- 如果用户给出买入金额但未给币种，也视为不完整；只提问一次要求补充币种。
+
+### 买入日期
+
+- 如果日期没有年份，默认使用当前年份计算。
+- 如果日期包含完整年份，严格使用用户给出的日期。
+- 除非用户后续主动纠正日期，否则报告必须清晰标注“使用的是用户提供的买入日期”，或“未提供年份，按当前年份补全年份”。
+
+### 信息不完整
+
+只要用户本次提供的股票代码、买入日期、买入数量或买入金额缺失任意一项，输出普通市场复盘报告，不包含任何持仓绩效内容，不回退使用旧投资记忆。若触发确认流程，可以在报告末尾只提问一次，精准说明缺失项，例如：
+
+- “如需持仓收益分析，请补充买入日期。”
+- “你提供了代码和日期，但数字未说明是数量还是金额；请确认是买入数量还是买入金额，并说明币种是人民币、港币还是美元。”
+
+用户补齐后重新判断完整性；如果仍不完整，继续输出普通市场复盘报告，不追加第二次追问。若用户明确表示不需要分析持仓，立即输出普通市场复盘报告。
+
+### 保存与清空投资记忆
+
+用户补齐或修改后的持仓信息一旦完整，必须保存到本地投资记忆：`~/.stock_analysis/profile.json` 或 `STOCK_ANALYSIS_PROFILE` 指向的位置。保存时保留当前兼容 JSON 结构，不另建私有记忆文件。
+
+如果用户新提供的信息与之前保存的投资记忆不一致，必须先按“股票代码、买入日期、买入数量或买入金额”确认信息完整性；确认信息完整性后，优先以用户新提供的信息为准，覆盖写入投资记忆。不完整的新信息不得覆盖已有完整投资记忆，只能按一次确认流程提示用户补齐缺失项。
+
+每次触发保存或修改时，必须在回复中明确告知用户：
+
+`投资记忆已保存本地。下次将默认按这份投资记忆分析持仓；如需清空投资记忆请反馈。`
+
+用户明确要求清空投资记忆后，后续问题不得继续默认使用旧投资记忆；只有用户重新提供完整持仓信息，或重新保存投资记忆后，才恢复默认持仓分析。
+
+### 信息完整后的收益计算
+
+- 用户提供买入数量：结合买入日期、买入价/历史价、当前价，计算持有期收益、浮盈浮亏和年化表现。
+- 用户提供买入金额：结合买入日期历史价格反推大致买入数量，再计算持有期收益、浮盈浮亏和年化表现。
+- 所有收益最终统一折算为人民币；明细保留原始币种和汇率依据。
+- 报告必须说明计算依据、买入日期处理、数量或金额来源，以及历史价反推是否为估算。
+- 持仓绩效分析只在本次输入或投资记忆信息完整时输出，内容包括单只标的收益情况、整体组合表现、与市场风格的关联分析。
+
+## 已保存持仓与模板
+
+- 用户未提供持仓时读取投资记忆 `~/.stock_analysis/profile.json` 或 `STOCK_ANALYSIS_PROFILE`。
+- 支持股票、基金、买入日期、数量、买入金额和买入参考价；缺口仍按“投资记忆优先与持仓完整性”规则处理。
+- HKD/USD 按当前汇率折算 CNY，明细保留原始币种。
+- 前三大持仓占比 `>70%` 标记集中度风险；单一市场 `>80%` 标记市场暴露风险。
+- A股对比沪指/创业板，港股对比恒指/恒生科技，美股对比纳指/道指。
+- 建议必须使用条件化触发器，不得给出无条件买卖指令。
+- 持仓表格格式见 `references/template/portfolio-template.md`，仅在持仓分析被触发且信息完整时套用。
+- 直接股票持仓追加公开信息脉冲；公开信息脉冲只展示新闻倾向、最新高信号事件和原文证据。
+- Futu 技术面、资金面、衍生品异动依赖 OpenD 登录，不属于默认免登录日报能力。
+
+## 输出纪律
+
+- 研报正文不展示 API、抓取工具或 fallback 工程细节；这些只进入 evidence 和 diagnose。
+- 每个模块使用 `==关键判断==`，并包含判断、证据、风险或确认条件。
+- 指数、持仓、连板梯队使用 Markdown 表格。
+- 精选资讯和补充数据只能作为证据、风险或观察清单，不能直接写成买入、卖出、申购、赎回或仓位信号。
+- 缺失指标不得被静默吞掉；若已尝试稳定公开源和精选资讯仍缺失，必须在对应模块自然说明“相关指标当日未披露”。
+- 结尾必须原样包含：
+
+`以上内容仅供参考，不构成任何投资建议。股市有风险，投资需谨慎。`
+
+## 示例
+
+- “复盘今日行情，分析我的持仓”
+- “今天全球市场怎么样，给我 summary”
+- “盘后给我完整 6 模块证据驱动复盘”
+- “帮我跑 diagnose，检查腾讯、新浪、东财、mootdx 和浏览器链路”

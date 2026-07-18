@@ -21,6 +21,29 @@ def test_revisioned_research_has_a_bounded_timeline(tmp_path: Path) -> None:
         assert timeline["next_cursor"]
 
 
+def test_deleting_a_note_removes_revisions_timeline_and_attachment_file(tmp_path: Path) -> None:
+    vault_directory = tmp_path / "vault"
+    source = tmp_path / "attachment.txt"
+    source.write_text("private note attachment", encoding="utf-8")
+    with Vault(vault_directory / "vault.sqlite3") as vault:
+        research = ResearchStore(vault, vault_directory)
+        note_id = research.add_note(security_id="CN:SSE:600519:STOCK", body="原始笔记")
+        research.revise_note(note_id, security_id="CN:SSE:600519:STOCK", body="修订笔记")
+        research.add_attachment(note_id, source, "text/plain")
+        stored_path = Path(
+            vault.connection.execute(
+                "SELECT storage_path FROM attachments WHERE note_id = ?", (note_id,)
+            ).fetchone()[0]
+        )
+
+        research.delete_note(note_id)
+
+        assert not stored_path.exists()
+        assert vault.connection.execute("SELECT COUNT(*) FROM notes WHERE note_id = ?", (note_id,)).fetchone()[0] == 0
+        assert vault.connection.execute("SELECT COUNT(*) FROM note_revisions WHERE note_id = ?", (note_id,)).fetchone()[0] == 0
+        assert vault.connection.execute("SELECT COUNT(*) FROM timeline_events WHERE reference_id = ?", (note_id,)).fetchone()[0] == 0
+
+
 def test_backup_restore_and_markdown_export_are_verifiable(tmp_path: Path) -> None:
     with Vault(tmp_path / "vault" / "vault.sqlite3") as vault:
         ResearchStore(vault).add_note(security_id="CN:SSE:600519:STOCK", body="关注经营现金流。")

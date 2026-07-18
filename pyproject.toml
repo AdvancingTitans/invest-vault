@@ -4,12 +4,16 @@ build-backend = "hatchling.build"
 
 [project]
 name = "invest-vault"
-version = "0.1.9"
+version = "0.3.24"
 description = "Local-first investment research ledger."
+license = { file = "LICENSE" }
 requires-python = ">=3.9"
 dependencies = [
     "fastapi>=0.115",
+    "pypdf>=5,<7",
+    "requests>=2.31",
     "uvicorn>=0.30",
+    "xlrd>=2.0,<3",
 ]
 
 [project.optional-dependencies]
@@ -19,7 +23,7 @@ dev = ["httpx2>=0.1", "pytest>=7", "ruff>=0.4"]
 invest-vault = "invest_vault.__main__:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/invest_vault"]
+packages = ["src/invest_vault", "src/stock_analysis"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
