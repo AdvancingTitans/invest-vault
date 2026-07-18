@@ -43,11 +43,13 @@ class FakeAIProvider:
         return {"loggedOut": True}
 
     def list_models(self) -> list[dict[str, object]]:
-        return [{
-            "id": "gpt-5.4",
-            "displayName": "GPT-5.4",
-            "supportedReasoningEfforts": ["low", "medium", "high"],
-        }]
+        return [
+            {
+                "id": "gpt-5.4",
+                "displayName": "GPT-5.4",
+                "supportedReasoningEfforts": ["low", "medium", "high"],
+            }
+        ]
 
     def configure_models(self, settings: dict[str, dict[str, str | None]]) -> None:
         self.model_settings = settings
@@ -64,7 +66,14 @@ class FakeAIProvider:
             "tags": ["盘后观察"],
         }
 
-    def chat(self, *, role: dict[str, object], messages: list[dict[str, str]], context: str, use_runtime_market_skill: bool = False) -> dict[str, object]:
+    def chat(
+        self,
+        *,
+        role: dict[str, object],
+        messages: list[dict[str, str]],
+        context: str,
+        use_runtime_market_skill: bool = False,
+    ) -> dict[str, object]:
         self.chat_calls += 1
         self.last_context = context
         assert role["role_id"] == "buffett"
@@ -92,7 +101,14 @@ class CatalogOnlyResearchSkillLayer:
 
 
 class MarketReportProvider(FakeAIProvider):
-    def chat(self, *, role: dict[str, object], messages: list[dict[str, str]], context: str, use_runtime_market_skill: bool = False) -> dict[str, object]:
+    def chat(
+        self,
+        *,
+        role: dict[str, object],
+        messages: list[dict[str, str]],
+        context: str,
+        use_runtime_market_skill: bool = False,
+    ) -> dict[str, object]:
         self.chat_calls += 1
         self.last_context = context
         assert role["role_id"] == "market_report"
@@ -120,7 +136,12 @@ def test_market_report_supports_expert_style_and_committee_scene() -> None:
     assert plan["scene"] == "market"
     assert len(plan["roles"]) == 6
     assert plan["roles"] == [
-        "livermore", "buffett", "munger", "duan_yongping", "zhang_kun", "graham",
+        "livermore",
+        "buffett",
+        "munger",
+        "duan_yongping",
+        "zhang_kun",
+        "graham",
     ]
     assert plan["skill_version"] == "4.12.0"
 
@@ -168,7 +189,10 @@ def test_market_committee_never_redirects_its_automatic_report_request(tmp_path:
         ).json()
         response = client.post(
             f"/api/ai/chats/{thread['thread_id']}/messages",
-            json={"content": "生成7月17日盘后行情报告，结合我的本地持仓给出条件化观察建议。", "role_id": "general"},
+            json={
+                "content": "生成7月17日盘后行情报告，结合我的本地持仓给出条件化观察建议。",
+                "role_id": "general",
+            },
         )
         immediate = response.json()
         for _ in range(100):
@@ -226,7 +250,9 @@ def test_bundled_stock_analysis_skill_is_used_without_user_installation(tmp_path
     )
 
     assert provider._find_runtime_market_skill() == {
-        "type": "skill", "name": "stock-analysis", "path": str(bundled.resolve())
+        "type": "skill",
+        "name": "stock-analysis",
+        "path": str(bundled.resolve()),
     }
 
 
@@ -261,12 +287,44 @@ def test_ai_settings_persist_per_task_model_without_credentials(tmp_path: Path) 
     assert catalog.json()[0]["id"] == "gpt-5.4"
     assert saved.status_code == 200
     assert settings["tasks"]["research"] == {
+        "provider_id": "codex",
         "model_id": "gpt-5.4",
         "reasoning_effort": "high",
     }
     serialized = json.dumps(settings).lower()
     assert "token" not in serialized
     assert "api_key" not in serialized
+
+
+def test_provider_api_keys_are_masked_encrypted_and_deletable(tmp_path: Path) -> None:
+    provider = FakeAIProvider()
+    secret = "sk-direct-provider-secret-2468"
+    with TestClient(create_app(tmp_path, automatic_updates=False, ai_provider=provider)) as client:
+        catalog = client.get("/api/ai/providers").json()["providers"]
+        assert [item["provider_id"] for item in catalog] == [
+            "codex",
+            "openai",
+            "anthropic",
+            "google",
+            "deepseek",
+        ]
+        saved = client.put("/api/ai/providers/openai/credential", json={"key": secret})
+        assert saved.json() == {"provider_id": "openai", "configured": True, "masked": "••••2468"}
+        configured = client.get("/api/ai/providers").json()["providers"]
+        openai = next(item for item in configured if item["provider_id"] == "openai")
+        assert openai["configured"] is True
+        assert openai["masked"] == "••••2468"
+        assert secret not in json.dumps(configured)
+
+        routed = client.put(
+            "/api/ai/settings/models/research",
+            json={"provider_id": "openai", "model_id": "gpt-5.2", "reasoning_effort": None},
+        )
+        assert routed.status_code == 200
+        assert client.get("/api/ai/settings").json()["tasks"]["research"]["provider_id"] == "openai"
+        assert client.delete("/api/ai/providers/openai/credential").json()["deleted"] is True
+
+    assert secret.encode() not in (tmp_path / "vault.sqlite3").read_bytes()
 
 
 def test_ai_logout_uses_codex_account_session(tmp_path: Path) -> None:
@@ -283,7 +341,9 @@ def test_ai_quick_note_preserves_raw_and_requires_acceptance_before_note_write(t
     provider = FakeAIProvider()
     security_id = "CN:SSE:600519:STOCK"
     raw_text = "今天回调，批价没变。先不补仓。"
-    accepted_body = "回调与批价观察\n\n事实\n- 用户观察到今日股价回调\n- 用户观察到批价未变化\n\n计划\n- 暂不补仓"
+    accepted_body = (
+        "回调与批价观察\n\n事实\n- 用户观察到今日股价回调\n- 用户观察到批价未变化\n\n计划\n- 暂不补仓"
+    )
 
     with TestClient(create_app(tmp_path, automatic_updates=False, ai_provider=provider)) as client:
         draft_response = client.post(
@@ -322,12 +382,14 @@ def test_ai_quick_note_preserves_raw_and_requires_acceptance_before_note_write(t
 
 def test_roles_and_recoverable_role_chat(tmp_path: Path) -> None:
     provider = FakeAIProvider()
-    with TestClient(create_app(
-        tmp_path,
-        automatic_updates=False,
-        ai_provider=provider,
-        research_skill_layer=CatalogOnlyResearchSkillLayer(),
-    )) as client:
+    with TestClient(
+        create_app(
+            tmp_path,
+            automatic_updates=False,
+            ai_provider=provider,
+            research_skill_layer=CatalogOnlyResearchSkillLayer(),
+        )
+    ) as client:
         roles = client.get("/api/ai/roles").json()
         skills = client.get("/api/ai/skills").json()
         assert len(roles) == 16
@@ -338,10 +400,10 @@ def test_roles_and_recoverable_role_chat(tmp_path: Path) -> None:
             "drawdown-attribution-readiness",
             "security-valuation-evidence",
             "portfolio-risk-evidence",
-                "public-topic-evidence",
-                "market-context-evidence",
-                "supplemental-company-evidence",
-                "framework-readiness",
+            "public-topic-evidence",
+            "market-context-evidence",
+            "supplemental-company-evidence",
+            "framework-readiness",
         }
         assert roles[0]["role_id"] == "general"
         assert all(not item["name"].endswith("框架") for item in roles)
@@ -388,16 +450,33 @@ def test_market_overview_chat_only_generates_session_report_with_local_holdings(
     provider = MarketReportProvider()
     monkeypatch.setattr(
         "invest_vault.ai_skills.fetch_security_price_history",
-        lambda *_, **__: {"rows": [{"date": "2026-07-16", "close": 99}, {"date": "2026-07-17", "close": 100}]},
+        lambda *_, **__: {
+            "rows": [{"date": "2026-07-16", "close": 99}, {"date": "2026-07-17", "close": 100}]
+        },
     )
     with TestClient(create_app(tmp_path, automatic_updates=False, ai_provider=provider)) as client:
         client.post(
             "/api/holdings",
-            json={"rows": [{"row_id": "a", "symbol": "600519", "asset_type": "a_share", "invested_amount_cny": "10000", "bought_on": "2026-01-08"}]},
+            json={
+                "rows": [
+                    {
+                        "row_id": "a",
+                        "symbol": "600519",
+                        "asset_type": "a_share",
+                        "invested_amount_cny": "10000",
+                        "bought_on": "2026-01-08",
+                    }
+                ]
+            },
         )
         with sqlite3.connect(tmp_path / "vault.sqlite3") as connection:
             for section, payload in {
-                "indices": {"date": "2026-07-17", "session": "盘后", "session_label": "7月17日盘后收盘数据", "rows": [{"name": "上证指数", "change_percent": 1.2}]},
+                "indices": {
+                    "date": "2026-07-17",
+                    "session": "盘后",
+                    "session_label": "7月17日盘后收盘数据",
+                    "rows": [{"name": "上证指数", "change_percent": 1.2}],
+                },
                 "lhb": {"date": "2026-07-17", "rows": []},
                 "industry_flow": {"date": "2026-07-17", "inbound": [], "outbound": []},
             }.items():
@@ -408,7 +487,12 @@ def test_market_overview_chat_only_generates_session_report_with_local_holdings(
             connection.commit()
         thread = client.post(
             "/api/ai/chats",
-            json={"security_id": "MARKET:GLOBAL:OVERVIEW", "role_id": "general", "mode": "assistant", "title": "市场报告"},
+            json={
+                "security_id": "MARKET:GLOBAL:OVERVIEW",
+                "role_id": "general",
+                "mode": "assistant",
+                "title": "市场报告",
+            },
         ).json()
 
         refused = client.post(
@@ -512,7 +596,9 @@ def test_chat_skill_tool_events_and_evidence_are_persisted_in_one_timeline(tmp_p
         restored = client.get(f"/api/ai/chats/{thread['thread_id']}").json()
 
     assert reply["cited_evidence_ids"] == ["EVIDENCE-SKILL-test"]
-    assert reply["sources"] == [{"name": "测试证据", "url": "https://example.test/evidence", "as_of": "2026-06-30"}]
+    assert reply["sources"] == [
+        {"name": "测试证据", "url": "https://example.test/evidence", "as_of": "2026-06-30"}
+    ]
     assert [event["event_type"] for event in restored["events"]] == [
         "message.completed",
         "tool.started",
@@ -528,7 +614,14 @@ class EngineeringOutputProvider(FakeAIProvider):
         super().__init__()
         self.messages_seen: list[list[dict[str, str]]] = []
 
-    def chat(self, *, role: dict[str, object], messages: list[dict[str, str]], context: str, use_runtime_market_skill: bool = False) -> dict[str, object]:
+    def chat(
+        self,
+        *,
+        role: dict[str, object],
+        messages: list[dict[str, str]],
+        context: str,
+        use_runtime_market_skill: bool = False,
+    ) -> dict[str, object]:
         self.messages_seen.append(messages)
         return {
             "content": "**结论**：依据 EVIDENCE-SKILL-test，仍需核实。",
@@ -569,12 +662,18 @@ def test_each_turn_excludes_old_chat_and_clearing_permanently_deletes_the_thread
     assert archived.json() == {"archived": True}
     assert remaining == []
     with sqlite3.connect(tmp_path / "vault.sqlite3") as connection:
-        assert connection.execute(
-            "SELECT COUNT(*) FROM research_threads WHERE thread_id = ?", (thread["thread_id"],)
-        ).fetchone()[0] == 0
-        assert connection.execute(
-            "SELECT COUNT(*) FROM research_events WHERE thread_id = ?", (thread["thread_id"],)
-        ).fetchone()[0] == 0
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM research_threads WHERE thread_id = ?", (thread["thread_id"],)
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM research_events WHERE thread_id = ?", (thread["thread_id"],)
+            ).fetchone()[0]
+            == 0
+        )
 
 
 class FailingResearchSkillLayer(FakeResearchSkillLayer):
@@ -614,7 +713,14 @@ class CommitteeProvider(FakeAIProvider):
         self.roles_seen: list[str] = []
         self.skill_flags: list[bool] = []
 
-    def chat(self, *, role: dict[str, object], messages: list[dict[str, str]], context: str, use_runtime_market_skill: bool = False) -> dict[str, object]:
+    def chat(
+        self,
+        *,
+        role: dict[str, object],
+        messages: list[dict[str, str]],
+        context: str,
+        use_runtime_market_skill: bool = False,
+    ) -> dict[str, object]:
         self.chat_calls += 1
         self.roles_seen.append(str(role["role_id"]))
         self.skill_flags.append(use_runtime_market_skill)
@@ -631,36 +737,52 @@ class CommitteeSkillLayer:
         return [{"skill_id": "committee-evidence", "name": "投委会证据", "description": "测试"}]
 
     def run(self, *, security_id: str, question: str, role_id: str = "general") -> list[dict[str, object]]:
-        return [{
-            "skill_id": "committee-evidence",
-            "name": "投委会证据",
-            "status": "completed",
-            "gaps": [],
-            "evidence": [{
-                "evidence_id": "EVIDENCE-SKILL-committee",
-                "kind": "committee",
-                "value": {"role": role_id},
-                "as_of": "2026-07-18",
-                "provider": "fixture",
-                "source_ref": "https://example.test/committee",
-            }],
-        }]
+        return [
+            {
+                "skill_id": "committee-evidence",
+                "name": "投委会证据",
+                "status": "completed",
+                "gaps": [],
+                "evidence": [
+                    {
+                        "evidence_id": "EVIDENCE-SKILL-committee",
+                        "kind": "committee",
+                        "value": {"role": role_id},
+                        "as_of": "2026-07-18",
+                        "provider": "fixture",
+                        "source_ref": "https://example.test/committee",
+                    }
+                ],
+            }
+        ]
 
 
 def test_fund_committee_auto_assigns_roles_and_persists_report(tmp_path: Path) -> None:
     provider = CommitteeProvider()
-    with TestClient(create_app(
-        tmp_path, automatic_updates=False, ai_provider=provider,
-        research_skill_layer=CommitteeSkillLayer(),
-    )) as client:
-        thread = client.post("/api/ai/chats", json={
-            "security_id": "CN:SSE:512480:FUND", "role_id": "general",
-            "mode": "committee", "title": "基金深度复盘",
-        }).json()
-        accepted = client.post(f"/api/ai/chats/{thread['thread_id']}/messages", json={
-            "content": "请深度复盘这只基金的持仓结构、流动性压力和组合风险",
-            "role_id": "general",
-        }).json()
+    with TestClient(
+        create_app(
+            tmp_path,
+            automatic_updates=False,
+            ai_provider=provider,
+            research_skill_layer=CommitteeSkillLayer(),
+        )
+    ) as client:
+        thread = client.post(
+            "/api/ai/chats",
+            json={
+                "security_id": "CN:SSE:512480:FUND",
+                "role_id": "general",
+                "mode": "committee",
+                "title": "基金深度复盘",
+            },
+        ).json()
+        accepted = client.post(
+            f"/api/ai/chats/{thread['thread_id']}/messages",
+            json={
+                "content": "请深度复盘这只基金的持仓结构、流动性压力和组合风险",
+                "role_id": "general",
+            },
+        ).json()
         assert accepted["status"] == "running"
         deadline = time.monotonic() + 3
         while True:
@@ -672,10 +794,20 @@ def test_fund_committee_auto_assigns_roles_and_persists_report(tmp_path: Path) -
 
     plan = next(item for item in restored["events"] if item["event_type"] == "plan.completed")
     assert plan["payload"]["selected_roles"] == [
-        "达利欧", "卡拉曼", "西蒙斯", "芒格", "张坤", "巴菲特",
+        "达利欧",
+        "卡拉曼",
+        "西蒙斯",
+        "芒格",
+        "张坤",
+        "巴菲特",
     ]
     assert set(provider.roles_seen[:6]) == {
-        "dalio", "klarman", "simons", "munger", "zhang_kun", "buffett",
+        "dalio",
+        "klarman",
+        "simons",
+        "munger",
+        "zhang_kun",
+        "buffett",
     }
     assert provider.roles_seen[-1] == "report_editor"
     assert provider.skill_flags == [True, True, True, True, True, True, True]
@@ -692,17 +824,30 @@ def test_fund_committee_auto_assigns_roles_and_persists_report(tmp_path: Path) -
 
 def test_every_investment_assistant_turn_loads_bundled_stock_analysis_skill(tmp_path: Path) -> None:
     provider = CommitteeProvider()
-    with TestClient(create_app(
-        tmp_path, automatic_updates=False, ai_provider=provider,
-        research_skill_layer=CommitteeSkillLayer(),
-    )) as client:
-        thread = client.post("/api/ai/chats", json={
-            "security_id": "CN:SSE:600519:STOCK", "role_id": "buffett",
-            "mode": "assistant", "title": "快速问题",
-        }).json()
-        response = client.post(f"/api/ai/chats/{thread['thread_id']}/messages", json={
-            "content": "现金流如何？", "role_id": "buffett",
-        })
+    with TestClient(
+        create_app(
+            tmp_path,
+            automatic_updates=False,
+            ai_provider=provider,
+            research_skill_layer=CommitteeSkillLayer(),
+        )
+    ) as client:
+        thread = client.post(
+            "/api/ai/chats",
+            json={
+                "security_id": "CN:SSE:600519:STOCK",
+                "role_id": "buffett",
+                "mode": "assistant",
+                "title": "快速问题",
+            },
+        ).json()
+        response = client.post(
+            f"/api/ai/chats/{thread['thread_id']}/messages",
+            json={
+                "content": "现金流如何？",
+                "role_id": "buffett",
+            },
+        )
 
     assert response.status_code == 200
     assert provider.skill_flags == [True]
@@ -711,13 +856,22 @@ def test_every_investment_assistant_turn_loads_bundled_stock_analysis_skill(tmp_
 def test_committee_redirects_a_simple_question_without_model_calls(tmp_path: Path) -> None:
     provider = CommitteeProvider()
     with TestClient(create_app(tmp_path, automatic_updates=False, ai_provider=provider)) as client:
-        thread = client.post("/api/ai/chats", json={
-            "security_id": "CN:SSE:600519:STOCK", "role_id": "general",
-            "mode": "committee", "title": "简单问题",
-        }).json()
-        reply = client.post(f"/api/ai/chats/{thread['thread_id']}/messages", json={
-            "content": "现在的市盈率是多少？", "role_id": "general",
-        }).json()
+        thread = client.post(
+            "/api/ai/chats",
+            json={
+                "security_id": "CN:SSE:600519:STOCK",
+                "role_id": "general",
+                "mode": "committee",
+                "title": "简单问题",
+            },
+        ).json()
+        reply = client.post(
+            f"/api/ai/chats/{thread['thread_id']}/messages",
+            json={
+                "content": "现在的市盈率是多少？",
+                "role_id": "general",
+            },
+        ).json()
 
     assert reply["suggested_mode"] == "assistant"
     assert provider.chat_calls == 0
@@ -737,19 +891,31 @@ class BlockingCommitteeProvider(CommitteeProvider):
 
 def test_committee_returns_immediately_and_exposes_durable_progress(tmp_path: Path) -> None:
     provider = BlockingCommitteeProvider()
-    with TestClient(create_app(
-        tmp_path, automatic_updates=False, ai_provider=provider,
-        research_skill_layer=CommitteeSkillLayer(),
-    )) as client:
-        thread = client.post("/api/ai/chats", json={
-            "security_id": "CN:SSE:512480:FUND", "role_id": "general",
-            "mode": "committee", "title": "后台投委会",
-        }).json()
+    with TestClient(
+        create_app(
+            tmp_path,
+            automatic_updates=False,
+            ai_provider=provider,
+            research_skill_layer=CommitteeSkillLayer(),
+        )
+    ) as client:
+        thread = client.post(
+            "/api/ai/chats",
+            json={
+                "security_id": "CN:SSE:512480:FUND",
+                "role_id": "general",
+                "mode": "committee",
+                "title": "后台投委会",
+            },
+        ).json()
         started_at = time.monotonic()
-        accepted = client.post(f"/api/ai/chats/{thread['thread_id']}/messages", json={
-            "content": "请深度复盘这只基金的持仓、流动性和组合风险",
-            "role_id": "general",
-        })
+        accepted = client.post(
+            f"/api/ai/chats/{thread['thread_id']}/messages",
+            json={
+                "content": "请深度复盘这只基金的持仓、流动性和组合风险",
+                "role_id": "general",
+            },
+        )
         assert time.monotonic() - started_at < 0.5
         assert accepted.status_code == 200
         assert accepted.json()["status"] == "running"
@@ -785,23 +951,25 @@ def test_app_server_uses_authoritative_completed_agent_message_when_deltas_are_a
 ) -> None:
     provider = CodexAppServerProvider(tmp_path / "runtime", executable="/bin/false")
     with provider._condition:
-        provider._notifications.extend([
-            {
-                "method": "item/completed",
-                "params": {
-                    "threadId": "thread-1",
-                    "turnId": "turn-1",
-                    "item": {"type": "agentMessage", "id": "item-1", "text": '{"content":"ok"}'},
+        provider._notifications.extend(
+            [
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "item": {"type": "agentMessage", "id": "item-1", "text": '{"content":"ok"}'},
+                    },
                 },
-            },
-            {
-                "method": "turn/completed",
-                "params": {
-                    "threadId": "thread-1",
-                    "turn": {"id": "turn-1", "status": "completed"},
+                {
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turn": {"id": "turn-1", "status": "completed"},
+                    },
                 },
-            },
-        ])
+            ]
+        )
 
     assert provider._wait_for_turn("thread-1", "turn-1", operation="深度研究") == '{"content":"ok"}'
 
@@ -826,18 +994,30 @@ class RetryOnceCommitteeProvider(CommitteeProvider):
 
 def test_committee_retries_one_transient_invalid_expert_response(tmp_path: Path) -> None:
     provider = RetryOnceCommitteeProvider()
-    with TestClient(create_app(
-        tmp_path, automatic_updates=False, ai_provider=provider,
-        research_skill_layer=CommitteeSkillLayer(),
-    )) as client:
-        thread = client.post("/api/ai/chats", json={
-            "security_id": "CN:SSE:600519:STOCK", "role_id": "general",
-            "mode": "committee", "title": "公司深度复盘",
-        }).json()
-        client.post(f"/api/ai/chats/{thread['thread_id']}/messages", json={
-            "content": "请深度复盘公司的商业质量、估值、护城河和组合风险",
-            "role_id": "general",
-        })
+    with TestClient(
+        create_app(
+            tmp_path,
+            automatic_updates=False,
+            ai_provider=provider,
+            research_skill_layer=CommitteeSkillLayer(),
+        )
+    ) as client:
+        thread = client.post(
+            "/api/ai/chats",
+            json={
+                "security_id": "CN:SSE:600519:STOCK",
+                "role_id": "general",
+                "mode": "committee",
+                "title": "公司深度复盘",
+            },
+        ).json()
+        client.post(
+            f"/api/ai/chats/{thread['thread_id']}/messages",
+            json={
+                "content": "请深度复盘公司的商业质量、估值、护城河和组合风险",
+                "role_id": "general",
+            },
+        )
         deadline = time.monotonic() + 3
         while True:
             restored = client.get(f"/api/ai/chats/{thread['thread_id']}").json()
@@ -853,24 +1033,40 @@ def test_committee_retries_one_transient_invalid_expert_response(tmp_path: Path)
         for event in restored["events"]
     )
     with sqlite3.connect(tmp_path / "vault.sqlite3") as connection:
-        assert connection.execute(
-            "SELECT attempt FROM research_tasks WHERE assigned_role = 'duan_yongping'"
-        ).fetchone()[0] == 2
+        assert (
+            connection.execute(
+                "SELECT attempt FROM research_tasks WHERE assigned_role = 'duan_yongping'"
+            ).fetchone()[0]
+            == 2
+        )
 
 
 def test_normal_assistant_can_use_runtime_market_skill_for_deep_research(tmp_path: Path) -> None:
     provider = CommitteeProvider()
-    with TestClient(create_app(
-        tmp_path, automatic_updates=False, ai_provider=provider,
-        research_skill_layer=CommitteeSkillLayer(),
-    )) as client:
-        thread = client.post("/api/ai/chats", json={
-            "security_id": "CN:SSE:600519:STOCK", "role_id": "buffett",
-            "mode": "assistant", "title": "单专家深度复盘",
-        }).json()
-        client.post(f"/api/ai/chats/{thread['thread_id']}/messages", json={
-            "content": "请深度复盘当前持仓逻辑和主要风险", "role_id": "buffett",
-        })
+    with TestClient(
+        create_app(
+            tmp_path,
+            automatic_updates=False,
+            ai_provider=provider,
+            research_skill_layer=CommitteeSkillLayer(),
+        )
+    ) as client:
+        thread = client.post(
+            "/api/ai/chats",
+            json={
+                "security_id": "CN:SSE:600519:STOCK",
+                "role_id": "buffett",
+                "mode": "assistant",
+                "title": "单专家深度复盘",
+            },
+        ).json()
+        client.post(
+            f"/api/ai/chats/{thread['thread_id']}/messages",
+            json={
+                "content": "请深度复盘当前持仓逻辑和主要风险",
+                "role_id": "buffett",
+            },
+        )
 
     assert provider.roles_seen == ["buffett"]
     assert provider.skill_flags == [True]
@@ -886,16 +1082,29 @@ class PartialSkillLayer(CommitteeSkillLayer):
 
 def test_normal_assistant_loads_stock_analysis_when_evidence_pass_still_has_gaps(tmp_path: Path) -> None:
     provider = CommitteeProvider()
-    with TestClient(create_app(
-        tmp_path, automatic_updates=False, ai_provider=provider,
-        research_skill_layer=PartialSkillLayer(),
-    )) as client:
-        thread = client.post("/api/ai/chats", json={
-            "security_id": "CN:SSE:600519:STOCK", "role_id": "buffett",
-            "mode": "assistant", "title": "补证",
-        }).json()
-        client.post(f"/api/ai/chats/{thread['thread_id']}/messages", json={
-            "content": "你怎么看这家公司？", "role_id": "buffett",
-        })
+    with TestClient(
+        create_app(
+            tmp_path,
+            automatic_updates=False,
+            ai_provider=provider,
+            research_skill_layer=PartialSkillLayer(),
+        )
+    ) as client:
+        thread = client.post(
+            "/api/ai/chats",
+            json={
+                "security_id": "CN:SSE:600519:STOCK",
+                "role_id": "buffett",
+                "mode": "assistant",
+                "title": "补证",
+            },
+        ).json()
+        client.post(
+            f"/api/ai/chats/{thread['thread_id']}/messages",
+            json={
+                "content": "你怎么看这家公司？",
+                "role_id": "buffett",
+            },
+        )
 
     assert provider.skill_flags == [True]

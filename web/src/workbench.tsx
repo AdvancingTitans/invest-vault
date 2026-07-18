@@ -12,7 +12,12 @@ type Holding = {
   bought_on: string | null;
   quantity: string | null;
   price: number | null;
+  previous_close: number | null;
   change_percent: number | null;
+  pe_ttm: number | null;
+  pb: number | null;
+  market_cap_100m: number | null;
+  currency: "CNY" | "HKD";
   trade_date: string | null;
   data_session: "盘前" | "盘中" | "盘后";
   data_label: string;
@@ -47,6 +52,8 @@ type Material = {
 type Note = {
   note_id: string;
   security_id: string;
+  title: string | null;
+  market_session: "盘前" | "盘中" | "盘后" | null;
   body: string;
   created_at: string;
   updated_at?: string;
@@ -255,8 +262,21 @@ type AIModel = {
 };
 type AIModelTask = "quick_note" | "research" | "committee";
 type AISettings = {
-  provider: "codex_app_server";
-  tasks: Record<AIModelTask, { model_id: string | null; reasoning_effort: string | null }>;
+  provider: "multi_provider";
+  tasks: Record<AIModelTask, {
+    provider_id: string;
+    model_id: string | null;
+    reasoning_effort: string | null;
+  }>;
+};
+type AIProviderOption = {
+  provider_id: "codex" | "openai" | "anthropic" | "google" | "deepseek";
+  name: string;
+  auth_kind: "codex_login" | "api_key";
+  models: string[];
+  configured: boolean;
+  masked: string | null;
+  updated_at: string | null;
 };
 type QuickNoteShape = {
   title: string;
@@ -534,6 +554,12 @@ const invested = (value: string | null) =>
   value === null
     ? "—"
     : `¥${Number(value).toLocaleString("zh-CN", { maximumFractionDigits: 2 })}`;
+const quotePrice = (value: number | null, currency: "CNY" | "HKD") =>
+  value === null
+    ? "—"
+    : `${currency === "HKD" ? "HK$" : "¥"}${value.toLocaleString("zh-CN", {
+        maximumFractionDigits: 2,
+      })}`;
 const symbolOf = (securityId: string) => securityId.split(":")[2];
 const tone = (value: number | null) =>
   value === null ? "" : value >= 0 ? "up" : "down";
@@ -1115,14 +1141,23 @@ function HoldingDeck({
                 )}
               </div>
               <div className="footer">
-                <span>{item.data_label}</span>
-                <span
-                  className={`status-pill ${item.trade_date !== archiveDate ? "stale" : "fresh"}`}
-                >
-                  {item.trade_date !== archiveDate
-                    ? "数据缺失"
-                    : item.profit_basis ?? "已归档"}
+                <span>
+                  {item.data_label}
+                  {item.profit_basis && <small>盈亏口径：{item.profit_basis}</small>}
                 </span>
+                {item.trade_date !== archiveDate || item.price === null ? (
+                  <span className="status-pill stale">数据缺失</span>
+                ) : (
+                  <span className="holding-card-quote">
+                    <small>{item.asset_type === "fund" ? "最新净值" : "最新价"}</small>
+                    <b className="mono">
+                      {item.currency === "HKD" ? "HK$" : "¥"}{item.price.toLocaleString("zh-CN")}
+                    </b>
+                    {item.change_percent !== null && (
+                      <i className={`mono ${tone(item.change_percent)}`}>{percent(item.change_percent)}</i>
+                    )}
+                  </span>
+                )}
               </div>
             </button>
             <button
@@ -1312,13 +1347,26 @@ function Today({
   addHoldings,
   navigate,
   openHolding,
+  refreshQuotes,
+  refreshMaterials,
 }: {
   data: Bootstrap;
   workspaces: Record<string, Workspace>;
   addHoldings: () => void;
   navigate: (key: string) => void;
   openHolding: (id: string) => void;
+  refreshQuotes: () => Promise<void>;
+  refreshMaterials: () => Promise<void>;
 }) {
+  const [refreshing, setRefreshing] = useState<"quotes" | "materials" | null>(null);
+  const refreshSection = async (section: "quotes" | "materials") => {
+    setRefreshing(section);
+    try {
+      await (section === "quotes" ? refreshQuotes() : refreshMaterials());
+    } finally {
+      setRefreshing(null);
+    }
+  };
   if (!data.holdings.length)
     return (
       <>
@@ -1367,7 +1415,12 @@ function Today({
         <Card
           title="组合行情摘要"
           action={
-            <span className="meta">盈亏按买入日收盘价估算</span>
+            <div className="card-action-group">
+              <span className="meta">盈亏按买入日收盘价估算</span>
+              <button className="text-button" disabled={refreshing !== null} onClick={() => void refreshSection("quotes")}>
+                {refreshing === "quotes" ? "刷新中…" : "刷新组合行情"}
+              </button>
+            </div>
           }
         >
           <div className="summary-strip today-summary-strip">
@@ -1414,7 +1467,12 @@ function Today({
         <Card
           title="持仓事项"
           action={
-            <span className="meta">最近 {materials.length} 条</span>
+            <div className="card-action-group">
+              <span className="meta">最近 {materials.length} 条</span>
+              <button className="text-button" disabled={refreshing !== null} onClick={() => void refreshSection("materials")}>
+                {refreshing === "materials" ? "刷新中…" : "刷新持仓事项"}
+              </button>
+            </div>
           }
         >
           {materials.length ? (
@@ -1667,8 +1725,8 @@ function MarketPage({
   saveMarketNote,
 }: {
   market: Market;
-  reload: () => Promise<void>;
-  saveMarketNote: (body: string) => Promise<void>;
+  reload: (market: Market) => void;
+  saveMarketNote: (body: string, title?: string, marketSession?: "盘前" | "盘中" | "盘后") => Promise<void>;
 }) {
   const indices = market.indices;
   const lhb = market.lhb;
@@ -1677,15 +1735,15 @@ function MarketPage({
   const pulse = market.pulse;
   const [refreshing, setRefreshing] = useState<string | null>(null);
   const [refreshNotice, setRefreshNotice] = useState("");
-  const refreshMarket = async (section: "all" | "indices" | "lhb" | "industry_flow" | "market_news") => {
+  const refreshMarket = async (section: "all" | "indices" | "lhb" | "industry_flow" | "pulse" | "market_news") => {
     setRefreshing(section);
     setRefreshNotice("");
     try {
-      const result = await api<{ completed: string[]; failed: Record<string, string>; report_stage: MarketReportStage }>(
+      const result = await api<{ completed: string[]; failed: Record<string, string>; report_stage: MarketReportStage; market: Market }>(
         "/api/market/refresh",
         { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ section }) },
       );
-      await reload();
+      reload(result.market);
       const failures = Object.values(result.failed);
       setRefreshNotice(
         failures.length
@@ -1834,23 +1892,23 @@ function MarketPage({
           {flow ? (
             <div className="industry-flow-columns">
               <div>
-                <h4 style={{ fontSize: "12px", color: "var(--success)", margin: "0 0 10px", fontWeight: 650 }}>净流入居前</h4>
+                <h4 style={{ fontSize: "12px", color: "var(--danger)", margin: "0 0 10px", fontWeight: 650 }}>净流入居前</h4>
                 <div style={{ display: "grid", gap: "8px" }}>
                   {flow.inbound.map((row) => (
                     <div style={{ display: "flex", justifyContent: "space-between", gap: "8px", fontSize: "13px" }} key={row.code}>
                       <span>{row.name}</span>
-                      <span className="mono down" style={{ fontWeight: 600 }}>{amountYi(row.net_amount)}</span>
+                      <span className="mono up" style={{ fontWeight: 600 }}>{amountYi(row.net_amount)}</span>
                     </div>
                   ))}
                 </div>
               </div>
               <div>
-                <h4 style={{ fontSize: "12px", color: "var(--danger)", margin: "0 0 10px", fontWeight: 650 }}>净流出居前</h4>
+                <h4 style={{ fontSize: "12px", color: "var(--success)", margin: "0 0 10px", fontWeight: 650 }}>净流出居前</h4>
                 <div style={{ display: "grid", gap: "8px" }}>
                   {flow.outbound.map((row) => (
                     <div style={{ display: "flex", justifyContent: "space-between", gap: "8px", fontSize: "13px" }} key={row.code}>
                       <span>{row.name}</span>
-                      <span className="mono up" style={{ fontWeight: 600 }}>{amountYi(row.net_amount)}</span>
+                      <span className="mono down" style={{ fontWeight: 600 }}>{amountYi(row.net_amount)}</span>
                     </div>
                   ))}
                 </div>
@@ -1903,13 +1961,16 @@ function MarketPage({
         </div>
         {pulse?.kind === "limit_pools" && (
           <>
-            <Card title="赚钱效应与上涨主线">
+            <Card
+              title="赚钱效应与上涨主线"
+              action={<button className="text-button" disabled={refreshing !== null} onClick={() => void refreshMarket("pulse")}>{refreshing === "pulse" ? "刷新中…" : "刷新"}</button>}
+            >
               {pulse.m3?.available ? (
                 <>
                   <p className="pulse-summary">
-                    涨停 <strong>{pulse.m3.limit_up_count}</strong> 家 · 首板 {pulse.m3.first_board_count} · 连板 {pulse.m3.multi_board_count} · 封单 {pulse.m3.seal_fund_yi.toFixed(2)} 亿
+                    涨停 <strong className="up">{pulse.m3.limit_up_count}</strong> 家 · 首板 <strong className="up">{pulse.m3.first_board_count}</strong> · 连板 <strong className="up">{pulse.m3.multi_board_count}</strong> · 封单 <strong className="up">{pulse.m3.seal_fund_yi.toFixed(2)}</strong> 亿
                   </p>
-                  <div className="pulse-leaders">
+                  <div className="pulse-leaders upside">
                     {pulse.m3.leaders.slice(0, 5).map((row) => (
                       <span key={row.symbol}>{row.name}（{row.symbol}）<b>{row.board_days}板</b></span>
                     ))}
@@ -1917,11 +1978,14 @@ function MarketPage({
                 </>
               ) : <p className="empty">该交易日涨停池暂不可用。</p>}
             </Card>
-            <Card title="下跌风险">
+            <Card
+              title="下跌风险"
+              action={<button className="text-button" disabled={refreshing !== null} onClick={() => void refreshMarket("pulse")}>{refreshing === "pulse" ? "刷新中…" : "刷新"}</button>}
+            >
               {pulse.m4?.available ? (
                 <>
                   <p className="pulse-summary">
-                    跌停 <strong>{pulse.m4.limit_down_count}</strong> 家 · 炸板 {pulse.m4.failed_breakout_count} 家 · 炸板率 {pulse.m4.failed_breakout_ratio == null ? "—" : `${(pulse.m4.failed_breakout_ratio * 100).toFixed(1)}%`}
+                    跌停 <strong className="down">{pulse.m4.limit_down_count}</strong> 家 · 炸板 <strong className="down">{pulse.m4.failed_breakout_count}</strong> 家 · 炸板率 <strong className="down">{pulse.m4.failed_breakout_ratio == null ? "—" : `${(pulse.m4.failed_breakout_ratio * 100).toFixed(1)}%`}</strong>
                   </p>
                   <div className="pulse-leaders risk">
                     {pulse.m4.rows.slice(0, 5).map((row) => (
@@ -2061,7 +2125,7 @@ function NoteDisclosure({ note }: { note: Note }) {
             <header>
               <div>
                 <span>投资笔记</span>
-                <h2 id={`note-detail-title-${note.note_id}`}>{note.source_title || "笔记详情"}</h2>
+                <h2 id={`note-detail-title-${note.note_id}`}>{note.title || note.source_title || "笔记详情"}</h2>
               </div>
               <button ref={detailCloseRef} className="secondary" onClick={() => setOpen(false)}>
                 关闭
@@ -2118,6 +2182,7 @@ function EditableNotes({
               {item.source_title}
             </a>
           )}
+          {item.title && <strong className="note-record-title">{item.title}</strong>}
           {editing === item.note_id ? (
             <div className="inline-editor">
               <textarea
@@ -2448,6 +2513,14 @@ function Security({
             <div className="security-overview-scroll" tabIndex={0} aria-label="行情概览指标，可横向滚动">
               <div className="security-overview-metrics">
               <div className="metric-card">
+                <div className="label">最新价</div>
+                <div className="value">{quotePrice(selected.price, selected.currency)}</div>
+              </div>
+              <div className="metric-card">
+                <div className="label">涨跌幅</div>
+                <div className={`value ${tone(selected.change_percent)}`}>{percent(selected.change_percent)}</div>
+              </div>
+              <div className="metric-card">
                 <div className="label">买入金额</div>
                 <div className="value">{invested(selected.invested_amount_cny)}</div>
               </div>
@@ -2465,6 +2538,20 @@ function Security({
                 <div className="label">盈亏口径</div>
                 <div className="value" style={{ fontSize: "16px" }}>
                   {selected.profit_basis ?? selected.profit_reason ?? "—"}
+                </div>
+              </div>
+              <div className="metric-card">
+                <div className="label">PE（行情口径）</div>
+                <div className="value">{selected.pe_ttm == null ? "—" : selected.pe_ttm.toFixed(2)}</div>
+              </div>
+              <div className="metric-card">
+                <div className="label">PB（行情口径）</div>
+                <div className="value">{selected.pb == null ? "—" : selected.pb.toFixed(2)}</div>
+              </div>
+              <div className="metric-card">
+                <div className="label">总市值</div>
+                <div className="value" style={{ fontSize: "16px" }}>
+                  {selected.market_cap_100m == null ? "—" : `${selected.market_cap_100m.toLocaleString("zh-CN", { maximumFractionDigits: 2 })} 亿${selected.currency === "HKD" ? "港元" : "元"}`}
                 </div>
               </div>
               </div>
@@ -2820,7 +2907,12 @@ function Research({
   workspaces: Record<string, Workspace>;
   selected?: Holding;
   setSelected: (id: string) => void;
-  saveNote: (body: string, securityId?: string) => Promise<void>;
+  saveNote: (
+    body: string,
+    securityId?: string,
+    title?: string,
+    marketSession?: "盘前" | "盘中" | "盘后",
+  ) => Promise<void>;
   editNote: (note: Note, body: string) => Promise<void>;
   deleteNote: (note: Note) => void;
   reload: () => Promise<void>;
@@ -2833,6 +2925,9 @@ function Research({
   const [working, setWorking] = useState(false);
   const [notice, setNotice] = useState("");
   const [scopeId, setScopeId] = useState(selected?.security_id ?? "all");
+  const [marketSession, setMarketSession] = useState<"盘前" | "盘中" | "盘后">(
+    data.market.report_stage?.session ?? "盘后",
+  );
   const [query, setQuery] = useState("");
   const expandInlineSelection = (value: string, start: number, end: number) => {
     if (value.slice(start, start + 2) === "**" && value.slice(end - 2, end) === "**")
@@ -2916,6 +3011,11 @@ function Research({
   const allNotes = Object.values(workspaces)
     .flatMap((item) => item.notes)
     .filter((item) => scopeId === "all" || item.security_id === scopeId)
+    .filter(
+      (item) =>
+        scopeId !== marketOverviewSubject.security_id ||
+        item.market_session === marketSession,
+    )
     .filter((item) => item.body.toLowerCase().includes(query.trim().toLowerCase()))
     .sort((a, b) =>
       (b.updated_at ?? b.created_at).localeCompare(a.updated_at ?? a.created_at),
@@ -3011,12 +3111,24 @@ function Research({
                 {item.name}
               </button>
             ))}
-            <button
-              className={`note-scope-option ${scopeId === marketOverviewSubject.security_id ? "active" : ""}`}
-              onClick={() => { setScopeId(marketOverviewSubject.security_id); setDraft(null); }}
-            >
-              市场概览
-            </button>
+            <div className="note-scope-heading">按市场概览</div>
+            <div className="market-note-stage-tabs" role="tablist" aria-label="按行情阶段筛选市场笔记">
+              {(["盘前", "盘中", "盘后"] as const).map((session) => (
+                <button
+                  key={session}
+                  role="tab"
+                  aria-selected={scopeId === marketOverviewSubject.security_id && marketSession === session}
+                  className={`note-scope-option ${scopeId === marketOverviewSubject.security_id && marketSession === session ? "active" : ""}`}
+                  onClick={() => {
+                    setScopeId(marketOverviewSubject.security_id);
+                    setMarketSession(session);
+                    setDraft(null);
+                  }}
+                >
+                  {session}
+                </button>
+              ))}
+            </div>
           </div>
         </div>
         <Card title="最近笔记" action={<span className="meta">共 {allNotes.length} 条</span>} style={{}}>
@@ -3064,7 +3176,12 @@ function Research({
                 <button
                   disabled={!note.trim()}
                   onClick={async () => {
-                    await saveNote(note, editorSubject.security_id);
+                    await saveNote(
+                      note,
+                      editorSubject.security_id,
+                      undefined,
+                      scopeId === marketOverviewSubject.security_id ? marketSession : undefined,
+                    );
                     setNote("");
                   }}
                 >
@@ -3110,7 +3227,11 @@ function ResearchAssistant({
   initialMarketStage,
 }: {
   selected?: Pick<Holding, "security_id" | "name" | "symbol">;
-  saveNote?: (body: string) => Promise<void>;
+  saveNote?: (
+    body: string,
+    title?: string,
+    marketSession?: "盘前" | "盘中" | "盘后",
+  ) => Promise<void>;
   scene?: "security" | "market";
   beforeMarketReport?: () => Promise<MarketReportStage | undefined>;
   initialMarketStage?: MarketReportStage;
@@ -3259,6 +3380,17 @@ function ResearchAssistant({
   };
   if (!selected) return <p className="empty">添加持仓后可开始研究对话。</p>;
   const role = roles.find((item) => item.role_id === roleId);
+  const marketNoteTitle = (event: ChatEvent) => {
+    if (scene !== "market" || !marketStage) return undefined;
+    const [year, month, dayOfMonth] = marketStage.report_date.split("-").map(Number);
+    const dateLabel = `${year}年${month}月${dayOfMonth}日`;
+    if (thread?.thread_type === "committee" && event.event_type !== "report.completed")
+      return `${dateLabel} ${marketStage.session}报告（投委会模式）${event.payload.role_name || "专家"}结论`;
+    const styleName = thread?.thread_type === "committee"
+      ? "投委会"
+      : event.payload.role_name || roles.find((item) => item.role_id === marketStyle)?.name || "研究助手";
+    return `${dateLabel} ${marketStage.session}报告（${styleName}）最终稿`;
+  };
   const excerpt = async (event: ChatEvent) => {
     if (!saveNote) return;
     const index =
@@ -3274,6 +3406,8 @@ function ResearchAssistant({
       : "";
     await saveNote(
       `${scene === "market" && marketStage ? `行情阶段\n${marketStage.label}\n\n` : ""}问题\n${question}\n\n${event.payload.role_name || "研究助手"}\n${cleanAssistantText(event.payload.content)}${sources}`,
+      marketNoteTitle(event),
+      scene === "market" ? marketStage?.session : undefined,
     );
     setSavedEvent(event.event_id);
   };
@@ -3382,13 +3516,53 @@ function ResearchAssistant({
       )}
       <div className="chat-timeline" ref={timelineRef} aria-live="polite">
         {!thread?.events.length && (
-          <p className="empty">
-            {scene === "market"
-              ? "生成当前市场行情报告。助手会区分盘前、盘中和盘后数据，并基于本地账本说明持仓暴露与下一步观察条件。"
-              : mode === "committee"
-              ? "研究计划、证据、专家意见和报告将在这里展开。"
-              : `向 ${role?.name ?? "通用模式"} 提问。助手会按信源读取左侧标的的已归档证据、关联资料和历史笔记。`}
-          </p>
+          scene === "market" ? (
+            <p className="empty">生成当前市场行情报告。助手会区分盘前、盘中和盘后数据，并基于本地账本说明持仓暴露与下一步观察条件。</p>
+          ) : mode === "committee" ? (
+            <div className="committee-empty-state">
+              <div>
+                <span className="committee-empty-kicker">深度研究工作流</span>
+                <strong>从证据开始，而不是从结论开始</strong>
+                <p>协调员会拆解问题、核对本地证据、选择 6 位互补委员，最后保留共识、分歧与数据缺口。</p>
+              </div>
+              <ol aria-label="投委会研究步骤">
+                <li><b>01</b><span>制定计划与证据清单</span></li>
+                <li><b>02</b><span>并行审议与反方检查</span></li>
+                <li><b>03</b><span>汇总条件化深度报告</span></li>
+              </ol>
+              <div className="committee-question-list" aria-label="深度复盘问题示例">
+                {[
+                  "深度复盘当前核心矛盾、证据变化与失效条件",
+                  "从反方角度审查估值、现金流和竞争风险",
+                  "结合我的持仓成本，列出下一次复核清单",
+                ].map((question) => (
+                  <button className="committee-question" key={question} onClick={() => setText(question)}>{question}</button>
+                ))}
+              </div>
+            </div>
+          ) : (
+            <div className="assistant-empty-state">
+              <div>
+                <span className="committee-empty-kicker">单专家研究</span>
+                <strong>让问题落到已归档证据上</strong>
+                <p>{role?.name ?? "通用模式"}会围绕当前标的组织事实、判断与缺口；每次提问独立分析，不自动沿用旧结论。</p>
+              </div>
+              <ol aria-label="普通助手证据范围">
+                <li><b>01</b><span>已归档行情</span></li>
+                <li><b>02</b><span>关联资料与财务</span></li>
+                <li><b>03</b><span>历史笔记与待验证项</span></li>
+              </ol>
+              <div className="assistant-question-list" aria-label="投资问题示例">
+                {[
+                  "现金流变化是否削弱了原投资逻辑？",
+                  "当前估值需要哪些增长假设才能成立？",
+                  "列出下一次复核最值得关注的三项证据",
+                ].map((question) => (
+                  <button className="committee-question" key={question} onClick={() => setText(question)}>{question}</button>
+                ))}
+              </div>
+            </div>
+          )
         )}
         {thread?.active_run?.status === "running" && (
           <div className="committee-live-status" role="status">
@@ -3640,9 +3814,7 @@ function SecurityWorkbench({
         </div>
         <div className="security-quote-price">
           <div className="mono security-price-value">
-            {selected.price != null
-              ? `¥${selected.price.toLocaleString("zh-CN", { maximumFractionDigits: 2 })}`
-              : "—"}
+            {quotePrice(selected.price, selected.currency)}
           </div>
           <div className={`mono security-price-change ${selected.change_percent != null && selected.change_percent >= 0 ? "up" : "down"}`}>
             {selected.change_percent != null
@@ -3722,24 +3894,32 @@ function SettingsPage() {
   const [status, setStatus] = useState<AIStatus | null>(null);
   const [settings, setSettings] = useState<AISettings | null>(null);
   const [models, setModels] = useState<AIModel[]>([]);
-  const [message, setMessage] = useState("正在读取 Codex 状态…");
+  const [providers, setProviders] = useState<AIProviderOption[]>([]);
+  const [providerKeys, setProviderKeys] = useState<Record<string, string>>({});
+  const [message, setMessage] = useState("正在读取 Provider 状态…");
   const [busy, setBusy] = useState(false);
   const load = async () => {
-    const [nextStatus, nextSettings] = await Promise.all([
-      api<AIStatus>("/api/ai/status"),
-      api<AISettings>("/api/ai/settings"),
-    ]);
-    setStatus(nextStatus);
-    setSettings(nextSettings);
-    if (nextStatus.authenticated) {
-      try {
-        setModels(await api<AIModel[]>("/api/ai/models"));
-      } catch (error) {
-        setMessage(error instanceof Error ? error.message : "模型目录暂不可用");
-        return;
-      }
+    try {
+      const [nextSettings, nextProviders] = await Promise.all([
+        api<AISettings>("/api/ai/settings"),
+        api<{ providers: AIProviderOption[] }>("/api/ai/providers"),
+      ]);
+      setSettings(nextSettings);
+      setProviders(nextProviders.providers);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Provider 设置读取失败");
+      return;
     }
-    setMessage(nextStatus.detail);
+    try {
+      const nextStatus = await api<AIStatus>("/api/ai/status");
+      setStatus(nextStatus);
+      if (nextStatus.authenticated) {
+        setModels(await api<AIModel[]>("/api/ai/models"));
+      }
+      setMessage(nextStatus.detail);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Codex 状态暂不可用，仍可配置 API key");
+    }
   };
   useEffect(() => { void load(); }, []);
   const login = async () => {
@@ -3763,11 +3943,10 @@ function SettingsPage() {
   };
   const saveTask = async (
     task: AIModelTask,
-    field: "model_id" | "reasoning_effort",
-    value: string,
+    patch: Partial<AISettings["tasks"][AIModelTask]>,
   ) => {
     if (!settings) return;
-    const next = { ...settings.tasks[task], [field]: value || null };
+    const next = { ...settings.tasks[task], ...patch };
     setSettings({ ...settings, tasks: { ...settings.tasks, [task]: next } });
     try {
       await api(`/api/ai/settings/models/${task}`, {
@@ -3781,13 +3960,40 @@ function SettingsPage() {
       await load();
     }
   };
+  const saveCredential = async (providerId: string) => {
+    const key = providerKeys[providerId]?.trim();
+    if (!key) return;
+    setBusy(true);
+    try {
+      await api(`/api/ai/providers/${providerId}/credential`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ key }),
+      });
+      setProviderKeys((current) => ({ ...current, [providerId]: "" }));
+      await load();
+      setMessage("API key 已加密保存；首次生成时会由对应 Provider 验证。");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "API key 保存失败");
+    } finally { setBusy(false); }
+  };
+  const deleteCredential = async (providerId: string) => {
+    setBusy(true);
+    try {
+      await api(`/api/ai/providers/${providerId}/credential`, { method: "DELETE" });
+      await load();
+      setMessage("已删除本机保存的 API key。");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "API key 删除失败");
+    } finally { setBusy(false); }
+  };
   const taskLabels: Array<[AIModelTask, string, string]> = [
     ["quick_note", "AI 速记", "整理原始投资笔记"],
     ["research", "研究助手", "单专家问答与市场报告"],
     ["committee", "投委会", "六人审议与深度报告"],
   ];
   return <>
-    <PageHeader eyebrow="设置" title="AI 与模型" description="使用 Codex 管理 ChatGPT 登录；Invest Vault 不读取或保存访问令牌。" />
+    <PageHeader eyebrow="设置" title="AI 与模型" description="可使用本机 Codex 登录态，或为 OpenAI、Anthropic、Google、DeepSeek 配置自带 API key。" />
     <div className="settings-grid">
       <section className="card settings-account" aria-labelledby="codex-account-title">
         <div className="card-header">
@@ -3808,24 +4014,69 @@ function SettingsPage() {
           {status?.authenticated && <button className="secondary" disabled={busy} onClick={() => void logout()}>退出登录</button>}
         </div>
       </section>
+      <section className="card settings-providers" aria-labelledby="provider-settings-title">
+        <div className="card-header"><div><p className="page-eyebrow">本机凭据</p><h2 id="provider-settings-title">Provider 与 API key</h2></div></div>
+        <p className="hint">key 使用 AES-256-GCM 加密写入本地 SQLite；页面只显示末 4 位，保存时不会发起计费请求。</p>
+        <div className="provider-list">
+          {providers.filter((item) => item.auth_kind === "api_key").map((item) => (
+            <div className="provider-row" key={item.provider_id}>
+              <div className="provider-row-heading">
+                <strong>{item.name}</strong>
+                <span className={item.configured ? "provider-state configured" : "provider-state"}>
+                  {item.configured ? `已保存 ${item.masked}` : "未配置"}
+                </span>
+              </div>
+              <div className="provider-key-editor">
+                <input
+                  type="password"
+                  autoComplete="off"
+                  aria-label={`${item.name} API key`}
+                  value={providerKeys[item.provider_id] || ""}
+                  placeholder={item.configured ? "输入新 key 以替换" : "输入 API key"}
+                  onChange={(event) => setProviderKeys((current) => ({ ...current, [item.provider_id]: event.target.value }))}
+                />
+                <button disabled={busy || !providerKeys[item.provider_id]?.trim()} onClick={() => void saveCredential(item.provider_id)}>
+                  {item.configured ? "更新" : "保存"}
+                </button>
+                {item.configured && <button className="secondary" disabled={busy} onClick={() => void deleteCredential(item.provider_id)}>删除</button>}
+              </div>
+            </div>
+          ))}
+        </div>
+      </section>
       <section className="card settings-models" aria-labelledby="model-settings-title">
         <div className="card-header"><div><p className="page-eyebrow">按任务配置</p><h2 id="model-settings-title">模型与推理强度</h2></div></div>
         <p className="hint">留空时跟随 Codex 默认值。设置只影响下一次生成，不改变历史报告。</p>
         <div className="model-task-list">
           {taskLabels.map(([task, label, description]) => {
             const current = settings?.tasks[task];
+            const providerId = current?.provider_id || "codex";
+            const providerOption = providers.find((item) => item.provider_id === providerId);
+            const availableModels = providerId === "codex"
+              ? models.map((model) => ({ id: model.id, name: model.displayName }))
+              : (providerOption?.models || []).map((model) => ({ id: model, name: model }));
             const selectedModel = models.find((model) => model.id === current?.model_id);
             const efforts = selectedModel?.supportedReasoningEfforts?.map((item) =>
               typeof item === "string" ? item : item.reasoningEffort
             ) || ["low", "medium", "high", "xhigh"];
             return <div className="model-task-row" key={task}>
               <div><strong>{label}</strong><span>{description}</span></div>
-              <label><span>模型</span><select value={current?.model_id || ""} disabled={!status?.authenticated} onChange={(event) => void saveTask(task, "model_id", event.target.value)}>
-                <option value="">Codex 默认模型</option>
-                {models.map((model) => <option key={model.id} value={model.id}>{model.displayName}{model.isDefault ? "（默认）" : ""}</option>)}
+              <label><span>Provider</span><select value={providerId} onChange={(event) => {
+                const nextProvider = providers.find((item) => item.provider_id === event.target.value);
+                void saveTask(task, {
+                  provider_id: event.target.value,
+                  model_id: event.target.value === "codex" ? null : nextProvider?.models[0] || null,
+                  reasoning_effort: event.target.value === "codex" ? current?.reasoning_effort || null : null,
+                });
+              }}>
+                {providers.map((item) => <option key={item.provider_id} value={item.provider_id}>{item.name}{item.configured ? "" : "（未配置）"}</option>)}
               </select></label>
-              <label><span>推理强度</span><select value={current?.reasoning_effort || ""} disabled={!status?.authenticated} onChange={(event) => void saveTask(task, "reasoning_effort", event.target.value)}>
-                <option value="">跟随模型默认值</option>
+              <label><span>模型</span><select value={current?.model_id || ""} disabled={!providerOption?.configured} onChange={(event) => void saveTask(task, { model_id: event.target.value || null })}>
+                {providerId === "codex" && <option value="">Codex 默认模型</option>}
+                {availableModels.map((model) => <option key={model.id} value={model.id}>{model.name}</option>)}
+              </select></label>
+              <label><span>推理强度</span><select value={providerId === "codex" ? current?.reasoning_effort || "" : ""} disabled={providerId !== "codex" || !status?.authenticated} onChange={(event) => void saveTask(task, { reasoning_effort: event.target.value || null })}>
+                <option value="">{providerId === "codex" ? "跟随模型默认值" : "由 Provider 管理"}</option>
                 {efforts.map((effort) => <option key={effort} value={effort}>{effort}</option>)}
               </select></label>
             </div>;
@@ -3993,6 +4244,16 @@ export function App() {
       "持仓行情、证券资料与盈亏估算已更新",
     );
   };
+  const refreshHoldingSection = async (scope: "quotes" | "materials") => {
+    await run(
+      async () => {
+        await api(`/api/holdings/refresh?scope=${scope}`, { method: "POST" });
+        await load(false);
+      },
+      scope === "quotes" ? "正在刷新组合行情并重算盈亏…" : "正在刷新持仓公告与财务资料…",
+      scope === "quotes" ? "组合行情与盈亏估算已更新" : "持仓事项已更新",
+    );
+  };
   useEffect(() => {
     load().catch((error) => setMessage(`本地服务不可用：${error.message}`));
     let lastCheck = Date.now();
@@ -4092,7 +4353,12 @@ export function App() {
       entry,
       label: `${symbolOf(entry.security_id)} · 买入金额 ${invested(entry.invested_amount_cny)} · ${entry.bought_on}`,
     });
-  const saveNote = (body: string, securityId?: string) =>
+  const saveNote = (
+    body: string,
+    securityId?: string,
+    title?: string,
+    marketSession?: "盘前" | "盘中" | "盘后",
+  ) =>
     run(
       async () => {
         const targetSecurityId = securityId ?? selected?.security_id;
@@ -4100,7 +4366,7 @@ export function App() {
         await api("/api/research/notes", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ security_id: targetSecurityId, body }),
+          body: JSON.stringify({ security_id: targetSecurityId, body, title, market_session: marketSession }),
         });
         await load();
       },
@@ -4276,14 +4542,18 @@ export function App() {
           addHoldings={addHoldings}
           navigate={setActive}
           openHolding={openHolding}
+          refreshQuotes={() => refreshHoldingSection("quotes")}
+          refreshMaterials={() => refreshHoldingSection("materials")}
         />
       );
     else if (active === "market")
       content = (
         <MarketPage
           market={data.market}
-          reload={load}
-          saveMarketNote={(body) => saveNote(body, marketOverviewSubject.security_id)}
+          reload={(market) => setData((current) => current ? { ...current, market } : current)}
+          saveMarketNote={(body, title, marketSession) =>
+            saveNote(body, marketOverviewSubject.security_id, title, marketSession)
+          }
         />
       );
     else if (active === "portfolio")
@@ -4469,7 +4739,7 @@ export function App() {
         </nav>
         <div className="side-foot">
           <span className="local-dot">● 本地优先 · 数据私有</span>
-          <span>v0.3.24</span>
+        <span>v0.3.28</span>
         </div>
       </aside>
       <main id="content">

@@ -84,7 +84,8 @@ def export_markdown(vault: Vault, destination: Path, *, data_cutoff: str) -> Pat
     lines.extend(["", "## 研究笔记", ""])
     for row in vault.connection.execute(
         """SELECT n.security_id, COALESCE(nr.created_at, n.created_at) created_at,
-        COALESCE(nr.body, n.body) body, m.title, m.source_url, r.quoted_text
+        COALESCE(nr.body, n.body) body, n.title AS note_title,
+        m.title AS material_title, m.source_url, r.quoted_text
         FROM notes n
         LEFT JOIN note_revisions nr ON nr.revision_id = (
             SELECT revision_id FROM note_revisions WHERE note_id = n.note_id
@@ -94,9 +95,11 @@ def export_markdown(vault: Vault, destination: Path, *, data_cutoff: str) -> Pat
         LEFT JOIN research_materials m ON m.material_id = r.material_id
         WHERE COALESCE(nr.is_deleted, 0) = 0 ORDER BY COALESCE(nr.created_at, n.created_at)"""
     ):
-        lines.append(f"### {row['security_id']} · {row['created_at']}")
-        if row["title"]:
-            lines.extend(["", f"资料：[{row['title']}]({row['source_url']})", "", f"> {row['quoted_text']}"])
+        lines.append(f"### {row['note_title'] or row['security_id']} · {row['created_at']}")
+        if row["material_title"]:
+            lines.extend(
+                ["", f"资料：[{row['material_title']}]({row['source_url']})", "", f"> {row['quoted_text']}"]
+            )
         lines.extend(["", row["body"], ""])
     destination.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return destination

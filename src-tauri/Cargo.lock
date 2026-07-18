@@ -1766,7 +1766,7 @@ dependencies = [
 
 [[package]]
 name = "invest-vault"
-version = "0.3.24"
+version = "0.3.28"
 dependencies = [
  "rfd",
  "tauri",

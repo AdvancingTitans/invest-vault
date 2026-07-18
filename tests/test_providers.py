@@ -18,6 +18,7 @@ from invest_vault.providers import (
     fetch_profit_forecast,
     fetch_public_news,
     fetch_sector_price_history,
+    fetch_security_live_quote,
     fetch_security_price_history,
     fetch_security_valuation,
     market_report_stage,
@@ -34,18 +35,10 @@ from invest_vault.providers import (
 
 
 def test_market_report_stage_is_automatic_for_trade_day_and_holiday() -> None:
-    premarket = market_report_stage(
-        datetime(2026, 7, 20, 8, 45, tzinfo=ZoneInfo("Asia/Shanghai"))
-    )
-    intraday = market_report_stage(
-        datetime(2026, 7, 20, 10, 15, tzinfo=ZoneInfo("Asia/Shanghai"))
-    )
-    postmarket = market_report_stage(
-        datetime(2026, 7, 20, 15, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
-    )
-    holiday = market_report_stage(
-        datetime(2026, 10, 2, 10, 15, tzinfo=ZoneInfo("Asia/Shanghai"))
-    )
+    premarket = market_report_stage(datetime(2026, 7, 20, 8, 45, tzinfo=ZoneInfo("Asia/Shanghai")))
+    intraday = market_report_stage(datetime(2026, 7, 20, 10, 15, tzinfo=ZoneInfo("Asia/Shanghai")))
+    postmarket = market_report_stage(datetime(2026, 7, 20, 15, 30, tzinfo=ZoneInfo("Asia/Shanghai")))
+    holiday = market_report_stage(datetime(2026, 10, 2, 10, 15, tzinfo=ZoneInfo("Asia/Shanghai")))
 
     assert (premarket["session"], premarket["report_date"]) == ("盘前", "2026-07-20")
     assert intraday["session"] == "盘中"
@@ -57,13 +50,18 @@ def test_market_report_stage_is_automatic_for_trade_day_and_holiday() -> None:
 def test_market_breadth_requires_complete_unique_population() -> None:
     def request(url: str) -> bytes:
         assert "clist/get" in url
-        return json.dumps({
-            "data": {"total": 3, "diff": [
-                {"f12": "600001", "f3": 1.2},
-                {"f12": "000001", "f3": -0.5},
-                {"f12": "300001", "f3": 0},
-            ]}
-        }).encode()
+        return json.dumps(
+            {
+                "data": {
+                    "total": 3,
+                    "diff": [
+                        {"f12": "600001", "f3": 1.2},
+                        {"f12": "000001", "f3": -0.5},
+                        {"f12": "300001", "f3": 0},
+                    ],
+                }
+            }
+        ).encode()
 
     result = fetch_a_share_market_breadth(date(2026, 7, 20), request=request)
 
@@ -77,10 +75,14 @@ def test_market_breadth_falls_back_to_complete_sina_pages() -> None:
         if "clist/get" in url:
             raise OSError("primary unavailable")
         page = int(urllib.parse.parse_qs(urllib.parse.urlparse(url).query)["page"][0])
-        rows = [
-            {"code": "600001", "changepercent": "1.2"},
-            {"code": "000001", "changepercent": "-0.5"},
-        ] if page == 1 else []
+        rows = (
+            [
+                {"code": "600001", "changepercent": "1.2"},
+                {"code": "000001", "changepercent": "-0.5"},
+            ]
+            if page == 1
+            else []
+        )
         return json.dumps(rows).encode()
 
     result = fetch_a_share_market_breadth(date(2026, 7, 20), request=request, page_size=2)
@@ -119,7 +121,13 @@ def test_global_index_price_volume_uses_verified_fallbacks_for_bj_and_us() -> No
         decoded = urllib.parse.unquote(url)
         if "fqkline" in url:
             code = re.search(r"param=([^,%]+)", decoded).group(1)
-            return json.dumps({"data": {code: {"day": [] if code.startswith(("bj", "us")) else [["2026-05-01", "1", "2"]] * 2}}}).encode()
+            return json.dumps(
+                {
+                    "data": {
+                        code: {"day": [] if code.startswith(("bj", "us")) else [["2026-05-01", "1", "2"]] * 2}
+                    }
+                }
+            ).encode()
         if "US_MinKService" in url:
             return f"var({json.dumps(history)})".encode()
         if "push2his" in url:
@@ -137,19 +145,136 @@ def test_global_index_price_volume_uses_verified_fallbacks_for_bj_and_us() -> No
 
 def test_global_index_overview_keeps_all_thirteen_closes_and_activity_fields() -> None:
     codes = {
-        "sh000001": ("上证指数", "3764.15", "3882.41", "650450984", "20260717161402", "-118.26", "-3.05", "124644545"),
-        "sz399001": ("深证成指", "13706.88", "14488.65", "763770395", "20260717161451", "-781.77", "-5.40", "140851331"),
-        "sz399006": ("创业板指", "3428.63", "3692.46", "230221243", "20260717161406", "-263.83", "-7.15", "68260370"),
-        "sh000300": ("沪深300", "4529.10", "4698.43", "302629886", "20260717161408", "-169.33", "-3.60", "92082241"),
-        "sh000688": ("科创50", "1715.40", "1846.88", "16629024", "20260717161414", "-131.48", "-7.12", "19147353"),
-        "sz399005": ("中小100", "8604.67", "9045.83", "70341078", "20260717161403", "-441.16", "-4.88", "23147870"),
-        "bj899050": ("北证50", "1076.38", "1101.80", "8647241", "20260717153625", "-25.42", "-2.31", "1690599.19"),
-        "hkHSI": ("恒生指数", "24562.240", "25008.600", "34732530.8302", "2026/07/17 18:31:09", "-446.360", "-1.78", "34732530.830"),
-        "hkHSCEI": ("国企指数", "8136.730", "8318.140", "11134217.3095", "2026/07/17 16:08:36", "-181.410", "-2.18", "11134217.309"),
-        "hkHSTECH": ("恒生科技指数", "4623.170", "4834.440", "11550937.9524", "2026/07/17 16:08:36", "-211.270", "-4.37", "11550937.952"),
-        "usINX": ("标普500", "7457.69", "7533.77", "3397503316", "2026-07-17 16:43:30", "-76.08", "-1.01", "25337526504700"),
-        "usIXIC": ("纳斯达克", "25520.24", "25881.95", "6557165689", "2026-07-17 17:15:59", "-361.71", "-1.40", "167340466364558"),
-        "usDJI": ("道琼斯", "52146.42", "52552.97", "549691647", "2026-07-17 16:43:30", "-406.55", "-0.77", "28748736408349"),
+        "sh000001": (
+            "上证指数",
+            "3764.15",
+            "3882.41",
+            "650450984",
+            "20260717161402",
+            "-118.26",
+            "-3.05",
+            "124644545",
+        ),
+        "sz399001": (
+            "深证成指",
+            "13706.88",
+            "14488.65",
+            "763770395",
+            "20260717161451",
+            "-781.77",
+            "-5.40",
+            "140851331",
+        ),
+        "sz399006": (
+            "创业板指",
+            "3428.63",
+            "3692.46",
+            "230221243",
+            "20260717161406",
+            "-263.83",
+            "-7.15",
+            "68260370",
+        ),
+        "sh000300": (
+            "沪深300",
+            "4529.10",
+            "4698.43",
+            "302629886",
+            "20260717161408",
+            "-169.33",
+            "-3.60",
+            "92082241",
+        ),
+        "sh000688": (
+            "科创50",
+            "1715.40",
+            "1846.88",
+            "16629024",
+            "20260717161414",
+            "-131.48",
+            "-7.12",
+            "19147353",
+        ),
+        "sz399005": (
+            "中小100",
+            "8604.67",
+            "9045.83",
+            "70341078",
+            "20260717161403",
+            "-441.16",
+            "-4.88",
+            "23147870",
+        ),
+        "bj899050": (
+            "北证50",
+            "1076.38",
+            "1101.80",
+            "8647241",
+            "20260717153625",
+            "-25.42",
+            "-2.31",
+            "1690599.19",
+        ),
+        "hkHSI": (
+            "恒生指数",
+            "24562.240",
+            "25008.600",
+            "34732530.8302",
+            "2026/07/17 18:31:09",
+            "-446.360",
+            "-1.78",
+            "34732530.830",
+        ),
+        "hkHSCEI": (
+            "国企指数",
+            "8136.730",
+            "8318.140",
+            "11134217.3095",
+            "2026/07/17 16:08:36",
+            "-181.410",
+            "-2.18",
+            "11134217.309",
+        ),
+        "hkHSTECH": (
+            "恒生科技指数",
+            "4623.170",
+            "4834.440",
+            "11550937.9524",
+            "2026/07/17 16:08:36",
+            "-211.270",
+            "-4.37",
+            "11550937.952",
+        ),
+        "usINX": (
+            "标普500",
+            "7457.69",
+            "7533.77",
+            "3397503316",
+            "2026-07-17 16:43:30",
+            "-76.08",
+            "-1.01",
+            "25337526504700",
+        ),
+        "usIXIC": (
+            "纳斯达克",
+            "25520.24",
+            "25881.95",
+            "6557165689",
+            "2026-07-17 17:15:59",
+            "-361.71",
+            "-1.40",
+            "167340466364558",
+        ),
+        "usDJI": (
+            "道琼斯",
+            "52146.42",
+            "52552.97",
+            "549691647",
+            "2026-07-17 16:43:30",
+            "-406.55",
+            "-0.77",
+            "28748736408349",
+        ),
     }
     lines = []
     for code, (name, close, previous, volume, stamp, change, change_percent, amount) in codes.items():
@@ -177,7 +302,13 @@ def test_global_index_overview_keeps_live_values_and_labels_the_active_session()
     for code, name, market, _ in GLOBAL_INDEX_CODES:
         fields = [""] * 66
         fields[1], fields[3], fields[4], fields[6] = name, "90", "110", "5"
-        fields[30] = "20260720100000" if market == "CN" else "2026/07/20 10:00:00" if market == "HK" else "2026-07-20 10:00:00"
+        fields[30] = (
+            "20260720100000"
+            if market == "CN"
+            else "2026/07/20 10:00:00"
+            if market == "HK"
+            else "2026-07-20 10:00:00"
+        )
         fields[31], fields[32], fields[37] = "-20", "-18.18", "5"
         lines.append(f'v_{code}="{"~".join(fields)}";')
     quote_payload = "\n".join(lines).encode("gbk")
@@ -201,14 +332,40 @@ def test_global_index_overview_keeps_live_values_and_labels_the_active_session()
 
 def test_profit_forecast_keeps_consensus_growth_and_revision_history() -> None:
     payload = {
-        "jgyc": [{"PUBLISH_DATE": "2026-07-18", "ORG_NAME_ABBR": "近六月平均", "YEAR1": 2025,
-                  "YEAR_MARK1": "A", "EPS1": 2.0, "YEAR2": 2026, "YEAR_MARK2": "E", "EPS2": 2.4,
-                  "PE2": 20.0, "YEAR3": 2027, "YEAR_MARK3": "E", "EPS3": 3.0, "PE3": 16.0}],
+        "jgyc": [
+            {
+                "PUBLISH_DATE": "2026-07-18",
+                "ORG_NAME_ABBR": "近六月平均",
+                "YEAR1": 2025,
+                "YEAR_MARK1": "A",
+                "EPS1": 2.0,
+                "YEAR2": 2026,
+                "YEAR_MARK2": "E",
+                "EPS2": 2.4,
+                "PE2": 20.0,
+                "YEAR3": 2027,
+                "YEAR_MARK3": "E",
+                "EPS3": 3.0,
+                "PE3": 16.0,
+            }
+        ],
         "ycmx": [
-            {"PUBLISH_DATE": "2026-06-14", "ORG_NAME_ABBR": "甲证券", "YEAR2": 2026, "EPS2": 2.3,
-             "YEAR3": 2027, "EPS3": 2.8},
-            {"PUBLISH_DATE": "2026-07-10", "ORG_NAME_ABBR": "乙证券", "YEAR2": 2026, "EPS2": 2.5,
-             "YEAR3": 2027, "EPS3": 3.1},
+            {
+                "PUBLISH_DATE": "2026-06-14",
+                "ORG_NAME_ABBR": "甲证券",
+                "YEAR2": 2026,
+                "EPS2": 2.3,
+                "YEAR3": 2027,
+                "EPS3": 2.8,
+            },
+            {
+                "PUBLISH_DATE": "2026-07-10",
+                "ORG_NAME_ABBR": "乙证券",
+                "YEAR2": 2026,
+                "EPS2": 2.5,
+                "YEAR3": 2027,
+                "EPS3": 3.1,
+            },
         ],
     }
 
@@ -224,7 +381,10 @@ def test_company_supplement_uses_short_topic_queries_that_public_search_can_matc
     queries = []
     monkeypatch.setattr(
         "invest_vault.providers.fetch_public_news",
-        lambda keyword, **_: queries.append(keyword) or {"items": [{"title": keyword, "url": f"https://example.test/{len(queries)}"}]},
+        lambda keyword, **_: (
+            queries.append(keyword)
+            or {"items": [{"title": keyword, "url": f"https://example.test/{len(queries)}"}]}
+        ),
     )
 
     result = fetch_company_supplemental_evidence(
@@ -243,7 +403,7 @@ def test_company_supplement_uses_short_topic_queries_that_public_search_can_matc
 def test_peer_valuations_falls_back_to_delayed_eastmoney_host(monkeypatch) -> None:
     monkeypatch.setattr(
         "invest_vault.providers.fetch_stock_industry",
-        lambda *_ , **__: {"industry": "医疗设备", "classification_rows": [{"code": "BK1605"}]},
+        lambda *_, **__: {"industry": "医疗设备", "classification_rows": [{"code": "BK1605"}]},
     )
     urls = []
 
@@ -251,8 +411,9 @@ def test_peer_valuations_falls_back_to_delayed_eastmoney_host(monkeypatch) -> No
         urls.append(url)
         if "push2.eastmoney.com" in url:
             raise ConnectionError("primary disconnected")
-        return json.dumps({"data": {"diff": [{"f12": "300003", "f14": "同行", "f2": 10,
-                                                "f9": 20, "f20": 100, "f23": 2}]}}).encode()
+        return json.dumps(
+            {"data": {"diff": [{"f12": "300003", "f14": "同行", "f2": 10, "f9": 20, "f20": 100, "f23": 2}]}}
+        ).encode()
 
     result = fetch_peer_valuations("300760", request=request)
 
@@ -261,12 +422,34 @@ def test_peer_valuations_falls_back_to_delayed_eastmoney_host(monkeypatch) -> No
 
 
 def test_industry_money_flow_fetches_separate_inbound_and_outbound_rankings() -> None:
-    inbound = {"data": {"diff": [
-        {"f12": "BK0459", "f14": "元件", "f3": 6.31, "f62": 14137115136, "f184": 9.18, "f124": 1784014494},
-    ]}}
-    outbound = {"data": {"diff": [
-        {"f12": "BK1036", "f14": "半导体", "f3": -2.1, "f62": -12420579328, "f184": -4.2, "f124": 1784014494},
-    ]}}
+    inbound = {
+        "data": {
+            "diff": [
+                {
+                    "f12": "BK0459",
+                    "f14": "元件",
+                    "f3": 6.31,
+                    "f62": 14137115136,
+                    "f184": 9.18,
+                    "f124": 1784014494,
+                },
+            ]
+        }
+    }
+    outbound = {
+        "data": {
+            "diff": [
+                {
+                    "f12": "BK1036",
+                    "f14": "半导体",
+                    "f3": -2.1,
+                    "f62": -12420579328,
+                    "f184": -4.2,
+                    "f124": 1784014494,
+                },
+            ]
+        }
+    }
     urls: list[str] = []
 
     def request(url: str) -> bytes:
@@ -283,27 +466,51 @@ def test_industry_money_flow_fetches_separate_inbound_and_outbound_rankings() ->
 
 def test_market_pulse_uses_stock_analysis_limit_pools_for_m3_and_m4() -> None:
     pools = {
-        "zt": {"data": {"qdate": "20260717", "tc": 2, "pool": [
-            {"c": "600001", "n": "首板样本", "hybk": "医药", "fund": 200_000_000, "zttj": {"ct": 1}},
-            {"c": "600002", "n": "连板样本", "hybk": "医药", "fund": 300_000_000, "zttj": {"ct": 3}},
-        ]}},
-        "dt": {"data": {"qdate": "20260717", "tc": 1, "pool": [
-            {"c": "600003", "n": "跌停样本", "hybk": "消费", "zdp": -10.0},
-        ]}},
-        "zb": {"data": {"qdate": "20260717", "tc": 1, "pool": [
-            {"c": "600004", "n": "炸板样本", "hybk": "科技", "zdp": 4.0},
-        ]}},
+        "zt": {
+            "data": {
+                "qdate": "20260717",
+                "tc": 2,
+                "pool": [
+                    {"c": "600001", "n": "首板样本", "hybk": "医药", "fund": 200_000_000, "zttj": {"ct": 1}},
+                    {"c": "600002", "n": "连板样本", "hybk": "医药", "fund": 300_000_000, "zttj": {"ct": 3}},
+                ],
+            }
+        },
+        "dt": {
+            "data": {
+                "qdate": "20260717",
+                "tc": 1,
+                "pool": [
+                    {"c": "600003", "n": "跌停样本", "hybk": "消费", "zdp": -10.0},
+                ],
+            }
+        },
+        "zb": {
+            "data": {
+                "qdate": "20260717",
+                "tc": 1,
+                "pool": [
+                    {"c": "600004", "n": "炸板样本", "hybk": "科技", "zdp": 4.0},
+                ],
+            }
+        },
     }
 
     result = fetch_market_pulse(
-        date(2026, 7, 17), session="盘后", holdings=[], pools_loader=lambda _: pools,
+        date(2026, 7, 17),
+        session="盘后",
+        holdings=[],
+        pools_loader=lambda _: pools,
     )
 
     assert result["kind"] == "limit_pools"
     assert result["skill_version"] == "4.12.0"
     assert result["m3"] == {
-        "available": True, "limit_up_count": 2, "first_board_count": 1,
-        "multi_board_count": 1, "seal_fund_yi": 5.0,
+        "available": True,
+        "limit_up_count": 2,
+        "first_board_count": 1,
+        "multi_board_count": 1,
+        "seal_fund_yi": 5.0,
         "top_themes": [{"name": "医药", "count": 2}],
         "leaders": [
             {"symbol": "600002", "name": "连板样本", "theme": "医药", "board_days": 3, "seal_fund_yi": 3.0},
@@ -319,15 +526,29 @@ def test_premarket_pulse_shows_only_holding_news_from_the_last_24_hours() -> Non
     def news_loader(keyword: str, *, size: int = 10) -> dict[str, object]:
         assert keyword == "贵州茅台"
         assert size == 6
-        return {"items": [
-            {"title": "茅台最新经营动态", "published_at": "2026-07-20T00:30:00+00:00", "url": "https://example.test/new", "source": "测试资讯"},
-            {"title": "过期资讯", "published_at": "2026-07-18T00:00:00+00:00", "url": "https://example.test/old", "source": "测试资讯"},
-        ]}
+        return {
+            "items": [
+                {
+                    "title": "茅台最新经营动态",
+                    "published_at": "2026-07-20T00:30:00+00:00",
+                    "url": "https://example.test/new",
+                    "source": "测试资讯",
+                },
+                {
+                    "title": "过期资讯",
+                    "published_at": "2026-07-18T00:00:00+00:00",
+                    "url": "https://example.test/old",
+                    "source": "测试资讯",
+                },
+            ]
+        }
 
     result = fetch_market_pulse(
-        date(2026, 7, 20), session="盘前",
+        date(2026, 7, 20),
+        session="盘前",
         holdings=[{"symbol": "600519", "name": "贵州茅台"}],
-        now=datetime(2026, 7, 20, 1, 0, tzinfo=timezone.utc), news_loader=news_loader,
+        now=datetime(2026, 7, 20, 1, 0, tzinfo=timezone.utc),
+        news_loader=news_loader,
     )
 
     assert result["kind"] == "holding_news"
@@ -339,15 +560,40 @@ def test_market_news_is_bounded_recent_deduplicated_and_market_wide() -> None:
         assert size == 20
         rows = {
             "A股": [
-                {"title": "A股市场宽幅震荡，银行电力板块领涨", "published_at": "2026-07-18T10:00:00+00:00", "url": "https://example.test/a", "source": "富途"},
-                {"title": "某公司拟发行A股股票", "published_at": "2026-07-18T11:00:00+00:00", "url": "https://example.test/company", "source": "富途"},
+                {
+                    "title": "A股市场宽幅震荡，银行电力板块领涨",
+                    "published_at": "2026-07-18T10:00:00+00:00",
+                    "url": "https://example.test/a",
+                    "source": "富途",
+                },
+                {
+                    "title": "某公司拟发行A股股票",
+                    "published_at": "2026-07-18T11:00:00+00:00",
+                    "url": "https://example.test/company",
+                    "source": "富途",
+                },
             ],
             "港股": [
-                {"title": "港股收盘：恒指震荡回落", "published_at": "2026-07-18T09:00:00+00:00", "url": "https://example.test/hk", "source": "富途"},
-                {"title": "港股收盘：恒指震荡回落", "published_at": "2026-07-18T09:00:00+00:00", "url": "https://example.test/hk-copy", "source": "富途"},
+                {
+                    "title": "港股收盘：恒指震荡回落",
+                    "published_at": "2026-07-18T09:00:00+00:00",
+                    "url": "https://example.test/hk",
+                    "source": "富途",
+                },
+                {
+                    "title": "港股收盘：恒指震荡回落",
+                    "published_at": "2026-07-18T09:00:00+00:00",
+                    "url": "https://example.test/hk-copy",
+                    "source": "富途",
+                },
             ],
             "美股": [
-                {"title": "美股全线下行，芯片板块继续承压", "published_at": "2026-07-16T08:00:00+00:00", "url": "https://example.test/old", "source": "富途"},
+                {
+                    "title": "美股全线下行，芯片板块继续承压",
+                    "published_at": "2026-07-16T08:00:00+00:00",
+                    "url": "https://example.test/old",
+                    "source": "富途",
+                },
             ],
         }
         return {"items": rows[keyword]}
@@ -387,7 +633,7 @@ def test_fund_nav_close_uses_exact_official_nav_date() -> None:
 
 def test_fund_profile_exposes_fees_manager_and_recent_nav_without_stock_fields() -> None:
     profile = 'var fS_name = "半导体ETF国联安";var syl_1y="-8.2";var Data_currentFundManager = [{"name":"黄欣","workTime":"4年","fundSize":"120亿元","power":{"avr":"72"},"profit":{"series":[{"data":[{"y":"12.3"}]}]}}];'
-    basic = '<table><tr><th>基金经理人</th><td>黄欣</td></tr><tr><th>管理费率</th><td>0.50%（每年）</td></tr><tr><th>托管费率</th><td>0.10%（每年）</td></tr></table>'
+    basic = "<table><tr><th>基金经理人</th><td>黄欣</td></tr><tr><th>管理费率</th><td>0.50%（每年）</td></tr><tr><th>托管费率</th><td>0.10%（每年）</td></tr></table>"
     nav = [{"FSRQ": "2026-07-13", "DWJZ": "1.2925", "JZZZL": "-4.70", "FHSP": ""}]
     result = parse_fund_profile("512480", profile, basic, nav, "2026-07-13")
     assert result["name"] == "半导体ETF国联安"
@@ -431,19 +677,40 @@ def test_tencent_quote_parser_preserves_real_price_and_provenance() -> None:
 def test_financial_snapshot_keeps_cashflow_bridge_fields_for_quarter_decomposition() -> None:
     def request(url: str) -> bytes:
         if "RPT_LICO_FN_CPD" in url:
-            rows = [{
-                "SECURITY_CODE": "600519", "SECURITY_NAME_ABBR": "贵州茅台",
-                "REPORT_DATE": "2025-12-31", "NOTICE_DATE": "2026-03-31",
-                "TOTAL_OPERATE_INCOME": 1000, "PARENT_NETPROFIT": 500,
-            }]
+            rows = [
+                {
+                    "SECURITY_CODE": "600519",
+                    "SECURITY_NAME_ABBR": "贵州茅台",
+                    "REPORT_DATE": "2025-12-31",
+                    "NOTICE_DATE": "2026-03-31",
+                    "TOTAL_OPERATE_INCOME": 1000,
+                    "PARENT_NETPROFIT": 500,
+                }
+            ]
         elif "RPT_DMSK_FN_BALANCE" in url:
-            rows = [{
-                "REPORT_DATE": "2025-12-31", "TOTAL_ASSETS": 3000, "TOTAL_LIABILITIES": 600,
-                "DEBT_ASSET_RATIO": 20, "MONETARYFUNDS": 900, "INVENTORY": 700,
-                "ACCOUNTS_RECE": 30, "ACCOUNTS_PAYABLE": 80, "ADVANCE_RECEIVABLES": 120,
-            }]
+            rows = [
+                {
+                    "REPORT_DATE": "2025-12-31",
+                    "TOTAL_ASSETS": 3000,
+                    "TOTAL_LIABILITIES": 600,
+                    "DEBT_ASSET_RATIO": 20,
+                    "MONETARYFUNDS": 900,
+                    "INVENTORY": 700,
+                    "ACCOUNTS_RECE": 30,
+                    "ACCOUNTS_PAYABLE": 80,
+                    "ADVANCE_RECEIVABLES": 120,
+                }
+            ]
         else:
-            rows = [{"REPORT_DATE": "2025-12-31", "NETCASH_OPERATE": 420, "CONSTRUCT_LONG_ASSET": 80, "NETCASH_INVEST": -120, "NETCASH_FINANCE": -200}]
+            rows = [
+                {
+                    "REPORT_DATE": "2025-12-31",
+                    "NETCASH_OPERATE": 420,
+                    "CONSTRUCT_LONG_ASSET": 80,
+                    "NETCASH_INVEST": -120,
+                    "NETCASH_FINANCE": -200,
+                }
+            ]
         return json.dumps({"success": True, "result": {"data": rows}}).encode()
 
     result = fetch_financial_snapshot("600519", date(2026, 7, 17), request=request)
@@ -468,28 +735,80 @@ def test_hk_valuation_uses_hk_specific_pb_field() -> None:
     fields[39], fields[44], fields[46], fields[58] = "16.74", "41680.09", "TENCENT", "3.31"
     payload = 'v_hk00700="' + "~".join(fields) + '";'
 
-    result = fetch_security_valuation(
-        "HK:HKEX:00700:STOCK", request=lambda _: payload.encode("gbk")
-    )
+    result = fetch_security_valuation("HK:HKEX:00700:STOCK", request=lambda _: payload.encode("gbk"))
 
     assert result["pe_ttm"] == 16.74
     assert result["pb"] == 3.31
     assert result["currency"] == "HKD"
 
 
+def test_hk_live_quote_preserves_quote_fields_and_valuation() -> None:
+    fields = [""] * 66
+    fields[1], fields[2], fields[3], fields[4] = "腾讯控股", "00700", "461.60", "454.20"
+    fields[6], fields[30], fields[37], fields[38] = "188000", "2026/07/17 16:08:03", "8640000000", "0.23"
+    fields[39], fields[44], fields[58] = "16.86", "41945.30", "3.34"
+    payload = 'v_hk00700="' + "~".join(fields) + '";'
+
+    result = fetch_security_live_quote("HK:HKEX:00700:STOCK", request=lambda _: payload.encode("gbk"))
+
+    assert result["name"] == "腾讯控股"
+    assert result["price"] == 461.6
+    assert result["previous_close"] == 454.2
+    assert result["change_percent"] == 1.6292
+    assert result["pe_ttm"] == 16.86
+    assert result["pb"] == 3.34
+    assert result["trade_date"] == "2026-07-17"
+    assert result["source_chain"] == ["tencent_quote"]
+
+
+def test_hk_live_quote_falls_back_to_latest_verified_kline() -> None:
+    kline = {
+        "data": {
+            "hk00700": {
+                "day": [
+                    ["2026-07-16", "450.0", "454.2", "456.0", "449.0", "1200"],
+                    ["2026-07-17", "455.0", "461.6", "463.0", "453.0", "1800"],
+                ],
+                "qt": {"hk00700": ["", "腾讯控股"]},
+            }
+        }
+    }
+
+    def request(url: str) -> bytes:
+        if "qt.gtimg.cn" in url:
+            raise OSError("quote host disconnected")
+        return json.dumps(kline).encode()
+
+    result = fetch_security_live_quote("HK:HKEX:00700:STOCK", request=request)
+
+    assert result["name"] == "腾讯控股"
+    assert result["price"] == 461.6
+    assert result["trade_date"] == "2026-07-17"
+    assert result["change_percent"] == 1.6292
+    assert result["source"] == "tencent_kline"
+    assert result["source_chain"] == ["tencent_quote", "tencent_kline"]
+    assert "quote host disconnected" in result["fallback_reason"]
+
+
 def test_public_topic_news_requires_both_security_alias_and_topic() -> None:
     payload = {
         "code": 0,
         "data": [
-            {"title": "Pentair泳池渠道库存去化", "publish_time": "1710000000", "url": "https://example.test/other"},
-            {"title": "贵州茅台渠道库存下降", "publish_time": "1710000001", "url": "https://example.test/moutai"},
+            {
+                "title": "Pentair泳池渠道库存去化",
+                "publish_time": "1710000000",
+                "url": "https://example.test/other",
+            },
+            {
+                "title": "贵州茅台渠道库存下降",
+                "publish_time": "1710000001",
+                "url": "https://example.test/moutai",
+            },
             {"title": "茅台批价企稳", "publish_time": "1710000002", "url": "https://example.test/price"},
         ],
     }
 
-    result = fetch_public_news(
-        "贵州茅台 渠道库存", request=lambda _: json.dumps(payload).encode()
-    )
+    result = fetch_public_news("贵州茅台 渠道库存", request=lambda _: json.dumps(payload).encode())
 
     assert [item["title"] for item in result["items"]] == ["贵州茅台渠道库存下降"]
 
@@ -512,7 +831,10 @@ def test_target_trade_date_only_advances_after_the_post_close_gate() -> None:
     assert target_trade_date(datetime(2026, 7, 13, 10, 0, tzinfo=timezone)).isoformat() == "2026-07-10"
     assert target_trade_date(datetime(2026, 7, 13, 18, 0, tzinfo=timezone)).isoformat() == "2026-07-13"
     assert target_trade_date(datetime(2026, 7, 12, 18, 0, tzinfo=timezone)).isoformat() == "2026-07-10"
-    assert previous_trade_date(target_trade_date(datetime(2026, 7, 13, 18, 0, tzinfo=timezone))).isoformat() == "2026-07-10"
+    assert (
+        previous_trade_date(target_trade_date(datetime(2026, 7, 13, 18, 0, tzinfo=timezone))).isoformat()
+        == "2026-07-10"
+    )
 
 
 def test_tencent_history_requires_an_exact_completed_trade_date() -> None:
@@ -534,9 +856,7 @@ def test_tencent_history_requires_an_exact_completed_trade_date() -> None:
 def test_security_history_preserves_ohlcv_for_framework_analysis() -> None:
     payload = '{"data":{"sh600519":{"qfqday":[["2026-07-09","1190","1182.19","1200","1180","24100"],["2026-07-10","1180","1204.98","1210","1170","32100"]]}}}'
 
-    result = fetch_security_price_history(
-        "CN:SSE:600519:STOCK", limit=80, request=lambda _: payload.encode()
-    )
+    result = fetch_security_price_history("CN:SSE:600519:STOCK", limit=80, request=lambda _: payload.encode())
 
     assert result["rows"][-1] == {
         "date": "2026-07-10",
@@ -549,10 +869,15 @@ def test_security_history_preserves_ohlcv_for_framework_analysis() -> None:
 
 
 def test_fund_performance_history_uses_cumulative_nav_across_share_splits() -> None:
-    payload = {"TotalCount": 2, "Data": {"LSJZList": [
-        {"FSRQ": "2026-07-17", "DWJZ": "1.00", "LJJZ": "4.00"},
-        {"FSRQ": "2026-07-16", "DWJZ": "2.00", "LJJZ": "4.00"},
-    ]}}
+    payload = {
+        "TotalCount": 2,
+        "Data": {
+            "LSJZList": [
+                {"FSRQ": "2026-07-17", "DWJZ": "1.00", "LJJZ": "4.00"},
+                {"FSRQ": "2026-07-16", "DWJZ": "2.00", "LJJZ": "4.00"},
+            ]
+        },
+    }
 
     result = fetch_security_price_history(
         "CN:SSE:512480:FUND",
@@ -565,14 +890,18 @@ def test_fund_performance_history_uses_cumulative_nav_across_share_splits() -> N
 
 
 def test_sector_history_preserves_volume_amount_and_daily_change() -> None:
-    payload = {"data": {"code": "BK0438", "name": "食品饮料", "klines": [
-        "2026-07-16,100,102,103,99,1000,2000,4,2,2,1",
-        "2026-07-17,102,99,104,98,1500,3000,6,-2.94,-3,1.5",
-    ]}}
+    payload = {
+        "data": {
+            "code": "BK0438",
+            "name": "食品饮料",
+            "klines": [
+                "2026-07-16,100,102,103,99,1000,2000,4,2,2,1",
+                "2026-07-17,102,99,104,98,1500,3000,6,-2.94,-3,1.5",
+            ],
+        }
+    }
 
-    result = fetch_sector_price_history(
-        "BK0438", limit=80, request=lambda _: json.dumps(payload).encode()
-    )
+    result = fetch_sector_price_history("BK0438", limit=80, request=lambda _: json.dumps(payload).encode())
 
     assert result["name"] == "食品饮料"
     assert result["rows"][-1]["volume"] == 1500.0

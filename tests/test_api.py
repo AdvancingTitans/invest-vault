@@ -85,30 +85,93 @@ def test_bootstrap_joins_a_persisted_close_to_the_matching_holding(tmp_path: Pat
 
 
 def test_portfolio_cutoff_uses_the_oldest_holding_archive_date(tmp_path: Path) -> None:
-    second = {**ENTRY, "record_id": "api-fund-001", "idempotency_key": "api:fund-001", "security_id": "CN:SSE:512480:FUND", "quantity": "1000", "cash_amount": "-1471.00"}
+    second = {
+        **ENTRY,
+        "record_id": "api-fund-001",
+        "idempotency_key": "api:fund-001",
+        "security_id": "CN:SSE:512480:FUND",
+        "quantity": "1000",
+        "cash_amount": "-1471.00",
+    }
     with TestClient(create_app(tmp_path, automatic_updates=False)) as client:
         client.post("/api/ledger/import", json={"entries": [ENTRY, second]})
-        for symbol, asset_type, price, trade_date in (("600519", "stock", 1204.98, "2026-07-10"), ("512480", "fund", 1.292, "2026-07-13")):
-            client.post("/api/refresh-jobs", json={"kind": "quote", "requested_as_of": trade_date, "payload": {"symbol": symbol, "market": "a", "asset_type": asset_type, "name": symbol, "price": price, "currency": "CNY", "trade_date": trade_date, "source": "tencent_kline", "source_ref": "https://example.test"}})
+        for symbol, asset_type, price, trade_date in (
+            ("600519", "stock", 1204.98, "2026-07-10"),
+            ("512480", "fund", 1.292, "2026-07-13"),
+        ):
+            client.post(
+                "/api/refresh-jobs",
+                json={
+                    "kind": "quote",
+                    "requested_as_of": trade_date,
+                    "payload": {
+                        "symbol": symbol,
+                        "market": "a",
+                        "asset_type": asset_type,
+                        "name": symbol,
+                        "price": price,
+                        "currency": "CNY",
+                        "trade_date": trade_date,
+                        "source": "tencent_kline",
+                        "source_ref": "https://example.test",
+                    },
+                },
+            )
         assert client.get("/api/bootstrap").json()["report_as_of"] == "2026-07-10"
 
 
-def test_post_close_archive_reports_the_target_batch_and_partial_holding_coverage(tmp_path: Path, monkeypatch) -> None:
+def test_post_close_archive_reports_the_target_batch_and_partial_holding_coverage(
+    tmp_path: Path, monkeypatch
+) -> None:
     rows = [
-        {"row_id": "current", "symbol": "600519", "asset_type": "a_share", "invested_amount_cny": "1000", "bought_on": "2026-07-13"},
-        {"row_id": "stale", "symbol": "002808", "asset_type": "a_share", "invested_amount_cny": "1000", "bought_on": "2026-07-13"},
+        {
+            "row_id": "current",
+            "symbol": "600519",
+            "asset_type": "a_share",
+            "invested_amount_cny": "1000",
+            "bought_on": "2026-07-13",
+        },
+        {
+            "row_id": "stale",
+            "symbol": "002808",
+            "asset_type": "a_share",
+            "invested_amount_cny": "1000",
+            "bought_on": "2026-07-13",
+        },
     ]
+
     def now() -> datetime:
         return datetime(2026, 7, 14, 18, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
 
     def quote(security_id, trade_date):
         if "600519" not in security_id:
             raise ValueError("目标交易日无交易记录")
-        return {"symbol": "600519", "market": "a", "asset_type": "stock", "name": "贵州茅台", "price": 1214.88, "currency": "CNY", "trade_date": trade_date.isoformat(), "source": "test", "source_ref": "https://example.test"}
+        return {
+            "symbol": "600519",
+            "market": "a",
+            "asset_type": "stock",
+            "name": "贵州茅台",
+            "price": 1214.88,
+            "currency": "CNY",
+            "trade_date": trade_date.isoformat(),
+            "source": "test",
+            "source_ref": "https://example.test",
+        }
 
     monkeypatch.setattr("invest_vault.api.fetch_security_historical_close", quote)
-    for loader in ("fetch_public_quote", "fetch_financial_snapshot", "fetch_company_announcements", "fetch_global_index_overview", "fetch_lhb", "fetch_industry_money_flow", "fetch_market_pulse", "fetch_market_news"):
-        monkeypatch.setattr(f"invest_vault.api.{loader}", lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("offline")))
+    for loader in (
+        "fetch_public_quote",
+        "fetch_financial_snapshot",
+        "fetch_company_announcements",
+        "fetch_global_index_overview",
+        "fetch_lhb",
+        "fetch_industry_money_flow",
+        "fetch_market_pulse",
+        "fetch_market_news",
+    ):
+        monkeypatch.setattr(
+            f"invest_vault.api.{loader}", lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("offline"))
+        )
 
     with TestClient(create_app(tmp_path, automatic_updates=True, now_provider=now)) as client:
         assert client.post("/api/holdings", json={"rows": rows}).status_code == 200
@@ -116,12 +179,16 @@ def test_post_close_archive_reports_the_target_batch_and_partial_holding_coverag
 
     assert payload["report_as_of"] == "2026-07-14"
     assert payload["archive_coverage"] == {"target_date": "2026-07-14", "current": 1, "total": 2, "stale": 1}
-    assert {item["symbol"]: item["trade_date"] for item in payload["holdings"]} == {"002808": None, "600519": "2026-07-14"}
+    assert {item["symbol"]: item["trade_date"] for item in payload["holdings"]} == {
+        "002808": None,
+        "600519": "2026-07-14",
+    }
 
 
 def test_failed_post_close_quote_is_retried_on_the_next_automatic_check(tmp_path: Path, monkeypatch) -> None:
     def now() -> datetime:
         return datetime(2026, 7, 14, 18, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+
     attempts = 0
 
     def quote(security_id, trade_date):
@@ -129,23 +196,60 @@ def test_failed_post_close_quote_is_retried_on_the_next_automatic_check(tmp_path
         attempts += 1
         if attempts == 1:
             raise ValueError("provider not ready")
-        return {"symbol": "600519", "market": "a", "asset_type": "stock", "name": "贵州茅台", "price": 1214.88, "currency": "CNY", "trade_date": trade_date.isoformat(), "source": "test", "source_ref": "https://example.test"}
+        return {
+            "symbol": "600519",
+            "market": "a",
+            "asset_type": "stock",
+            "name": "贵州茅台",
+            "price": 1214.88,
+            "currency": "CNY",
+            "trade_date": trade_date.isoformat(),
+            "source": "test",
+            "source_ref": "https://example.test",
+        }
 
     monkeypatch.setattr("invest_vault.api.fetch_security_historical_close", quote)
-    for loader in ("fetch_public_quote", "fetch_financial_snapshot", "fetch_company_announcements", "fetch_global_index_overview", "fetch_lhb", "fetch_industry_money_flow", "fetch_market_pulse", "fetch_market_news"):
-        monkeypatch.setattr(f"invest_vault.api.{loader}", lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("offline")))
+    for loader in (
+        "fetch_public_quote",
+        "fetch_financial_snapshot",
+        "fetch_company_announcements",
+        "fetch_global_index_overview",
+        "fetch_lhb",
+        "fetch_industry_money_flow",
+        "fetch_market_pulse",
+        "fetch_market_news",
+    ):
+        monkeypatch.setattr(
+            f"invest_vault.api.{loader}", lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("offline"))
+        )
 
     with TestClient(create_app(tmp_path, automatic_updates=True, now_provider=now)) as client:
-        client.post("/api/holdings", json={"rows": [{"row_id": "retry", "symbol": "600519", "asset_type": "a_share", "invested_amount_cny": "1000", "bought_on": "2026-07-13"}]})
+        client.post(
+            "/api/holdings",
+            json={
+                "rows": [
+                    {
+                        "row_id": "retry",
+                        "symbol": "600519",
+                        "asset_type": "a_share",
+                        "invested_amount_cny": "1000",
+                        "bought_on": "2026-07-13",
+                    }
+                ]
+            },
+        )
         assert client.get("/api/bootstrap").json()["holdings"][0]["trade_date"] == "2026-07-13"
         assert client.get("/api/bootstrap").json()["holdings"][0]["trade_date"] == "2026-07-14"
 
     assert attempts == 3
 
 
-def test_incomplete_industry_flow_archive_is_repaired_on_the_next_automatic_check(tmp_path: Path, monkeypatch) -> None:
+def test_incomplete_industry_flow_archive_is_repaired_on_the_next_automatic_check(
+    tmp_path: Path, monkeypatch
+) -> None:
     def now() -> datetime:
         return datetime(2026, 7, 14, 18, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+
     with TestClient(create_app(tmp_path, automatic_updates=False)):
         pass
     broken = {"date": "2026-07-14", "source": "test", "inbound": [{"name": "元件"}], "outbound": []}
@@ -155,11 +259,21 @@ def test_incomplete_industry_flow_archive_is_repaired_on_the_next_automatic_chec
             ("industry_flow", "2026-07-14", "test", json.dumps(broken), "2026-07-14T09:31:00+00:00"),
         )
 
-    repaired = {"date": "2026-07-14", "source": "test", "inbound": [{"name": "元件"}], "outbound": [{"name": "半导体"}]}
+    repaired = {
+        "date": "2026-07-14",
+        "source": "test",
+        "inbound": [{"name": "元件"}],
+        "outbound": [{"name": "半导体"}],
+    }
     monkeypatch.setattr("invest_vault.api.fetch_industry_money_flow", lambda _: repaired)
-    monkeypatch.setattr("invest_vault.api.fetch_market_pulse", lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("offline")))
+    monkeypatch.setattr(
+        "invest_vault.api.fetch_market_pulse",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("offline")),
+    )
     for loader in ("fetch_global_index_overview", "fetch_lhb"):
-        monkeypatch.setattr(f"invest_vault.api.{loader}", lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("offline")))
+        monkeypatch.setattr(
+            f"invest_vault.api.{loader}", lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("offline"))
+        )
 
     with TestClient(create_app(tmp_path, automatic_updates=True, now_provider=now)) as client:
         flow = client.get("/api/bootstrap").json()["market"]["industry_flow"]
@@ -167,24 +281,50 @@ def test_incomplete_industry_flow_archive_is_repaired_on_the_next_automatic_chec
     assert flow["outbound"] == [{"name": "半导体"}]
 
 
-def test_user_can_refresh_all_market_sections_and_receive_partial_failures(tmp_path: Path, monkeypatch) -> None:
+def test_user_can_refresh_all_market_sections_and_receive_partial_failures(
+    tmp_path: Path, monkeypatch
+) -> None:
     indices = {
-        "date": "2026-07-17", "source": "fixture", "rows": [
-            {"code": "000001", "name": "上证指数", "close": 3764.15, "change": -118.26,
-             "change_percent": -3.05, "volume": 650450984, "amount": 1246445450000,
-             "trade_date": "2026-07-17", "market": "CN", "currency": "CNY"},
+        "date": "2026-07-17",
+        "source": "fixture",
+        "rows": [
+            {
+                "code": "000001",
+                "name": "上证指数",
+                "close": 3764.15,
+                "change": -118.26,
+                "change_percent": -3.05,
+                "volume": 650450984,
+                "amount": 1246445450000,
+                "trade_date": "2026-07-17",
+                "market": "CN",
+                "currency": "CNY",
+            },
         ],
     }
     flow = {"date": "2026-07-17", "source": "fixture", "inbound": [], "outbound": [{"name": "白酒"}]}
     monkeypatch.setattr("invest_vault.api.fetch_global_index_overview", lambda: indices)
-    monkeypatch.setattr("invest_vault.api.fetch_lhb", lambda _: (_ for _ in ()).throw(ValueError("龙虎榜源不可用")))
+    monkeypatch.setattr(
+        "invest_vault.api.fetch_lhb", lambda _: (_ for _ in ()).throw(ValueError("龙虎榜源不可用"))
+    )
     monkeypatch.setattr("invest_vault.api.fetch_industry_money_flow", lambda _: flow)
-    monkeypatch.setattr("invest_vault.api.fetch_market_pulse", lambda *_args, **_kwargs: {
-        "date": "2026-07-17", "source": "stock-analysis fixture", "kind": "limit_pools",
-    })
-    monkeypatch.setattr("invest_vault.api.fetch_market_news", lambda **_kwargs: {
-        "date": "2026-07-18", "source": "富途 fixture", "items": [], "total_count": 0,
-    })
+    monkeypatch.setattr(
+        "invest_vault.api.fetch_market_pulse",
+        lambda *_args, **_kwargs: {
+            "date": "2026-07-17",
+            "source": "stock-analysis fixture",
+            "kind": "limit_pools",
+        },
+    )
+    monkeypatch.setattr(
+        "invest_vault.api.fetch_market_news",
+        lambda **_kwargs: {
+            "date": "2026-07-18",
+            "source": "富途 fixture",
+            "items": [],
+            "total_count": 0,
+        },
+    )
 
     with TestClient(create_app(tmp_path, automatic_updates=False)) as client:
         response = client.post("/api/market/refresh", json={"section": "all"})
@@ -200,10 +340,13 @@ def test_user_can_refresh_all_market_sections_and_receive_partial_failures(tmp_p
 
 def test_user_can_record_cash_balance_and_drawdown_limit_for_ai_evidence(tmp_path: Path) -> None:
     with TestClient(create_app(tmp_path, automatic_updates=False)) as client:
-        saved = client.post("/api/portfolio/risk-profile", json={
-            "cash_balance_cny": "50000",
-            "max_drawdown_percent": "12.5",
-        })
+        saved = client.post(
+            "/api/portfolio/risk-profile",
+            json={
+                "cash_balance_cny": "50000",
+                "max_drawdown_percent": "12.5",
+            },
+        )
         bootstrap = client.get("/api/bootstrap").json()
 
     assert saved.status_code == 200
@@ -213,14 +356,19 @@ def test_user_can_record_cash_balance_and_drawdown_limit_for_ai_evidence(tmp_pat
     }
 
 
-def test_bootstrap_refreshes_all_market_sections_instead_of_reusing_a_saved_day(tmp_path: Path, monkeypatch) -> None:
+def test_bootstrap_refreshes_all_market_sections_instead_of_reusing_a_saved_day(
+    tmp_path: Path, monkeypatch
+) -> None:
     calls = {"indices": 0, "lhb": 0, "industry_flow": 0, "pulse": 0, "market_news": 0}
 
     def indices():
         calls["indices"] += 1
         return {
-            "date": "2026-07-20", "session": "盘中", "session_label": "7月20日盘中实时数据",
-            "source": "fixture", "rows": [{"name": "上证指数", "close": 3000 + calls["indices"]}],
+            "date": "2026-07-20",
+            "session": "盘中",
+            "session_label": "7月20日盘中实时数据",
+            "source": "fixture",
+            "rows": [{"name": "上证指数", "close": 3000 + calls["indices"]}],
         }
 
     def lhb(_):
@@ -245,11 +393,13 @@ def test_bootstrap_refreshes_all_market_sections_instead_of_reusing_a_saved_day(
     monkeypatch.setattr("invest_vault.api.fetch_market_pulse", pulse)
     monkeypatch.setattr("invest_vault.api.fetch_market_news", market_news)
 
-    with TestClient(create_app(
-        tmp_path,
-        automatic_updates=True,
-        now_provider=lambda: datetime(2026, 7, 20, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
-    )) as client:
+    with TestClient(
+        create_app(
+            tmp_path,
+            automatic_updates=True,
+            now_provider=lambda: datetime(2026, 7, 20, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+    ) as client:
         first = client.get("/api/bootstrap").json()["market"]
         second = client.get("/api/bootstrap").json()["market"]
 
@@ -258,23 +408,66 @@ def test_bootstrap_refreshes_all_market_sections_instead_of_reusing_a_saved_day(
     assert calls == {"indices": 2, "lhb": 2, "industry_flow": 2, "pulse": 2, "market_news": 2}
 
 
-def test_bootstrap_uses_intraday_holding_quote_without_overwriting_completed_close(tmp_path: Path, monkeypatch) -> None:
+def test_bootstrap_uses_intraday_holding_quote_without_overwriting_completed_close(
+    tmp_path: Path, monkeypatch
+) -> None:
     def now() -> datetime:
         return datetime(2026, 7, 20, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
-    monkeypatch.setattr("invest_vault.api.fetch_public_quote", lambda *_: {
-        "symbol": "600519", "name": "贵州茅台", "price": 120, "previous_close": 110,
-        "change": 10, "change_percent": 9.09, "trade_date": "2026-07-20", "source": "fixture-live",
-    })
-    monkeypatch.setattr("invest_vault.api.fetch_security_historical_close", lambda _, trade_date: {
-        "symbol": "600519", "name": "贵州茅台", "price": 110, "trade_date": trade_date.isoformat(),
-        "source": "fixture-close", "source_ref": "https://example.test/close", "market": "a", "asset_type": "stock",
-    })
-    for loader in ("fetch_financial_snapshot", "fetch_company_announcements", "fetch_global_index_overview", "fetch_lhb", "fetch_industry_money_flow", "fetch_market_pulse", "fetch_market_news"):
-        monkeypatch.setattr(f"invest_vault.api.{loader}", lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("offline")))
+
+    monkeypatch.setattr(
+        "invest_vault.api.fetch_public_quote",
+        lambda *_: {
+            "symbol": "600519",
+            "name": "贵州茅台",
+            "price": 120,
+            "previous_close": 110,
+            "change": 10,
+            "change_percent": 9.09,
+            "trade_date": "2026-07-20",
+            "source": "fixture-live",
+        },
+    )
+    monkeypatch.setattr(
+        "invest_vault.api.fetch_security_historical_close",
+        lambda _, trade_date: {
+            "symbol": "600519",
+            "name": "贵州茅台",
+            "price": 110,
+            "trade_date": trade_date.isoformat(),
+            "source": "fixture-close",
+            "source_ref": "https://example.test/close",
+            "market": "a",
+            "asset_type": "stock",
+        },
+    )
+    for loader in (
+        "fetch_financial_snapshot",
+        "fetch_company_announcements",
+        "fetch_global_index_overview",
+        "fetch_lhb",
+        "fetch_industry_money_flow",
+        "fetch_market_pulse",
+        "fetch_market_news",
+    ):
+        monkeypatch.setattr(
+            f"invest_vault.api.{loader}", lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("offline"))
+        )
 
     with TestClient(create_app(tmp_path, automatic_updates=True, now_provider=now)) as client:
-        client.post("/api/holdings", json={"rows": [{"row_id": "live", "symbol": "600519", "asset_type": "a_share",
-                                                       "invested_amount_cny": "1000", "bought_on": "2026-07-17"}]})
+        client.post(
+            "/api/holdings",
+            json={
+                "rows": [
+                    {
+                        "row_id": "live",
+                        "symbol": "600519",
+                        "asset_type": "a_share",
+                        "invested_amount_cny": "1000",
+                        "bought_on": "2026-07-17",
+                    }
+                ]
+            },
+        )
         holding = client.get("/api/bootstrap").json()["holdings"][0]
 
     assert holding["price"] == 120
@@ -284,9 +477,27 @@ def test_bootstrap_uses_intraday_holding_quote_without_overwriting_completed_clo
 
 def test_user_facing_holding_form_saves_supported_markets_without_inventing_quantity(tmp_path: Path) -> None:
     rows = [
-        {"row_id": "row-a", "symbol": "600519", "asset_type": "a_share", "invested_amount_cny": "10000.50", "bought_on": "2026-07-10"},
-        {"row_id": "row-fund", "symbol": "512480", "asset_type": "fund", "invested_amount_cny": "8000", "bought_on": "2026-07-09"},
-        {"row_id": "row-hk", "symbol": "700", "asset_type": "hk_stock", "invested_amount_cny": "12000", "bought_on": "2026-07-08"},
+        {
+            "row_id": "row-a",
+            "symbol": "600519",
+            "asset_type": "a_share",
+            "invested_amount_cny": "10000.50",
+            "bought_on": "2026-07-10",
+        },
+        {
+            "row_id": "row-fund",
+            "symbol": "512480",
+            "asset_type": "fund",
+            "invested_amount_cny": "8000",
+            "bought_on": "2026-07-09",
+        },
+        {
+            "row_id": "row-hk",
+            "symbol": "700",
+            "asset_type": "hk_stock",
+            "invested_amount_cny": "12000",
+            "bought_on": "2026-07-08",
+        },
     ]
     with TestClient(create_app(tmp_path, automatic_updates=False)) as client:
         response = client.post("/api/holdings", json={"rows": rows})
@@ -306,7 +517,20 @@ def test_user_facing_holding_form_saves_supported_markets_without_inventing_quan
 
 def test_saved_holdings_have_an_excel_export_and_no_csv_route(tmp_path: Path) -> None:
     with TestClient(create_app(tmp_path, automatic_updates=False)) as client:
-        client.post("/api/holdings", json={"rows": [{"row_id": "export-row", "symbol": "600519", "asset_type": "a_share", "invested_amount_cny": "11821.90", "bought_on": "2026-07-09"}]})
+        client.post(
+            "/api/holdings",
+            json={
+                "rows": [
+                    {
+                        "row_id": "export-row",
+                        "symbol": "600519",
+                        "asset_type": "a_share",
+                        "invested_amount_cny": "11821.90",
+                        "bought_on": "2026-07-09",
+                    }
+                ]
+            },
+        )
         response = client.get("/api/holdings/export.xlsx")
         assert response.status_code == 200
         assert response.content.startswith(b"PK")
@@ -316,23 +540,79 @@ def test_saved_holdings_have_an_excel_export_and_no_csv_route(tmp_path: Path) ->
 
 def test_holding_form_rejects_invalid_codes_and_non_positive_amounts(tmp_path: Path) -> None:
     with TestClient(create_app(tmp_path, automatic_updates=False)) as client:
-        bad_code = client.post("/api/holdings", json={"rows": [{"row_id": "bad-code", "symbol": "AAPL", "asset_type": "a_share", "invested_amount_cny": "1", "bought_on": "2026-07-10"}]})
+        bad_code = client.post(
+            "/api/holdings",
+            json={
+                "rows": [
+                    {
+                        "row_id": "bad-code",
+                        "symbol": "AAPL",
+                        "asset_type": "a_share",
+                        "invested_amount_cny": "1",
+                        "bought_on": "2026-07-10",
+                    }
+                ]
+            },
+        )
         assert bad_code.status_code == 422
         assert "6位数字" in bad_code.json()["detail"]
-        bad_amount = client.post("/api/holdings", json={"rows": [{"row_id": "bad-amount", "symbol": "600519", "asset_type": "a_share", "invested_amount_cny": "0", "bought_on": "2026-07-10"}]})
+        bad_amount = client.post(
+            "/api/holdings",
+            json={
+                "rows": [
+                    {
+                        "row_id": "bad-amount",
+                        "symbol": "600519",
+                        "asset_type": "a_share",
+                        "invested_amount_cny": "0",
+                        "bought_on": "2026-07-10",
+                    }
+                ]
+            },
+        )
         assert bad_amount.status_code == 422
-        unsupported = client.post("/api/holdings", json={"rows": [{"row_id": "unsupported", "symbol": "AAPL", "asset_type": "us_stock", "invested_amount_cny": "1", "bought_on": "2026-07-10"}]})
+        unsupported = client.post(
+            "/api/holdings",
+            json={
+                "rows": [
+                    {
+                        "row_id": "unsupported",
+                        "symbol": "AAPL",
+                        "asset_type": "us_stock",
+                        "invested_amount_cny": "1",
+                        "bought_on": "2026-07-10",
+                    }
+                ]
+            },
+        )
         assert unsupported.status_code == 422
 
 
 def test_holding_form_batch_rolls_back_when_a_row_conflicts(tmp_path: Path) -> None:
-    original = {"row_id": "same-row", "symbol": "600519", "asset_type": "a_share", "invested_amount_cny": "1000", "bought_on": "2026-07-10"}
+    original = {
+        "row_id": "same-row",
+        "symbol": "600519",
+        "asset_type": "a_share",
+        "invested_amount_cny": "1000",
+        "bought_on": "2026-07-10",
+    }
     with TestClient(create_app(tmp_path, automatic_updates=False)) as client:
         assert client.post("/api/holdings", json={"rows": [original]}).status_code == 200
-        response = client.post("/api/holdings", json={"rows": [
-            {"row_id": "new-row", "symbol": "512480", "asset_type": "fund", "invested_amount_cny": "2000", "bought_on": "2026-07-09"},
-            {**original, "invested_amount_cny": "9999"},
-        ]})
+        response = client.post(
+            "/api/holdings",
+            json={
+                "rows": [
+                    {
+                        "row_id": "new-row",
+                        "symbol": "512480",
+                        "asset_type": "fund",
+                        "invested_amount_cny": "2000",
+                        "bought_on": "2026-07-09",
+                    },
+                    {**original, "invested_amount_cny": "9999"},
+                ]
+            },
+        )
         assert response.status_code == 422
         holdings = client.get("/api/bootstrap").json()["holdings"]
         assert [(item["symbol"], item["invested_amount_cny"]) for item in holdings] == [("600519", "1000")]
@@ -378,9 +658,17 @@ def test_material_excerpt_is_saved_to_the_matching_security_note(tmp_path: Path)
         assert workspace["notes"][0]["quoted_text"] == "营业收入同比增长。"
 
 
-def test_holding_note_and_thesis_corrections_are_revisioned_but_deletions_are_permanent(tmp_path: Path) -> None:
+def test_holding_note_and_thesis_corrections_are_revisioned_but_deletions_are_permanent(
+    tmp_path: Path,
+) -> None:
     security_id = "CN:SSE:600519:STOCK"
-    row = {"row_id": "editable", "symbol": "600519", "asset_type": "a_share", "invested_amount_cny": "10000", "bought_on": "2026-07-09"}
+    row = {
+        "row_id": "editable",
+        "symbol": "600519",
+        "asset_type": "a_share",
+        "invested_amount_cny": "10000",
+        "bought_on": "2026-07-09",
+    }
     with TestClient(create_app(tmp_path, automatic_updates=False)) as client:
         assert client.post("/api/holdings", json={"rows": [row]}).status_code == 200
         entry = client.get("/api/bootstrap").json()["holding_entries"][0]
@@ -388,14 +676,26 @@ def test_holding_note_and_thesis_corrections_are_revisioned_but_deletions_are_pe
         assert client.put(f"/api/holdings/{entry['holding_id']}", json=revised).status_code == 200
         assert client.get("/api/bootstrap").json()["holdings"][0]["invested_amount_cny"] == "12000"
 
-        note_id = client.post("/api/research/notes", json={"security_id": security_id, "body": "旧笔记"}).json()["note_id"]
-        assert client.put(f"/api/research/notes/{note_id}", json={"security_id": security_id, "body": "新笔记"}).status_code == 200
+        note_id = client.post(
+            "/api/research/notes", json={"security_id": security_id, "body": "旧笔记"}
+        ).json()["note_id"]
+        assert (
+            client.put(
+                f"/api/research/notes/{note_id}", json={"security_id": security_id, "body": "新笔记"}
+            ).status_code
+            == 200
+        )
         assert client.get(f"/api/research/{security_id}").json()["notes"][0]["body"] == "新笔记"
         assert client.delete(f"/api/research/notes/{note_id}").status_code == 200
         assert client.get(f"/api/research/{security_id}").json()["notes"] == []
 
-        thesis = client.post("/api/research/theses", json={"security_id": security_id, "body": "旧观点"}).json()
-        revised_thesis = client.post("/api/research/theses", json={"security_id": security_id, "thesis_id": thesis["thesis_id"], "body": "新观点"})
+        thesis = client.post(
+            "/api/research/theses", json={"security_id": security_id, "body": "旧观点"}
+        ).json()
+        revised_thesis = client.post(
+            "/api/research/theses",
+            json={"security_id": security_id, "thesis_id": thesis["thesis_id"], "body": "新观点"},
+        )
         assert revised_thesis.json()["revision_number"] == 2
         assert client.delete(f"/api/research/theses/{thesis['thesis_id']}").status_code == 200
         assert client.get(f"/api/research/{security_id}").json()["thesis"] is None
@@ -405,17 +705,64 @@ def test_holding_note_and_thesis_corrections_are_revisioned_but_deletions_are_pe
 
     with sqlite3.connect(tmp_path / "vault.sqlite3") as connection:
         assert connection.execute("SELECT COUNT(*) FROM holding_records").fetchone()[0] == 0
-        assert connection.execute("SELECT COUNT(*) FROM notes WHERE note_id = ?", (note_id,)).fetchone()[0] == 0
-        assert connection.execute("SELECT COUNT(*) FROM note_revisions WHERE note_id = ?", (note_id,)).fetchone()[0] == 0
-        assert connection.execute("SELECT COUNT(*) FROM theses WHERE thesis_id = ?", (thesis["thesis_id"],)).fetchone()[0] == 0
-        assert connection.execute("SELECT COUNT(*) FROM thesis_revisions WHERE thesis_id = ?", (thesis["thesis_id"],)).fetchone()[0] == 0
+        assert (
+            connection.execute("SELECT COUNT(*) FROM notes WHERE note_id = ?", (note_id,)).fetchone()[0] == 0
+        )
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM note_revisions WHERE note_id = ?", (note_id,)
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM theses WHERE thesis_id = ?", (thesis["thesis_id"],)
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM thesis_revisions WHERE thesis_id = ?", (thesis["thesis_id"],)
+            ).fetchone()[0]
+            == 0
+        )
 
 
 def test_profit_is_estimated_from_exact_purchase_close_without_inventing_quantity(tmp_path: Path) -> None:
     with TestClient(create_app(tmp_path, automatic_updates=False)) as client:
-        client.post("/api/holdings", json={"rows": [{"row_id": "profit", "symbol": "600519", "asset_type": "a_share", "invested_amount_cny": "10000", "bought_on": "2026-07-09"}]})
+        client.post(
+            "/api/holdings",
+            json={
+                "rows": [
+                    {
+                        "row_id": "profit",
+                        "symbol": "600519",
+                        "asset_type": "a_share",
+                        "invested_amount_cny": "10000",
+                        "bought_on": "2026-07-09",
+                    }
+                ]
+            },
+        )
         for trade_date, price in (("2026-07-09", 1000), ("2026-07-13", 1100)):
-            client.post("/api/refresh-jobs", json={"kind": "quote", "requested_as_of": trade_date, "payload": {"symbol": "600519", "market": "a", "asset_type": "stock", "name": "贵州茅台", "price": price, "currency": "CNY", "trade_date": trade_date, "source": "test", "source_ref": "https://example.test"}})
+            client.post(
+                "/api/refresh-jobs",
+                json={
+                    "kind": "quote",
+                    "requested_as_of": trade_date,
+                    "payload": {
+                        "symbol": "600519",
+                        "market": "a",
+                        "asset_type": "stock",
+                        "name": "贵州茅台",
+                        "price": price,
+                        "currency": "CNY",
+                        "trade_date": trade_date,
+                        "source": "test",
+                        "source_ref": "https://example.test",
+                    },
+                },
+            )
         holding = client.get("/api/bootstrap").json()["holdings"][0]
         assert holding["quantity"] is None
         assert holding["estimated_profit_cny"] == 1000
@@ -450,33 +797,41 @@ def test_market_page_exposes_global_manual_refresh_and_activity_fields() -> None
     assert 'refreshMarket("lhb")' in source
     assert 'refreshMarket("industry_flow")' in source
     assert "market.pulse" in source
-    assert '<Card title="赚钱效应与上涨主线">' in source
-    assert '<Card title="下跌风险">' in source
+    assert 'title="赚钱效应与上涨主线"' in source
+    assert 'title="下跌风险"' in source
+    assert source.count('refreshMarket("pulse")') >= 2
     assert "M3 ·" not in source
     assert "M4 ·" not in source
     assert "持仓股票 24 小时资讯" in source
     assert 'scene="market"' in source
     assert "更新市场数据后自动识别" in source
-    assert "<span>报告阶段</span>" not in source[source.index("function ResearchAssistant"):source.index("function SecurityWorkbench")]
+    assert (
+        "<span>报告阶段</span>"
+        not in source[source.index("function ResearchAssistant") : source.index("function SecurityWorkbench")]
+    )
     assert "当前报告阶段" in source
     assert "生成最新行情报告" in source
-    market_assistant = source[source.index("function ResearchAssistant"):source.index("function SecurityWorkbench")]
-    assert '<span>专家风格</span>' in market_assistant
+    market_assistant = source[
+        source.index("function ResearchAssistant") : source.index("function SecurityWorkbench")
+    ]
+    assert "<span>专家风格</span>" in market_assistant
     assert 'useState("dalio")' in market_assistant
     assert '<option value="committee">投委会风格</option>' in market_assistant
     assert 'marketStyle === "committee"' in market_assistant
     assert '? "AI 市场行情助手"' not in market_assistant
     assert 'scene === "market" ? null' in market_assistant
     assert 'scene === "market" ? null : <div className="chat-composer">' in market_assistant
-    assert 'forceNew' in market_assistant
+    assert "forceNew" in market_assistant
     assert 'scene === "security" && <div className="button-row">' in market_assistant
     assert "会话历史" not in market_assistant
     assert 'if (scene === "market") {\n      setThreads([]);' not in market_assistant
     assert "行情阶段\\n${marketStage.label}" in market_assistant
     assert "大盘行情笔记" in source
     assert "saveNote={saveMarketNote}" in source
-    market_page = source[source.index("function MarketPage"):source.index("function MaterialList")]
-    investment_notes = source[source.index("function Research({"):source.index("function ResearchAssistant")]
+    market_page = source[source.index("function MarketPage") : source.index("function MaterialList")]
+    investment_notes = source[
+        source.index("function Research({") : source.index("function ResearchAssistant")
+    ]
     assert "大盘行情笔记" not in market_page
     assert "大盘行情笔记" in investment_notes
 
@@ -492,20 +847,46 @@ def test_market_report_stage_is_returned_by_bootstrap_and_refresh(tmp_path: Path
 def test_market_report_can_be_saved_as_a_market_note(tmp_path: Path) -> None:
     security_id = "MARKET:GLOBAL:OVERVIEW"
     body = "行情阶段\n7月20日盘中行情报告\n\n投委会报告\n市场宽度转弱。"
+    title = "2026年7月20日 盘中报告（投委会）最终稿"
     with TestClient(create_app(tmp_path, automatic_updates=False)) as client:
         saved = client.post(
-            "/api/research/notes", json={"security_id": security_id, "body": body}
+            "/api/research/notes",
+            json={"security_id": security_id, "body": body, "title": title},
         )
         assert saved.status_code == 200
         workspace = client.get(f"/api/research/{security_id}").json()
 
     assert workspace["notes"][0]["body"] == body
+    assert workspace["notes"][0]["title"] == title
+
+
+def test_industry_flow_refresh_does_not_refresh_market_pulse(tmp_path: Path, monkeypatch) -> None:
+    calls = {"industry_flow": 0, "pulse": 0}
+
+    def flow(_):
+        calls["industry_flow"] += 1
+        return {"date": "2026-07-20", "source": "fixture", "inbound": [], "outbound": []}
+
+    def pulse(*_args, **_kwargs):
+        calls["pulse"] += 1
+        return {"date": "2026-07-20", "source": "fixture", "kind": "holding_news", "news": []}
+
+    monkeypatch.setattr("invest_vault.api.fetch_industry_money_flow", flow)
+    monkeypatch.setattr("invest_vault.api.fetch_market_pulse", pulse)
+
+    with TestClient(create_app(tmp_path, automatic_updates=False)) as client:
+        response = client.post("/api/market/refresh", json={"section": "industry_flow"})
+
+    assert response.status_code == 200
+    assert response.json()["completed"] == ["industry_flow"]
+    assert response.json()["market"]["industry_flow"]["source"] == "fixture"
+    assert calls == {"industry_flow": 1, "pulse": 0}
 
 
 def test_assistant_report_renderer_turns_markdown_tables_into_real_tables() -> None:
     source = (Path(__file__).parents[1] / "web" / "src" / "workbench.tsx").read_text(encoding="utf-8")
 
-    renderer = source[source.index("function renderInlineMarkdown"):source.index("const money")]
+    renderer = source[source.index("function renderInlineMarkdown") : source.index("const money")]
     assert "markdown-table" in renderer
     assert "<table" in renderer
     assert "<thead>" in renderer
@@ -518,27 +899,30 @@ def test_investment_notes_use_semantic_preview_and_centered_detail_dialog() -> N
     root = Path(__file__).parents[1]
     source = (root / "web" / "src" / "workbench.tsx").read_text(encoding="utf-8")
     styles = (root / "web" / "src" / "styles.css").read_text(encoding="utf-8")
-    notes = source[source.index("function NoteDisclosure"):source.index("function FinancialTable")]
+    notes = source[source.index("function NoteDisclosure") : source.index("function FinancialTable")]
 
-    assert '<RichText text={note.body} />' in notes
+    assert "<RichText text={note.body} />" in notes
     assert "…显示更多" in notes
     assert 'role="dialog"' in notes
     assert 'aria-modal="true"' in notes
-    assert notes.count('<RichText text={note.body} />') >= 2
+    assert notes.count("<RichText text={note.body} />") >= 2
     assert "note-preview-clamp" in notes
     assert "note-detail-dialog" in notes
     assert "scrollHeight > node.clientHeight" in notes
     assert "ResizeObserver" in notes
     assert "{overflowing && (" in notes
-    today = source[source.index("function Today("):source.index("function Portfolio(")]
+    today = source[source.index("function Today(") : source.index("function Portfolio(")]
     assert "<NoteDisclosure note={item}" in today
     assert ".note-preview-clamp" in styles
-    assert "max-height:" in styles[styles.index(".note-preview-clamp"):styles.index(".note-preview-clamp") + 300]
+    assert (
+        "max-height:"
+        in styles[styles.index(".note-preview-clamp") : styles.index(".note-preview-clamp") + 300]
+    )
 
 
 def test_note_editor_toolbar_applies_markdown_to_the_real_textarea() -> None:
     source = (Path(__file__).parents[1] / "web" / "src" / "workbench.tsx").read_text(encoding="utf-8")
-    notes = source[source.index("function Research({"):source.index("function ResearchAssistant")]
+    notes = source[source.index("function Research({") : source.index("function ResearchAssistant")]
 
     assert "noteEditorRef" in notes
     assert "applyNoteFormat" in notes
@@ -548,7 +932,7 @@ def test_note_editor_toolbar_applies_markdown_to_the_real_textarea() -> None:
     assert 'onClick={() => applyNoteFormat("unordered")}' in notes
     assert 'onClick={() => applyNoteFormat("ordered")}' in notes
     assert "expandInlineSelection" in notes
-    renderer = source[source.index("function renderInlineMarkdown"):source.index("const money")]
+    renderer = source[source.index("function renderInlineMarkdown") : source.index("const money")]
     assert 'part.startsWith("***")' in renderer
     assert "<strong key={key}><em>" in renderer
     assert "renderInlineMarkdown" in renderer
@@ -566,10 +950,12 @@ def test_fund_manager_profile_uses_a_bounded_horizontal_scroll_region() -> None:
     root = Path(__file__).parents[1]
     source = (root / "web" / "src" / "workbench.tsx").read_text(encoding="utf-8")
     styles = (root / "web" / "src" / "styles.css").read_text(encoding="utf-8")
-    fund = source[source.index('title="基金经理画像"'):source.index('title="近期事件"')]
+    fund = source[source.index('title="基金经理画像"') : source.index('title="近期事件"')]
 
     assert 'className="manager-table-scroll"' in fund
-    manager_styles = styles[styles.index(".manager-table-scroll"):styles.index(".manager-table-scroll") + 260]
+    manager_styles = styles[
+        styles.index(".manager-table-scroll") : styles.index(".manager-table-scroll") + 260
+    ]
     assert "overflow-x: auto" in manager_styles
     assert "min-width:" in manager_styles
 
@@ -578,7 +964,7 @@ def test_global_search_is_scrollable_and_searches_related_symbols_and_materials(
     root = Path(__file__).parents[1]
     source = (root / "web" / "src" / "workbench.tsx").read_text(encoding="utf-8")
     styles = (root / "web" / "src" / "styles.css").read_text(encoding="utf-8")
-    palette = source[source.index("const paletteItems = useMemo"):source.index("const navigate =")]
+    palette = source[source.index("const paletteItems = useMemo") : source.index("const navigate =")]
 
     assert "fuzzyMatch" in palette
     assert "isSecurityCodeQuery" in palette
@@ -589,14 +975,17 @@ def test_global_search_is_scrollable_and_searches_related_symbols_and_materials(
     assert "materials: filter(materialItems)" in palette
     assert 'className="palette-results"' in source
     assert ".palette-results" in styles
-    assert "overflow-y: auto" in styles[styles.index(".palette-results"):styles.index(".palette-results") + 200]
+    assert (
+        "overflow-y: auto"
+        in styles[styles.index(".palette-results") : styles.index(".palette-results") + 200]
+    )
 
 
 def test_note_markdown_controls_render_as_semantic_ui_and_deletions_warn_permanently() -> None:
     source = (Path(__file__).parents[1] / "web" / "src" / "workbench.tsx").read_text(encoding="utf-8")
-    renderer = source[source.index("function renderInlineMarkdown"):source.index("const money")]
-    today = source[source.index("function Today("):source.index("function Portfolio(")]
-    delete_dialog = source[source.index("function ConfirmDelete"):source.index("export function App")]
+    renderer = source[source.index("function renderInlineMarkdown") : source.index("const money")]
+    today = source[source.index("function Today(") : source.index("function Portfolio(")]
+    delete_dialog = source[source.index("function ConfirmDelete") : source.index("export function App")]
 
     assert "<strong" in renderer
     assert "<em" in renderer
@@ -675,7 +1064,9 @@ def test_security_layout_aligns_topbar_and_reflows_secondary_metrics() -> None:
     assert "security-layout" in source
     assert ".app-shell.security-layout .topbar" in styles
     assert "margin-inline: -18px" in styles
-    overview = styles[styles.index(".security-overview-metrics"):styles.index(".security-overview-metrics") + 500]
+    overview = styles[
+        styles.index(".security-overview-metrics") : styles.index(".security-overview-metrics") + 500
+    ]
     assert "container-type: inline-size" in styles
     assert "@container security-evidence" in styles
     assert "grid-column" in overview or "grid-template-columns" in overview
@@ -731,8 +1122,8 @@ def test_today_long_names_and_market_news_use_bounded_vertical_layouts() -> None
 
 def test_portfolio_and_security_pages_offer_manual_data_refresh() -> None:
     source = (Path(__file__).parents[1] / "web" / "src" / "workbench.tsx").read_text(encoding="utf-8")
-    portfolio = source[source.index("function Portfolio("):source.index("const marketOverviewSubject")]
-    security = source[source.index("function SecurityWorkbench("):source.index("function SettingsPage")]
+    portfolio = source[source.index("function Portfolio(") : source.index("const marketOverviewSubject")]
+    security = source[source.index("function SecurityWorkbench(") : source.index("function SettingsPage")]
 
     assert "refreshData" in portfolio
     assert "刷新持仓行情" in portfolio
@@ -741,21 +1132,166 @@ def test_portfolio_and_security_pages_offer_manual_data_refresh() -> None:
     assert 'api("/api/holdings/refresh"' in source
 
 
-def test_manual_holding_refresh_recomputes_profit_from_refreshed_prices(
-    tmp_path: Path, monkeypatch
-) -> None:
-    monkeypatch.setattr("invest_vault.api.fetch_public_quote", lambda *_: {
-        "symbol": "600519", "name": "贵州茅台", "price": 120,
-        "previous_close": 118, "change_percent": 1.69,
-        "trade_date": "2026-07-17", "source": "fixture-live",
-    })
+def test_today_holding_matters_offer_manual_refresh() -> None:
+    source = (Path(__file__).parents[1] / "web" / "src" / "workbench.tsx").read_text(encoding="utf-8")
+    today = source[source.index("function Today(") : source.index("function Portfolio(")]
+
+    assert "refreshQuotes" in today
+    assert "refreshMaterials" in today
+    assert "刷新组合行情" in today
+    assert "刷新持仓事项" in today
+    assert 'scope=${scope}' in source
+
+
+def test_today_refresh_scopes_keep_quotes_and_materials_independent(tmp_path: Path, monkeypatch) -> None:
+    calls = {"live": 0, "history": 0, "financials": 0, "materials": 0}
+
+    def live(_symbol):
+        calls["live"] += 1
+        return {
+            "symbol": "600519",
+            "market": "a",
+            "asset_type": "stock",
+            "name": "贵州茅台",
+            "price": 1500,
+            "trade_date": "2026-07-17",
+            "source": "fixture-live",
+        }
+
+    def history(_security_id, requested):
+        calls["history"] += 1
+        return {
+            "symbol": "600519",
+            "market": "a",
+            "asset_type": "stock",
+            "name": "贵州茅台",
+            "price": 1400,
+            "trade_date": requested.isoformat(),
+            "source": "fixture-history",
+        }
+
+    def financials(_symbol, _target):
+        calls["financials"] += 1
+        return None
+
+    def materials(_symbol, _target):
+        calls["materials"] += 1
+        return []
+
+    monkeypatch.setattr("invest_vault.api.fetch_public_quote", live)
+    monkeypatch.setattr("invest_vault.api.fetch_security_historical_close", history)
+    monkeypatch.setattr("invest_vault.api.fetch_financial_snapshot", financials)
+    monkeypatch.setattr("invest_vault.api.fetch_company_announcements", materials)
+
+    with TestClient(
+        create_app(
+            tmp_path,
+            automatic_updates=False,
+            now_provider=lambda: datetime(2026, 7, 19, 12, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+    ) as client:
+        assert client.post(
+            "/api/holdings",
+            json={
+                "rows": [
+                    {
+                        "row_id": "row-1",
+                        "symbol": "600519",
+                        "asset_type": "a_share",
+                        "invested_amount_cny": "10000",
+                        "bought_on": "2026-07-01",
+                    }
+                ]
+            },
+        ).status_code == 200
+        materials_response = client.post("/api/holdings/refresh?scope=materials")
+        after_materials = dict(calls)
+        quotes_response = client.post("/api/holdings/refresh?scope=quotes")
+
+    assert materials_response.json()["scope"] == "materials"
+    assert after_materials == {"live": 0, "history": 0, "financials": 1, "materials": 1}
+    assert quotes_response.json()["scope"] == "quotes"
+    assert calls["live"] == 1
+    assert calls["history"] >= 1
+    assert calls["financials"] == 1
+    assert calls["materials"] == 1
+
+
+def test_assistant_empty_state_matches_committee_information_density() -> None:
+    app_root = Path(__file__).parents[1]
+    source = (app_root / "web" / "src" / "workbench.tsx").read_text(encoding="utf-8")
+    styles = (app_root / "web" / "src" / "styles.css").read_text(encoding="utf-8")
+    assistant = source[source.index("function ResearchAssistant") : source.index("function SecurityWorkbench")]
+
+    assert "assistant-empty-state" in assistant
+    assert "assistant-question-list" in assistant
+    assert "已归档行情" in assistant
+    assert ".assistant-empty-state" in styles
+
+
+def test_research_sidebar_separates_market_overview_from_holdings() -> None:
+    source = (Path(__file__).parents[1] / "web" / "src" / "workbench.tsx").read_text(encoding="utf-8")
+    research = source[source.index("function Research({") : source.index("function ResearchAssistant")]
+
+    assert "按市场概览" in research
+    assert "市场行情报告与结论" not in research
+    assert all(label in research for label in ("盘前", "盘中", "盘后"))
+    assert "market_session" in research
+
+
+def test_market_note_session_is_persisted_and_returned(tmp_path: Path) -> None:
+    with TestClient(create_app(tmp_path, automatic_updates=False)) as client:
+        response = client.post(
+            "/api/research/notes",
+            json={
+                "security_id": "MARKET:GLOBAL:OVERVIEW",
+                "body": "行情阶段明确的市场笔记",
+                "title": "2026年7月19日 盘中报告（芒格）最终稿",
+                "market_session": "盘中",
+            },
+        )
+        assert response.status_code == 200
+        workspace = client.get("/api/research/MARKET%3AGLOBAL%3AOVERVIEW").json()
+
+    assert workspace["notes"][0]["market_session"] == "盘中"
+
+
+def test_market_pulse_uses_red_upside_and_green_risk_semantics() -> None:
+    app_root = Path(__file__).parents[1]
+    source = (app_root / "web" / "src" / "workbench.tsx").read_text(encoding="utf-8")
+    styles = (app_root / "web" / "src" / "styles.css").read_text(encoding="utf-8")
+    market = source[source.index('title="赚钱效应与上涨主线"') : source.index('title="持仓股票 24 小时资讯"')]
+
+    assert 'className="pulse-leaders upside"' in market
+    assert 'className="pulse-leaders risk"' in market
+    assert ".pulse-leaders.upside b" in styles
+    assert ".pulse-leaders.risk b" in styles
+
+
+def test_manual_holding_refresh_recomputes_profit_from_refreshed_prices(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        "invest_vault.api.fetch_public_quote",
+        lambda *_: {
+            "symbol": "600519",
+            "name": "贵州茅台",
+            "price": 120,
+            "previous_close": 118,
+            "change_percent": 1.69,
+            "trade_date": "2026-07-17",
+            "source": "fixture-live",
+        },
+    )
     monkeypatch.setattr(
         "invest_vault.api.fetch_security_historical_close",
         lambda _security_id, trade_date: {
-            "symbol": "600519", "name": "贵州茅台",
+            "symbol": "600519",
+            "name": "贵州茅台",
             "price": 100 if trade_date.isoformat() == "2026-07-16" else 120,
-            "trade_date": trade_date.isoformat(), "source": "fixture-close",
-            "source_ref": "https://example.test/close", "market": "a", "asset_type": "stock",
+            "trade_date": trade_date.isoformat(),
+            "source": "fixture-close",
+            "source_ref": "https://example.test/close",
+            "market": "a",
+            "asset_type": "stock",
         },
     )
     for loader in ("fetch_financial_snapshot", "fetch_company_announcements"):
@@ -764,15 +1300,27 @@ def test_manual_holding_refresh_recomputes_profit_from_refreshed_prices(
             lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("offline")),
         )
 
-    with TestClient(create_app(
-        tmp_path,
-        automatic_updates=False,
-        now_provider=lambda: datetime(2026, 7, 17, 14, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
-    )) as client:
-        client.post("/api/holdings", json={"rows": [{
-            "row_id": "manual", "symbol": "600519", "asset_type": "a_share",
-            "invested_amount_cny": "1000", "bought_on": "2026-07-16",
-        }]})
+    with TestClient(
+        create_app(
+            tmp_path,
+            automatic_updates=False,
+            now_provider=lambda: datetime(2026, 7, 17, 14, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+    ) as client:
+        client.post(
+            "/api/holdings",
+            json={
+                "rows": [
+                    {
+                        "row_id": "manual",
+                        "symbol": "600519",
+                        "asset_type": "a_share",
+                        "invested_amount_cny": "1000",
+                        "bought_on": "2026-07-16",
+                    }
+                ]
+            },
+        )
         refreshed = client.post("/api/holdings/refresh")
         holding = client.get("/api/bootstrap?refresh=false").json()["holdings"][0]
 
@@ -780,6 +1328,77 @@ def test_manual_holding_refresh_recomputes_profit_from_refreshed_prices(
     assert refreshed.json()["refreshed"] is True
     assert holding["price"] == 120
     assert holding["estimated_profit_cny"] == 200.0
+
+
+def test_hk_manual_refresh_uses_live_quote_fallback_and_exposes_valuation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        "invest_vault.api.fetch_security_live_quote",
+        lambda *_: {
+            "symbol": "00700",
+            "name": "腾讯控股",
+            "price": 461.6,
+            "previous_close": 454.2,
+            "change_percent": 1.6292,
+            "trade_date": "2026-07-17",
+            "source": "tencent_kline",
+            "source_ref": "https://example.test/hk",
+            "pe_ttm": 16.86,
+            "pb": 3.34,
+            "market_cap_100m": 41945.3,
+            "currency": "HKD",
+        },
+    )
+    monkeypatch.setattr(
+        "invest_vault.api.fetch_security_historical_close",
+        lambda _security_id, trade_date: {
+            "symbol": "00700",
+            "name": "腾讯控股",
+            "price": 454.2,
+            "trade_date": trade_date.isoformat(),
+            "source": "fixture-close",
+            "source_ref": "https://example.test/close",
+            "market": "hk",
+            "asset_type": "stock",
+        },
+    )
+    monkeypatch.setattr(
+        "invest_vault.api.fetch_hkex_announcements",
+        lambda *_: (_ for _ in ()).throw(ValueError("offline")),
+    )
+
+    with TestClient(
+        create_app(
+            tmp_path,
+            automatic_updates=False,
+            now_provider=lambda: datetime(2026, 7, 17, 14, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+    ) as client:
+        client.post(
+            "/api/holdings",
+            json={
+                "rows": [
+                    {
+                        "row_id": "hk-manual",
+                        "symbol": "700",
+                        "asset_type": "hk_stock",
+                        "invested_amount_cny": "1000",
+                        "bought_on": "2026-07-16",
+                    }
+                ]
+            },
+        )
+        refreshed = client.post("/api/holdings/refresh")
+        holding = client.get("/api/bootstrap?refresh=false").json()["holdings"][0]
+
+    assert refreshed.status_code == 200
+    assert holding["name"] == "腾讯控股"
+    assert holding["price"] == 461.6
+    assert holding["change_percent"] == 1.6292
+    assert holding["pe_ttm"] == 16.86
+    assert holding["pb"] == 3.34
+    assert holding["currency"] == "HKD"
 
 
 def test_today_cards_use_pointer_dragging_from_the_card_surface() -> None:

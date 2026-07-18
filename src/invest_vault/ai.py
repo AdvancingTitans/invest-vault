@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Protocol
 from uuid import uuid4
 
+from .ai_providers import PROVIDER_CATALOG, DirectAPIClient, EncryptedCredentialStore
 from .ai_roles import committee_plan, get_role, is_deep_research_request
 from .ai_skills import MARKET_OVERVIEW_SECURITY_ID, AppResearchSkillLayer, ResearchSkillLayer
 from .ledger import Vault
@@ -36,15 +37,96 @@ CHAT_RESPONSE_SCHEMA: dict[str, object] = {
 }
 
 INVESTMENT_TERMS = (
-    "股票", "基金", "债券", "证券", "投资", "理财", "持仓", "组合", "市场", "行业", "公司", "财报",
-    "公告", "盈利", "利润", "收入", "现金流", "估值", "市盈率", "市净率", "roe", "roic", "价格", "股价",
-    "趋势", "成交量", "资金", "风险", "回撤", "收益", "分红", "护城河", "管理层", "资产", "负债", "宏观",
-    "利率", "通胀", "汇率", "政策", "经济", "商业模式", "竞争", "催化剂", "证据", "这家公司", "这个标的",
-    "stock", "fund", "bond", "portfolio", "market", "finance", "financial", "invest", "valuation", "earnings",
-    "买入", "卖出", "加仓", "减仓", "补仓", "仓位", "能买吗", "值得买", "基本面", "技术面", "增长", "营收",
-    "毛利", "净利", "股息", "净值", "波动", "牛市", "熊市",
+    "股票",
+    "基金",
+    "债券",
+    "证券",
+    "投资",
+    "理财",
+    "持仓",
+    "组合",
+    "市场",
+    "行业",
+    "公司",
+    "财报",
+    "公告",
+    "盈利",
+    "利润",
+    "收入",
+    "现金流",
+    "估值",
+    "市盈率",
+    "市净率",
+    "roe",
+    "roic",
+    "价格",
+    "股价",
+    "趋势",
+    "成交量",
+    "资金",
+    "风险",
+    "回撤",
+    "收益",
+    "分红",
+    "护城河",
+    "管理层",
+    "资产",
+    "负债",
+    "宏观",
+    "利率",
+    "通胀",
+    "汇率",
+    "政策",
+    "经济",
+    "商业模式",
+    "竞争",
+    "催化剂",
+    "证据",
+    "这家公司",
+    "这个标的",
+    "stock",
+    "fund",
+    "bond",
+    "portfolio",
+    "market",
+    "finance",
+    "financial",
+    "invest",
+    "valuation",
+    "earnings",
+    "买入",
+    "卖出",
+    "加仓",
+    "减仓",
+    "补仓",
+    "仓位",
+    "能买吗",
+    "值得买",
+    "基本面",
+    "技术面",
+    "增长",
+    "营收",
+    "毛利",
+    "净利",
+    "股息",
+    "净值",
+    "波动",
+    "牛市",
+    "熊市",
 )
-FOLLOW_UP_TERMS = ("为什么", "展开", "继续", "详细", "反方", "依据", "来源", "怎么看", "是否成立", "变化", "影响")
+FOLLOW_UP_TERMS = (
+    "为什么",
+    "展开",
+    "继续",
+    "详细",
+    "反方",
+    "依据",
+    "来源",
+    "怎么看",
+    "是否成立",
+    "变化",
+    "影响",
+)
 MARKET_REPORT_TERMS = ("盘前", "盘中", "盘后", "大盘", "市场", "行情", "指数", "复盘")
 
 MARKET_REPORT_ROLE: dict[str, object] = {
@@ -79,6 +161,7 @@ def is_market_report_question(content: str) -> bool:
     normalized = content.strip().lower()
     return any(term in normalized for term in MARKET_REPORT_TERMS)
 
+
 QUICK_NOTE_SCHEMA: dict[str, object] = {
     "type": "object",
     "additionalProperties": False,
@@ -112,7 +195,11 @@ class AIProvider(Protocol):
     def quick_note(self, raw_text: str, security_id: str) -> dict[str, object]: ...
 
     def chat(
-        self, *, role: dict[str, object], messages: list[dict[str, str]], context: str,
+        self,
+        *,
+        role: dict[str, object],
+        messages: list[dict[str, str]],
+        context: str,
         use_runtime_market_skill: bool = False,
     ) -> dict[str, object]: ...
 
@@ -202,11 +289,7 @@ class CodexAppServerProvider:
 
     def _subprocess_environment(self) -> dict[str, str]:
         environment = os.environ.copy()
-        prefixes = [
-            str(Path(path).parent)
-            for path in (self.node_executable, self.executable)
-            if path
-        ]
+        prefixes = [str(Path(path).parent) for path in (self.node_executable, self.executable) if path]
         existing = environment.get("PATH", "")
         environment["PATH"] = os.pathsep.join(dict.fromkeys([*prefixes, *existing.split(os.pathsep)]))
         return environment
@@ -246,7 +329,7 @@ class CodexAppServerProvider:
             self._stderr_reader.start()
             self._request(
                 "initialize",
-                {"clientInfo": {"name": "invest_vault", "title": "Invest Vault", "version": "0.3.24"}},
+                {"clientInfo": {"name": "invest_vault", "title": "Invest Vault", "version": "0.3.28"}},
                 ensure_started=False,
             )
             self._send({"method": "initialized", "params": {}})
@@ -273,9 +356,7 @@ class CodexAppServerProvider:
                 if self._fatal_error is None:
                     detail = self._safe_stderr_detail()
                     self._fatal_error = (
-                        f"Codex app-server 启动失败：{detail}"
-                        if detail
-                        else "Codex app-server 已意外退出"
+                        f"Codex app-server 启动失败：{detail}" if detail else "Codex app-server 已意外退出"
                     )
                 self._condition.notify_all()
 
@@ -344,11 +425,21 @@ class CodexAppServerProvider:
 
     def status(self) -> dict[str, object]:
         if not self.executable:
-            return {"available": False, "authenticated": False, "provider": "codex_app_server", "detail": "未检测到 Codex CLI"}
+            return {
+                "available": False,
+                "authenticated": False,
+                "provider": "codex_app_server",
+                "detail": "未检测到 Codex CLI",
+            }
         try:
             result = self._request("account/read", {"refreshToken": False}, timeout=15)
         except AIUnavailableError as error:
-            return {"available": False, "authenticated": False, "provider": "codex_app_server", "detail": str(error)}
+            return {
+                "available": False,
+                "authenticated": False,
+                "provider": "codex_app_server",
+                "detail": str(error),
+            }
         account = result.get("account")
         safe_account = None
         if isinstance(account, dict):
@@ -427,7 +518,9 @@ class CodexAppServerProvider:
                     turn = params["turn"]
                     if turn.get("status") != "completed":
                         error = turn.get("error") or {}
-                        raise AIUnavailableError(f"Codex 生成失败：{error.get('message') or turn.get('status')}")
+                        raise AIUnavailableError(
+                            f"Codex 生成失败：{error.get('message') or turn.get('status')}"
+                        )
                     return completed_text or "".join(chunks)
 
     def quick_note(self, raw_text: str, security_id: str) -> dict[str, object]:
@@ -477,9 +570,7 @@ class CodexAppServerProvider:
             return self._runtime_market_skill or None
         bundled = self.market_skill_directory.resolve()
         if (bundled / "SKILL.md").is_file():
-            self._runtime_market_skill = {
-                "type": "skill", "name": "stock-analysis", "path": str(bundled)
-            }
+            self._runtime_market_skill = {"type": "skill", "name": "stock-analysis", "path": str(bundled)}
             return self._runtime_market_skill
         try:
             result = self._request(
@@ -507,7 +598,11 @@ class CodexAppServerProvider:
         return self._runtime_market_skill or None
 
     def chat(
-        self, *, role: dict[str, object], messages: list[dict[str, str]], context: str,
+        self,
+        *,
+        role: dict[str, object],
+        messages: list[dict[str, str]],
+        context: str,
         use_runtime_market_skill: bool = False,
     ) -> dict[str, object]:
         status = self.status()
@@ -515,18 +610,18 @@ class CodexAppServerProvider:
             raise AIUnavailableError("请先使用 ChatGPT 登录 Codex")
         role_name = str(role["name"])
         report_rules = (
-                "你只能生成当前盘前、盘中或盘后市场复盘。投委会报告固定顺序为：执行摘要；"
-                "大盘指数概览；持仓分析；六模块深度复盘（M1指数与市场广度、M2板块资金、"
-                "M3赚钱效应与上涨主线、M4下跌与流动性风险、M5风格分组、M6抗跌方向）；"
-                "综合持仓建议与风险提示。指数和持仓必须使用Markdown表格。每个模块使用加粗的关键判断，"
-                "并写判断、证据、风险或确认条件。综合建议必须包含现状总结、基准跑赢/跑输、"
-                "条件化仓位动作、下一交易日观察清单、风险提示。单专家报告仍按该专家证据优先级组织，"
-                "但不得省略数据日期、指数表、持仓边界、观察清单和风险提示。"
-                "持仓必须引用本地账本，区分记录数量、推导数量、成本权重和实时市值估算。"
-                "持仓表必须使用证据中的display_name，统一写成证券名称（代码），不得只显示代码。"
-                "若所选时段与证据实际时段不一致，先披露错配，不得重标。正文不得出现接口、fallback、"
-                "Evidence或Skill等工程表述。结尾原样写：以上内容仅供参考，不构成任何投资建议。"
-                "股市有风险，投资需谨慎。"
+            "你只能生成当前盘前、盘中或盘后市场复盘。投委会报告固定顺序为：执行摘要；"
+            "大盘指数概览；持仓分析；六模块深度复盘（M1指数与市场广度、M2板块资金、"
+            "M3赚钱效应与上涨主线、M4下跌与流动性风险、M5风格分组、M6抗跌方向）；"
+            "综合持仓建议与风险提示。指数和持仓必须使用Markdown表格。每个模块使用加粗的关键判断，"
+            "并写判断、证据、风险或确认条件。综合建议必须包含现状总结、基准跑赢/跑输、"
+            "条件化仓位动作、下一交易日观察清单、风险提示。单专家报告仍按该专家证据优先级组织，"
+            "但不得省略数据日期、指数表、持仓边界、观察清单和风险提示。"
+            "持仓必须引用本地账本，区分记录数量、推导数量、成本权重和实时市值估算。"
+            "持仓表必须使用证据中的display_name，统一写成证券名称（代码），不得只显示代码。"
+            "若所选时段与证据实际时段不一致，先披露错配，不得重标。正文不得出现接口、fallback、"
+            "Evidence或Skill等工程表述。结尾原样写：以上内容仅供参考，不构成任何投资建议。"
+            "股市有风险，投资需谨慎。"
             if role.get("report_kind") == "market"
             else (
                 "你是投委会报告编辑器，必须执行 stock-analysis 4.12.0 Research 机构报告骨架："
@@ -542,23 +637,26 @@ class CodexAppServerProvider:
         skill_rules = (
             "本轮以已内置的 stock-analysis 4.12.0 skill 作为证据路由、六人投委会和报告纪律的"
             "主契约；只引用应用提供的结构化事实，不读取其他文件或改写本地账本。"
-            if skill_input else "不读取文件。"
+            if skill_input
+            else "不读取文件。"
         )
-        base_instructions = "".join((
-            f"你是 Invest Vault 的{role_name}，使用以下分析框架而非模仿或冒充真人。",
-            f"关注：{role['focus']}。核心问题：{role['questions']}。风险重点：{role['risk_focus']}。",
-            "只使用应用提供的上下文和用户消息，不自行联网。",
-            skill_rules,
-            report_rules,
-            "应用会按 AVAILABLE_SKILLS 调用受控只读工具，SKILL_RUN 和对应 EVIDENCE-SKILL 结果可作为证据；",
-            "技能仍报告缺口时不得自行补全。",
-            "回答前先读取专家证据覆盖检查：只把 available 当作完整证据，conditional 必须说明口径边界，",
-            "missing 必须具体说明缺少哪项；不要用笼统的‘现有证据不足’替代逐项结果。",
-            "事实结论必须在结构化 cited_evidence_ids 字段引用证据 ID，但正文绝不显示任何 EVIDENCE、",
-            "技能ID或其他工程标识；没有证据的内容明确写成推断，缺失数据放入 unknowns。",
-            "正文可用 Markdown 加粗，但不要把 Markdown 符号当普通文字解释。",
-            "不虚构数字、来源或专家原话，不给确定性买卖指令。用中文直接回答。",
-        ))
+        base_instructions = "".join(
+            (
+                f"你是 Invest Vault 的{role_name}，使用以下分析框架而非模仿或冒充真人。",
+                f"关注：{role['focus']}。核心问题：{role['questions']}。风险重点：{role['risk_focus']}。",
+                "只使用应用提供的上下文和用户消息，不自行联网。",
+                skill_rules,
+                report_rules,
+                "应用会按 AVAILABLE_SKILLS 调用受控只读工具，SKILL_RUN 和对应 EVIDENCE-SKILL 结果可作为证据；",
+                "技能仍报告缺口时不得自行补全。",
+                "回答前先读取专家证据覆盖检查：只把 available 当作完整证据，conditional 必须说明口径边界，",
+                "missing 必须具体说明缺少哪项；不要用笼统的‘现有证据不足’替代逐项结果。",
+                "事实结论必须在结构化 cited_evidence_ids 字段引用证据 ID，但正文绝不显示任何 EVIDENCE、",
+                "技能ID或其他工程标识；没有证据的内容明确写成推断，缺失数据放入 unknowns。",
+                "正文可用 Markdown 加粗，但不要把 Markdown 符号当普通文字解释。",
+                "不虚构数字、来源或专家原话，不给确定性买卖指令。用中文直接回答。",
+            )
+        )
         thread = self._request(
             "thread/start",
             {
@@ -584,7 +682,10 @@ class CodexAppServerProvider:
                 "input": inputs,
                 "outputSchema": CHAT_RESPONSE_SCHEMA,
                 **self._task_overrides(
-                    "committee" if role.get("role_id") == "report_editor" else "research"
+                    str(
+                        role.get("_provider_task")
+                        or ("committee" if role.get("role_id") == "report_editor" else "research")
+                    )
                 ),
             },
         )
@@ -619,6 +720,120 @@ class CodexAppServerProvider:
             process.kill()
 
 
+class MultiProviderAIProvider:
+    """Route each task to Codex login or one encrypted bring-your-own-key provider."""
+
+    def __init__(self, codex: AIProvider, credentials: EncryptedCredentialStore) -> None:
+        self.codex = codex
+        self.credentials = credentials
+        self._settings: dict[str, dict[str, str | None]] = {}
+
+    def status(self) -> dict[str, object]:
+        return self.codex.status()
+
+    def start_chatgpt_login(self) -> dict[str, object]:
+        return self.codex.start_chatgpt_login()
+
+    def logout(self) -> dict[str, object]:
+        return self.codex.logout()
+
+    def list_models(self) -> list[dict[str, object]]:
+        return self.codex.list_models()
+
+    def configure_models(self, settings: dict[str, dict[str, str | None]]) -> None:
+        self._settings = settings
+        self.codex.configure_models(settings)
+
+    def _route(self, task: str) -> tuple[str, str | None]:
+        setting = self._settings.get(task) or {}
+        provider_id = str(setting.get("provider_id") or "codex")
+        model_id = str(setting.get("model_id") or "") or None
+        if provider_id not in PROVIDER_CATALOG:
+            raise AIUnavailableError("AI Provider 设置无效，请在设置中重新选择")
+        return provider_id, model_id
+
+    def _direct(self, task: str) -> tuple[DirectAPIClient, str]:
+        provider_id, model_id = self._route(task)
+        if provider_id == "codex":
+            raise AssertionError("Codex route does not use DirectAPIClient")
+        api_key = self.credentials.get_api_key(provider_id)
+        if not api_key:
+            raise AIUnavailableError(f"请先在设置中填写 {PROVIDER_CATALOG[provider_id]['name']} key")
+        models = list(PROVIDER_CATALOG[provider_id]["models"])
+        return DirectAPIClient(provider_id, api_key), model_id or str(models[0])
+
+    def quick_note(self, raw_text: str, security_id: str) -> dict[str, object]:
+        provider_id, _ = self._route("quick_note")
+        if provider_id == "codex":
+            return self.codex.quick_note(raw_text, security_id)
+        client, model = self._direct("quick_note")
+        try:
+            result = client.generate_json(
+                model=model,
+                system=(
+                    "你是投资研究速记整理器。只整理用户提供的文本，不联网、不补充事实、"
+                    "不提供买卖建议；事实只包括用户明确陈述，猜测和感觉归入 user_judgements。"
+                ),
+                prompt=f"关联证券：{security_id}\n用户原始速记：\n{raw_text}",
+                schema=QUICK_NOTE_SCHEMA,
+            )
+        except (RuntimeError, ValueError) as error:
+            raise AIUnavailableError(str(error)) from error
+        missing = [key for key in QUICK_NOTE_SCHEMA["required"] if key not in result]
+        if missing:
+            raise AIUnavailableError(f"Provider 速记格式无效：缺少 {', '.join(missing)}")
+        return result
+
+    def chat(
+        self,
+        *,
+        role: dict[str, object],
+        messages: list[dict[str, str]],
+        context: str,
+        use_runtime_market_skill: bool = False,
+    ) -> dict[str, object]:
+        task = str(
+            role.get("_provider_task")
+            or ("committee" if role.get("role_id") == "report_editor" else "research")
+        )
+        provider_id, _ = self._route(task)
+        if provider_id == "codex":
+            return self.codex.chat(
+                role=role,
+                messages=messages,
+                context=context,
+                use_runtime_market_skill=use_runtime_market_skill,
+            )
+        client, model = self._direct(task)
+        system = "".join(
+            (
+                f"你是 Invest Vault 的{role['name']}，使用分析框架而非模仿真人。",
+                f"关注：{role['focus']}。核心问题：{role['questions']}。风险重点：{role['risk_focus']}。",
+                "只使用应用提供的有界证据和用户消息，不自行联网、不调用外部工具。",
+                "事实结论在 cited_evidence_ids 引用上下文中的证据 ID；缺失数据写入 unknowns，",
+                "推断写入 assumptions；正文不得显示内部工程标识，不虚构数字、来源或专家原话，",
+                "不给确定性买卖指令。用中文直接回答。",
+            )
+        )
+        transcript = "\n".join(f"{item['role']}: {item['content']}" for item in messages[-20:])
+        try:
+            result = client.generate_json(
+                model=model,
+                system=system,
+                prompt=f"应用上下文：\n{context}\n\n对话：\n{transcript}",
+                schema=CHAT_RESPONSE_SCHEMA,
+            )
+        except (RuntimeError, ValueError) as error:
+            raise AIUnavailableError(str(error)) from error
+        missing = [key for key in CHAT_RESPONSE_SCHEMA["required"] if key not in result]
+        if missing:
+            raise AIUnavailableError(f"Provider 研究回复格式无效：缺少 {', '.join(missing)}")
+        return result
+
+    def close(self) -> None:
+        self.codex.close()
+
+
 class AISettingsStore:
     TASKS = ("quick_note", "research", "committee")
     EFFORTS = {"minimal", "low", "medium", "high", "xhigh"}
@@ -634,9 +849,10 @@ class AISettingsStore:
         ).fetchone()
         raw = json.loads(str(row["model_config_json"])) if row else {}
         return {
-            "provider": "codex_app_server",
+            "provider": "multi_provider",
             "tasks": {
                 task: {
+                    "provider_id": (raw.get(task) or {}).get("provider_id") or "codex",
                     "model_id": (raw.get(task) or {}).get("model_id"),
                     "reasoning_effort": (raw.get(task) or {}).get("reasoning_effort"),
                 }
@@ -644,16 +860,27 @@ class AISettingsStore:
             },
         }
 
-    def put(self, task: str, *, model_id: str | None, reasoning_effort: str | None) -> dict[str, object]:
+    def put(
+        self,
+        task: str,
+        *,
+        provider_id: str | None,
+        model_id: str | None,
+        reasoning_effort: str | None,
+    ) -> dict[str, object]:
         if task not in self.TASKS:
             raise ValueError("未知的 AI 任务类型")
         if reasoning_effort and reasoning_effort not in self.EFFORTS:
             raise ValueError("不支持的推理强度")
+        selected_provider = provider_id or str(self.get()["tasks"][task]["provider_id"])
+        if selected_provider not in PROVIDER_CATALOG:
+            raise ValueError("不支持的 AI Provider")
         if model_id is not None and not model_id.strip():
             raise ValueError("模型不能为空")
         settings = self.get()
         tasks = dict(settings["tasks"])
         tasks[task] = {
+            "provider_id": selected_provider,
             "model_id": model_id.strip() if model_id else None,
             "reasoning_effort": reasoning_effort,
         }
@@ -694,13 +921,21 @@ class AIQuickNoteStore:
         item = QuickNoteDraft(str(uuid4()), security_id, raw_text.strip(), draft, "draft", created_at)
         self.vault.connection.execute(
             "INSERT INTO ai_quick_notes VALUES (?, ?, ?, ?, 'draft', NULL, ?, NULL)",
-            (item.draft_id, item.security_id, item.raw_text, json.dumps(item.draft, ensure_ascii=False), item.created_at),
+            (
+                item.draft_id,
+                item.security_id,
+                item.raw_text,
+                json.dumps(item.draft, ensure_ascii=False),
+                item.created_at,
+            ),
         )
         self.vault.connection.commit()
         return item
 
     def accept(self, draft_id: str, *, body: str) -> str:
-        row = self.vault.connection.execute("SELECT * FROM ai_quick_notes WHERE draft_id = ?", (draft_id,)).fetchone()
+        row = self.vault.connection.execute(
+            "SELECT * FROM ai_quick_notes WHERE draft_id = ?", (draft_id,)
+        ).fetchone()
         if row is None:
             raise ValueError("AI 速记草稿不存在")
         if row["status"] != "draft":
@@ -759,12 +994,17 @@ class ResearchChatStore:
         if security_id:
             query += " AND security_id = ?"
             params = (security_id,)
-        return [dict(row) for row in self.vault.connection.execute(query + " ORDER BY updated_at DESC", params)]
+        return [
+            dict(row) for row in self.vault.connection.execute(query + " ORDER BY updated_at DESC", params)
+        ]
 
     def archive(self, thread_id: str) -> None:
-        if self.vault.connection.execute(
-            "SELECT 1 FROM research_threads WHERE thread_id = ?", (thread_id,)
-        ).fetchone() is None:
+        if (
+            self.vault.connection.execute(
+                "SELECT 1 FROM research_threads WHERE thread_id = ?", (thread_id,)
+            ).fetchone()
+            is None
+        ):
             raise ValueError("研究会话不存在")
         connection = self.vault.connection
         connection.execute("BEGIN IMMEDIATE")
@@ -790,7 +1030,9 @@ class ResearchChatStore:
             raise
 
     def get(self, thread_id: str, *, include_events: bool = True) -> dict[str, object]:
-        row = self.vault.connection.execute("SELECT * FROM research_threads WHERE thread_id = ?", (thread_id,)).fetchone()
+        row = self.vault.connection.execute(
+            "SELECT * FROM research_threads WHERE thread_id = ?", (thread_id,)
+        ).fetchone()
         if row is None:
             raise ValueError("研究会话不存在")
         result = dict(row)
@@ -819,12 +1061,25 @@ class ResearchChatStore:
         *,
         event_type: str = "message.completed",
     ) -> None:
-        sequence = int(self.vault.connection.execute(
-            "SELECT COALESCE(MAX(sequence_number), 0) + 1 FROM research_events WHERE thread_id = ?", (thread_id,)
-        ).fetchone()[0])
+        sequence = int(
+            self.vault.connection.execute(
+                "SELECT COALESCE(MAX(sequence_number), 0) + 1 FROM research_events WHERE thread_id = ?",
+                (thread_id,),
+            ).fetchone()[0]
+        )
         self.vault.connection.execute(
             "INSERT INTO research_events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (str(uuid4()), thread_id, run_id, sequence, event_type, actor, role_id, json.dumps(payload, ensure_ascii=False), datetime.now(timezone.utc).isoformat()),
+            (
+                str(uuid4()),
+                thread_id,
+                run_id,
+                sequence,
+                event_type,
+                actor,
+                role_id,
+                json.dumps(payload, ensure_ascii=False),
+                datetime.now(timezone.utc).isoformat(),
+            ),
         )
         self.vault.connection.execute(
             "UPDATE research_threads SET updated_at = ? WHERE thread_id = ?",
@@ -885,7 +1140,8 @@ class ResearchChatStore:
                 )
         lines.append("USER_NOTES:")
         for row in self.vault.connection.execute(
-            "SELECT body, created_at FROM notes WHERE security_id = ? ORDER BY created_at DESC LIMIT 10", (security_id,)
+            "SELECT body, created_at FROM notes WHERE security_id = ? ORDER BY created_at DESC LIMIT 10",
+            (security_id,),
         ):
             lines.append(f"USER_NOTE: {row['created_at']} {row['body']}")
         lines.append("PUBLIC_MATERIALS:")
@@ -924,26 +1180,35 @@ class ResearchChatStore:
             (security_id,),
         ).fetchall()
         for index, row in enumerate(rows, 1):
-            sources[f"EVIDENCE-{index}"] = [{
-                "name": str(row["provider"]), "url": str(row["source_ref"]),
-                "as_of": str(row["period_end"] or row["effective_as_of"]),
-            }]
+            sources[f"EVIDENCE-{index}"] = [
+                {
+                    "name": str(row["provider"]),
+                    "url": str(row["source_ref"]),
+                    "as_of": str(row["period_end"] or row["effective_as_of"]),
+                }
+            ]
         for table, prefix in (("financial_snapshots", "FINANCIAL"), ("fund_snapshots", "FUND")):
             row = self.vault.connection.execute(
                 f"SELECT snapshot_id, cutoff_date, source FROM {table} WHERE security_id = ? ORDER BY cutoff_date DESC LIMIT 1",
                 (security_id,),
             ).fetchone()
             if row:
-                sources[f"EVIDENCE-{prefix}-{row['snapshot_id']}"] = [{
-                    "name": str(row["source"]), "url": "", "as_of": str(row["cutoff_date"]),
-                }]
+                sources[f"EVIDENCE-{prefix}-{row['snapshot_id']}"] = [
+                    {
+                        "name": str(row["source"]),
+                        "url": "",
+                        "as_of": str(row["cutoff_date"]),
+                    }
+                ]
         for result in skill_results:
             for evidence in result.get("evidence") or []:
-                details = [{
-                    "name": str(result.get("name") or evidence.get("provider") or "公开证据"),
-                    "url": str(evidence.get("source_ref") or ""),
-                    "as_of": str(evidence.get("as_of") or ""),
-                }]
+                details = [
+                    {
+                        "name": str(result.get("name") or evidence.get("provider") or "公开证据"),
+                        "url": str(evidence.get("source_ref") or ""),
+                        "as_of": str(evidence.get("as_of") or ""),
+                    }
+                ]
                 value = evidence.get("value")
                 if result.get("skill_id") == "public-topic-evidence" and isinstance(value, dict):
                     for search in value.get("searches") or []:
@@ -963,35 +1228,43 @@ class ResearchChatStore:
                         (value.get("related_sector"), "证券所属板块"),
                     ):
                         if isinstance(item, dict) and item.get("source_ref"):
-                            details.append({
-                                "name": str(item.get("source") or fallback_name),
-                                "url": str(item["source_ref"]),
-                                "as_of": str(item.get("as_of") or value.get("market_date") or ""),
-                            })
+                            details.append(
+                                {
+                                    "name": str(item.get("source") or fallback_name),
+                                    "url": str(item["source_ref"]),
+                                    "as_of": str(item.get("as_of") or value.get("market_date") or ""),
+                                }
+                            )
                     sector = value.get("related_sector")
                     sector_history = sector.get("price_volume") if isinstance(sector, dict) else None
                     if isinstance(sector_history, dict) and sector_history.get("source_ref"):
-                        details.append({
-                            "name": str(sector_history.get("source") or "相关板块历史日线"),
-                            "url": str(sector_history["source_ref"]),
-                            "as_of": str(sector_history.get("as_of") or value.get("market_date") or ""),
-                        })
+                        details.append(
+                            {
+                                "name": str(sector_history.get("source") or "相关板块历史日线"),
+                                "url": str(sector_history["source_ref"]),
+                                "as_of": str(sector_history.get("as_of") or value.get("market_date") or ""),
+                            }
+                        )
                     breadth = value.get("market_breadth")
                     if isinstance(breadth, dict) and breadth.get("source_ref"):
-                        details.append({
-                            "name": str(breadth.get("source") or "A股全市场涨跌家数"),
-                            "url": str(breadth["source_ref"]),
-                            "as_of": str(breadth.get("trade_date") or value.get("market_date") or ""),
-                        })
+                        details.append(
+                            {
+                                "name": str(breadth.get("source") or "A股全市场涨跌家数"),
+                                "url": str(breadth["source_ref"]),
+                                "as_of": str(breadth.get("trade_date") or value.get("market_date") or ""),
+                            }
+                        )
                     histories = value.get("continuous_price_volume")
                     if isinstance(histories, dict):
                         for history in histories.values():
                             if isinstance(history, dict) and history.get("source_ref"):
-                                details.append({
-                                    "name": str(history.get("source") or "主要指数连续量价"),
-                                    "url": str(history["source_ref"]),
-                                    "as_of": str(history.get("as_of") or value.get("market_date") or ""),
-                                })
+                                details.append(
+                                    {
+                                        "name": str(history.get("source") or "主要指数连续量价"),
+                                        "url": str(history["source_ref"]),
+                                        "as_of": str(history.get("as_of") or value.get("market_date") or ""),
+                                    }
+                                )
                 sources[str(evidence["evidence_id"])] = details[:13]
         return sources
 
@@ -1114,7 +1387,8 @@ class ResearchChatStore:
                 if evidence_id in valid_evidence_ids
             ]
             source_index = self._source_index(str(thread["security_id"]), skill_results)
-            reply["sources"] = [source
+            reply["sources"] = [
+                source
                 for evidence_id in reply["cited_evidence_ids"]
                 if evidence_id in source_index
                 for source in source_index[evidence_id]
@@ -1154,9 +1428,7 @@ class ResearchChatStore:
         by_skill: dict[str, dict[str, object]] = {}
         readiness: list[dict[str, object]] = []
         for role_id in role_ids:
-            for result in self.skill_layer.run(
-                security_id=security_id, question=question, role_id=role_id
-            ):
+            for result in self.skill_layer.run(security_id=security_id, question=question, role_id=role_id):
                 copied = dict(result)
                 if copied.get("skill_id") == "framework-readiness":
                     copied["skill_id"] = f"framework-readiness-{role_id}"
@@ -1179,10 +1451,9 @@ class ResearchChatStore:
         run_id, now = str(uuid4()), datetime.now(timezone.utc).isoformat()
         with self.vault.lock:
             thread = self.get(thread_id)
-            deep_request = (
-                str(thread["security_id"]) == MARKET_OVERVIEW_SECURITY_ID
-                or is_deep_research_request(content)
-            )
+            deep_request = str(
+                thread["security_id"]
+            ) == MARKET_OVERVIEW_SECURITY_ID or is_deep_research_request(content)
             running = self.vault.connection.execute(
                 "SELECT 1 FROM research_runs WHERE thread_id = ? AND status = 'running' LIMIT 1",
                 (thread_id,),
@@ -1192,7 +1463,13 @@ class ResearchChatStore:
             plan = committee_plan(str(thread["security_id"]), content)
             self.vault.connection.execute(
                 "INSERT INTO research_runs VALUES (?, ?, 'stock-analysis-4.12.0-committee-v1', 'running', 'planning', ?, ?, ?, NULL, NULL)",
-                (run_id, thread_id, json.dumps({"content": content}, ensure_ascii=False), json.dumps(plan, ensure_ascii=False), now),
+                (
+                    run_id,
+                    thread_id,
+                    json.dumps({"content": content}, ensure_ascii=False),
+                    json.dumps(plan, ensure_ascii=False),
+                    now,
+                ),
             )
             self._append_event(thread_id, run_id, "user", "user", {"content": content})
             self._append_event(
@@ -1204,21 +1481,28 @@ class ResearchChatStore:
                 event_type="planning.started",
             )
             self._append_event(
-                thread_id, run_id, "system", "coordinator",
-                ({
-                    "content": "协调员已理解研究问题并制定任务计划。",
-                    "role_name": "协调员",
-                    "selected_roles": [get_role(role_id)["name"] for role_id in plan["roles"]],
-                    "assignments": [
-                        {"name": get_role(item["role_id"])["name"], "function": item["function"]}
-                        for item in plan["assignments"]
-                    ],
-                    "reason": plan["reason"],
-                    "stages": plan["stages"],
-                } if deep_request else {
-                    "content": "协调员已完成问题分流。",
-                    "role_name": "协调员",
-                }),
+                thread_id,
+                run_id,
+                "system",
+                "coordinator",
+                (
+                    {
+                        "content": "协调员已理解研究问题并制定任务计划。",
+                        "role_name": "协调员",
+                        "selected_roles": [get_role(role_id)["name"] for role_id in plan["roles"]],
+                        "assignments": [
+                            {"name": get_role(item["role_id"])["name"], "function": item["function"]}
+                            for item in plan["assignments"]
+                        ],
+                        "reason": plan["reason"],
+                        "stages": plan["stages"],
+                    }
+                    if deep_request
+                    else {
+                        "content": "协调员已完成问题分流。",
+                        "role_name": "协调员",
+                    }
+                ),
                 event_type="plan.completed" if deep_request else "routing.completed",
             )
             self.vault.connection.commit()
@@ -1226,8 +1510,12 @@ class ResearchChatStore:
         if not deep_request:
             reply = {
                 "content": "这个问题更适合普通助手快速回答。投委会模式用于个股、基金或行情复盘的深度报告；请切换到普通助手，或补充研究范围、关注风险和希望复盘的时间区间。",
-                "cited_evidence_ids": [], "assumptions": [], "unknowns": [],
-                "role_id": "coordinator", "role_name": "协调员", "refused": True,
+                "cited_evidence_ids": [],
+                "assumptions": [],
+                "unknowns": [],
+                "role_id": "coordinator",
+                "role_name": "协调员",
+                "refused": True,
                 "suggested_mode": "assistant",
             }
             with self.vault.lock:
@@ -1320,20 +1608,29 @@ class ResearchChatStore:
                 security_id=str(thread["security_id"]), question=content, role_ids=role_ids
             )
         except Exception as error:
-            skill_results = [{
-                "skill_id": "research-evidence-router", "name": "研究证据收集",
-                "status": "failed", "gaps": [str(error)], "evidence": [],
-            }]
+            skill_results = [
+                {
+                    "skill_id": "research-evidence-router",
+                    "name": "研究证据收集",
+                    "status": "failed",
+                    "gaps": [str(error)],
+                    "evidence": [],
+                }
+            ]
         with self.vault.lock:
             self.vault.connection.execute(
                 "UPDATE research_runs SET current_stage = 'evidence' WHERE run_id = ?", (run_id,)
             )
             for result in skill_results:
                 self._append_event(
-                    thread_id, run_id, "system", str(result["skill_id"]),
+                    thread_id,
+                    run_id,
+                    "system",
+                    str(result["skill_id"]),
                     {
                         "content": f"已补充{result['name']}（{result['status']}）。",
-                        "skill_name": result["name"], "status": result["status"],
+                        "skill_name": result["name"],
+                        "status": result["status"],
                         "gaps": result.get("gaps") or [],
                         "evidence_ids": [item["evidence_id"] for item in result.get("evidence") or []],
                     },
@@ -1365,7 +1662,13 @@ class ResearchChatStore:
                 task_id = str(uuid4())
                 self.vault.connection.execute(
                     "INSERT INTO research_tasks (task_id, run_id, parent_task_id, assigned_role, task_type, input_json, output_json, status, attempt, started_at, completed_at) VALUES (?, ?, NULL, ?, 'expert_analysis', ?, NULL, 'running', 1, ?, NULL)",
-                    (task_id, run_id, role_id, json.dumps({"question": content}, ensure_ascii=False), datetime.now(timezone.utc).isoformat()),
+                    (
+                        task_id,
+                        run_id,
+                        role_id,
+                        json.dumps({"question": content}, ensure_ascii=False),
+                        datetime.now(timezone.utc).isoformat(),
+                    ),
                 )
                 self._append_event(
                     thread_id,
@@ -1385,13 +1688,20 @@ class ResearchChatStore:
             for attempt in (1, 2):
                 try:
                     opinion = self.provider.chat(
-                        role=role,
-                        messages=[{"role": "user", "content": f"作为投委会研究员，围绕以下深度问题提交独立意见：{content}"}],
+                        role={**role, "_provider_task": "committee"},
+                        messages=[
+                            {
+                                "role": "user",
+                                "content": f"作为投委会研究员，围绕以下深度问题提交独立意见：{content}",
+                            }
+                        ],
                         context=context[:45_000],
                         use_runtime_market_skill=True,
                     )
                     opinion = self._clean_reply(opinion)
-                    opinion["cited_evidence_ids"] = [item for item in opinion.get("cited_evidence_ids", []) if item in valid_ids]
+                    opinion["cited_evidence_ids"] = [
+                        item for item in opinion.get("cited_evidence_ids", []) if item in valid_ids
+                    ]
                     opinion.update({"role_id": role_id, "role_name": role["name"]})
                     return role_id, opinion, None, attempt
                 except BaseException as error:
@@ -1420,17 +1730,27 @@ class ResearchChatStore:
             if opinion is not None:
                 opinions.append(opinion)
                 with self.vault.lock:
-                    self._append_event(thread_id, run_id, "assistant", role_id, opinion, event_type="expert.completed")
+                    self._append_event(
+                        thread_id, run_id, "assistant", role_id, opinion, event_type="expert.completed"
+                    )
                     self.vault.connection.execute(
                         "UPDATE research_tasks SET output_json = ?, status = 'completed', attempt = ?, completed_at = ? WHERE task_id = ?",
-                        (json.dumps(opinion, ensure_ascii=False), attempts, datetime.now(timezone.utc).isoformat(), task["task_id"]),
+                        (
+                            json.dumps(opinion, ensure_ascii=False),
+                            attempts,
+                            datetime.now(timezone.utc).isoformat(),
+                            task["task_id"],
+                        ),
                     )
                     self.vault.connection.commit()
             else:
                 assert error is not None
                 with self.vault.lock:
                     self._append_event(
-                        thread_id, run_id, "system", role_id,
+                        thread_id,
+                        run_id,
+                        "system",
+                        role_id,
                         {
                             "content": f"{role['name']}本轮未完成，协调员将使用其余意见继续。",
                             "role_name": role["name"],
@@ -1440,13 +1760,19 @@ class ResearchChatStore:
                     )
                     self.vault.connection.execute(
                         "UPDATE research_tasks SET output_json = ?, status = 'failed', attempt = ?, completed_at = ? WHERE task_id = ?",
-                        (json.dumps({"message": str(error)}, ensure_ascii=False), attempts, datetime.now(timezone.utc).isoformat(), task["task_id"]),
+                        (
+                            json.dumps({"message": str(error)}, ensure_ascii=False),
+                            attempts,
+                            datetime.now(timezone.utc).isoformat(),
+                            task["task_id"],
+                        ),
                     )
                     self.vault.connection.commit()
 
         opinion_text = json.dumps(opinions, ensure_ascii=False)[:24_000]
         report_role = {
-            "role_id": "report_editor", "name": "投委会报告编辑器",
+            "role_id": "report_editor",
+            "name": "投委会报告编辑器",
             "focus": "证据边界、专家共识、关键分歧、组合风险和可复核条件",
             "questions": "哪些逻辑仍成立、哪些已削弱、哪些缺口会改变判断？",
             "risk_focus": "证据错配、虚假共识、数据缺口和无条件行动建议",
@@ -1470,23 +1796,36 @@ class ResearchChatStore:
                 )
                 self.vault.connection.commit()
             report = self.provider.chat(
-                role=report_role,
-                messages=[{"role": "user", "content": f"根据协调员计划和专家意见形成最终深度报告：{content}"}],
+                role={**report_role, "_provider_task": "committee"},
+                messages=[
+                    {"role": "user", "content": f"根据协调员计划和专家意见形成最终深度报告：{content}"}
+                ],
                 context=report_context,
                 use_runtime_market_skill=True,
             )
             report = self._clean_reply(report)
-            report["cited_evidence_ids"] = [item for item in report.get("cited_evidence_ids", []) if item in valid_ids]
-            report["sources"] = [source for evidence_id in report["cited_evidence_ids"] for source in source_index.get(evidence_id, [])]
+            report["cited_evidence_ids"] = [
+                item for item in report.get("cited_evidence_ids", []) if item in valid_ids
+            ]
+            report["sources"] = [
+                source
+                for evidence_id in report["cited_evidence_ids"]
+                for source in source_index.get(evidence_id, [])
+            ]
             report.update({"role_id": "report_editor", "role_name": "投委会报告", "report": True})
-            unresolved = list(dict.fromkeys(str(item) for opinion in opinions for item in opinion.get("unknowns", [])))[:8]
+            unresolved = list(
+                dict.fromkeys(str(item) for opinion in opinions for item in opinion.get("unknowns", []))
+            )[:8]
             completed_at = datetime.now(timezone.utc).isoformat()
             with self.vault.lock:
                 self.vault.connection.execute(
                     "UPDATE research_runs SET current_stage = 'conflicts' WHERE run_id = ?", (run_id,)
                 )
                 self._append_event(
-                    thread_id, run_id, "system", "coordinator",
+                    thread_id,
+                    run_id,
+                    "system",
+                    "coordinator",
                     {"content": "协调员已完成共识与分歧整理。", "role_name": "协调员", "gaps": unresolved},
                     event_type="conflicts.completed",
                 )
@@ -1494,14 +1833,28 @@ class ResearchChatStore:
                     "UPDATE research_runs SET current_stage = 'risk_review' WHERE run_id = ?", (run_id,)
                 )
                 self._append_event(
-                    thread_id, run_id, "system", "risk_manager",
-                    {"content": "已完成风险与组合影响审查；未取得的数据继续保留为条件项。", "role_name": "风险与组合经理"},
+                    thread_id,
+                    run_id,
+                    "system",
+                    "risk_manager",
+                    {
+                        "content": "已完成风险与组合影响审查；未取得的数据继续保留为条件项。",
+                        "role_name": "风险与组合经理",
+                    },
                     event_type="risk_review.completed",
                 )
-                self._append_event(thread_id, run_id, "assistant", "report_editor", report, event_type="report.completed")
+                self._append_event(
+                    thread_id, run_id, "assistant", "report_editor", report, event_type="report.completed"
+                )
                 self.vault.connection.execute(
                     "INSERT INTO research_reports VALUES (?, ?, 1, ?, ?, NULL, ?)",
-                    (str(uuid4()), run_id, json.dumps(report, ensure_ascii=False), str(report["content"]), completed_at),
+                    (
+                        str(uuid4()),
+                        run_id,
+                        json.dumps(report, ensure_ascii=False),
+                        str(report["content"]),
+                        completed_at,
+                    ),
                 )
                 self.vault.connection.execute(
                     "UPDATE research_runs SET status = 'completed', current_stage = 'completed', completed_at = ? WHERE run_id = ?",

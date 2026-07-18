@@ -24,8 +24,10 @@ from .ai import (
     AISettingsStore,
     AIUnavailableError,
     CodexAppServerProvider,
+    MultiProviderAIProvider,
     ResearchChatStore,
 )
+from .ai_providers import PROVIDER_CATALOG, EncryptedCredentialStore
 from .ai_roles import AI_ROLES, get_role
 from .ai_skills import ResearchSkillLayer
 from .evidence import EvidenceStore
@@ -44,7 +46,7 @@ from .providers import (
     fetch_market_pulse,
     fetch_public_quote,
     fetch_security_historical_close,
-    fetch_security_valuation,
+    fetch_security_live_quote,
     market_report_stage,
     market_session_metadata,
     previous_trade_date,
@@ -93,6 +95,8 @@ class PortfolioRiskProfilePayload(BaseModel):
 class NotePayload(BaseModel):
     security_id: str = Field(min_length=1, max_length=128)
     body: str = Field(min_length=1, max_length=100_000)
+    title: str | None = Field(default=None, min_length=1, max_length=500)
+    market_session: Literal["盘前", "盘中", "盘后"] | None = None
 
 
 class ThesisPayload(NotePayload):
@@ -137,8 +141,13 @@ class ChatMessagePayload(BaseModel):
 
 
 class AIModelSettingPayload(BaseModel):
+    provider_id: str | None = Field(default=None, max_length=32)
     model_id: str | None = Field(default=None, max_length=200)
     reasoning_effort: str | None = Field(default=None, max_length=20)
+
+
+class AICredentialPayload(BaseModel):
+    key: str = Field(min_length=1, max_length=1_000)
 
 
 def _holding_record(payload: HoldingRowPayload) -> HoldingRecord:
@@ -201,7 +210,11 @@ def _bootstrap(
             "SELECT payload_json FROM market_snapshots WHERE section = ? ORDER BY observed_at DESC LIMIT 1",
             (f"live_quote:{item['security_id']}",),
         ).fetchone()
-        current_quote = json.loads(str(live_row["payload_json"])) if live_row else evidence.latest_quote_payload(item["security_id"]) or {}
+        current_quote = (
+            json.loads(str(live_row["payload_json"]))
+            if live_row
+            else evidence.latest_quote_payload(item["security_id"]) or {}
+        )
         purchase_quote = evidence.quote_payload_for_date(item["security_id"], item["bought_on"]) or {}
         entry_profit: float | None = None
         entry_profit_percent: float | None = None
@@ -214,8 +227,12 @@ def _bootstrap(
                 **item,
                 "estimated_profit_cny": entry_profit,
                 "estimated_profit_percent": entry_profit_percent,
-                "profit_reason": None if entry_profit is not None else (
-                    "最近完整交易日收盘价不可用" if current_quote.get("price") is None else "买入日无可核验收盘价"
+                "profit_reason": None
+                if entry_profit is not None
+                else (
+                    "最近完整交易日收盘价不可用"
+                    if current_quote.get("price") is None
+                    else "买入日无可核验收盘价"
                 ),
             }
         )
@@ -227,13 +244,19 @@ def _bootstrap(
             "SELECT payload_json FROM market_snapshots WHERE section = ? ORDER BY observed_at DESC LIMIT 1",
             (f"live_quote:{security_id}",),
         ).fetchone()
-        quote = json.loads(str(live_row["payload_json"])) if live_row else evidence.latest_quote_payload(security_id) or {}
+        quote = (
+            json.loads(str(live_row["payload_json"]))
+            if live_row
+            else evidence.latest_quote_payload(security_id) or {}
+        )
         records = [item for item in holding_entries if item["security_id"] == security_id]
         estimated_profit: float | None = None
         estimated_profit_percent: float | None = None
         profit_reason = ""
         if records and quote.get("price") is not None:
-            purchase_quotes = [evidence.quote_payload_for_date(security_id, item["bought_on"]) for item in records]
+            purchase_quotes = [
+                evidence.quote_payload_for_date(security_id, item["bought_on"]) for item in records
+            ]
             if all(item and item.get("price") is not None for item in purchase_quotes):
                 invested_total = sum(Decimal(item["invested_amount_cny"]) for item in records)
                 estimated_value = sum(
@@ -256,19 +279,27 @@ def _bootstrap(
                 "security_id": security_id,
                 "name": fund_names.get(security_id) or quote.get("name") or symbol,
                 "symbol": symbol,
-                "asset_type": record.get("asset_type") or ("fund" if security_id.endswith(":FUND") else "a_share"),
+                "asset_type": record.get("asset_type")
+                or ("fund" if security_id.endswith(":FUND") else "a_share"),
                 "invested_amount_cny": record.get("invested_amount_cny"),
                 "bought_on": record.get("bought_on"),
                 "quantity": position.quantity if position else None,
                 "price": quote.get("price"),
+                "previous_close": quote.get("previous_close"),
                 "change_percent": quote.get("change_percent"),
                 "amount": quote.get("amount"),
                 "turnover": quote.get("turnover"),
+                "pe_ttm": quote.get("pe_ttm"),
+                "pb": quote.get("pb"),
+                "market_cap_100m": quote.get("market_cap_100m"),
+                "currency": quote.get("currency") or ("HKD" if region == "HK" else "CNY"),
                 "trade_date": quote.get("trade_date"),
                 "data_session": quote.get("data_session") or "盘后",
-                "data_label": quote.get("data_label") or (
+                "data_label": quote.get("data_label")
+                or (
                     f"{str(quote.get('trade_date') or '')[5:7]}月{str(quote.get('trade_date') or '')[8:10]}日盘后收盘数据"
-                    if quote.get("trade_date") else "等待行情数据"
+                    if quote.get("trade_date")
+                    else "等待行情数据"
                 ),
                 "valuation_status": (
                     "最新行情"
@@ -294,7 +325,9 @@ def _bootstrap(
     report_as_of = (
         archive_target.isoformat()
         if archive_target
-        else min(archived_dates.values()) if archived_dates else None
+        else min(archived_dates.values())
+        if archived_dates
+        else None
     )
     current_count = sum(value == report_as_of for value in archived_dates.values()) if report_as_of else 0
     market = _latest_market_snapshots(vault)
@@ -355,7 +388,13 @@ def create_app(
     vault = Vault(vault_directory / "vault.sqlite3")
     evidence = EvidenceStore(vault, vault_directory)
     research = ResearchStore(vault, vault_directory)
-    provider = ai_provider or CodexAppServerProvider(vault_directory / "ai-runtime")
+    credentials = EncryptedCredentialStore(vault, vault_directory / "ai-master.key")
+    if ai_provider is None:
+        provider = MultiProviderAIProvider(
+            CodexAppServerProvider(vault_directory / "ai-runtime"), credentials
+        )
+    else:
+        provider = ai_provider
     ai_settings = AISettingsStore(vault, provider)
     quick_notes = AIQuickNoteStore(vault, research)
     chats = ResearchChatStore(vault, provider, research_skill_layer)
@@ -412,7 +451,13 @@ def create_app(
                 failed[section] = str(error)
         return completed, failed
 
-    def archive_completed_closes(*, force: bool = False, refresh_market: bool = True) -> date | None:
+    def archive_completed_closes(
+        *,
+        force: bool = False,
+        refresh_market: bool = True,
+        refresh_quotes: bool = True,
+        refresh_research: bool = True,
+    ) -> date | None:
         if not automatic_updates and not force:
             return None
         target = target_trade_date(clock())
@@ -429,54 +474,44 @@ def create_app(
             if not security_id.startswith(("CN:", "HK:")):
                 continue
             symbol, instrument = security_id.split(":")[2], security_id.split(":")[3]
-            try:
-                if security_id.startswith("CN:"):
-                    live_quote = fetch_public_quote(symbol)
-                    market = "CN"
-                elif security_id.startswith("HK:") and instrument == "STOCK":
-                    valuation = fetch_security_valuation(security_id)
-                    live_quote = {
-                        "symbol": symbol,
-                        "name": valuation.get("name"),
-                        "price": valuation.get("price"),
-                        "change_percent": None,
-                        "amount": None,
-                        "turnover": None,
-                        "currency": valuation.get("currency"),
-                        "pe_ttm": valuation.get("pe_ttm"),
-                        "pb": valuation.get("pb"),
-                        "market_cap_100m": valuation.get("market_cap_100m"),
-                        "trade_date": valuation.get("as_of"),
-                        "source": valuation.get("source"),
-                        "source_ref": valuation.get("source_ref"),
-                    }
-                    market = "HK"
-                else:
-                    live_quote = None
-                    market = "CN"
-                if live_quote and live_quote.get("price") is not None and live_quote.get("trade_date"):
-                    session = market_session_metadata(market, str(live_quote["trade_date"]), clock())
-                    live_quote = {
-                        **live_quote,
-                        "data_session": session["session"],
-                        "data_label": session["label"],
-                        "observed_at": datetime.now(timezone.utc).isoformat(),
-                    }
-                    vault.connection.execute(
-                        "INSERT OR REPLACE INTO market_snapshots VALUES (?, ?, ?, ?, ?)",
-                        (
-                            f"live_quote:{security_id}",
-                            str(live_quote["trade_date"]),
-                            str(live_quote.get("source") or "公开行情"),
-                            json.dumps(live_quote, ensure_ascii=False),
-                            datetime.now(timezone.utc).isoformat(),
-                        ),
-                    )
-                    vault.connection.commit()
-            except Exception:
-                pass
+            if refresh_quotes:
+                try:
+                    if security_id.startswith("CN:"):
+                        live_quote = fetch_public_quote(symbol)
+                        market = "CN"
+                    elif security_id.startswith("HK:") and instrument == "STOCK":
+                        live_quote = fetch_security_live_quote(security_id)
+                        market = "HK"
+                    else:
+                        live_quote = None
+                        market = "CN"
+                    if live_quote and live_quote.get("price") is not None and live_quote.get("trade_date"):
+                        session = market_session_metadata(market, str(live_quote["trade_date"]), clock())
+                        live_quote = {
+                            **live_quote,
+                            "data_session": session["session"],
+                            "data_label": session["label"],
+                            "observed_at": datetime.now(timezone.utc).isoformat(),
+                        }
+                        vault.connection.execute(
+                            "INSERT OR REPLACE INTO market_snapshots VALUES (?, ?, ?, ?, ?)",
+                            (
+                                f"live_quote:{security_id}",
+                                str(live_quote["trade_date"]),
+                                str(live_quote.get("source") or "公开行情"),
+                                json.dumps(live_quote, ensure_ascii=False),
+                                datetime.now(timezone.utc).isoformat(),
+                            ),
+                        )
+                        vault.connection.commit()
+                except Exception:
+                    pass
             attempt_key = (security_id, target)
-            if not evidence.has_quote_for_date(security_id, target) and attempt_key not in attempted_quotes:
+            if (
+                refresh_quotes
+                and not evidence.has_quote_for_date(security_id, target)
+                and attempt_key not in attempted_quotes
+            ):
                 attempted_quotes.add(attempt_key)
                 try:
                     quote = fetch_security_historical_close(security_id, target)
@@ -499,10 +534,17 @@ def create_app(
                         requested_as_of=target,
                         observed_at=datetime.now(timezone.utc).isoformat(),
                     )
-            for holding in (item for item in vault.holding_entries() if item["security_id"] == security_id):
+            for holding in (
+                item
+                for item in vault.holding_entries()
+                if refresh_quotes and item["security_id"] == security_id
+            ):
                 bought_on = date.fromisoformat(holding["bought_on"])
                 purchase_key = (security_id, bought_on)
-                if not evidence.has_quote_for_date(security_id, bought_on) and purchase_key not in attempted_quotes:
+                if (
+                    not evidence.has_quote_for_date(security_id, bought_on)
+                    and purchase_key not in attempted_quotes
+                ):
                     attempted_quotes.add(purchase_key)
                     try:
                         purchase_quote = fetch_security_historical_close(security_id, bought_on)
@@ -513,7 +555,7 @@ def create_app(
                         requested_as_of=bought_on,
                         observed_at=datetime.now(timezone.utc).isoformat(),
                     )
-            if security_id.startswith("CN:") and instrument == "STOCK":
+            if refresh_research and security_id.startswith("CN:") and instrument == "STOCK":
                 existing_financials = vault.connection.execute(
                     "SELECT 1 FROM financial_snapshots WHERE security_id = ? AND cutoff_date = ?",
                     (security_id, target.isoformat()),
@@ -526,10 +568,17 @@ def create_app(
                     if financials is not None:
                         vault.connection.execute(
                             "INSERT OR IGNORE INTO financial_snapshots VALUES (?, ?, ?, ?, ?, ?)",
-                            (str(uuid4()), security_id, target.isoformat(), financials["source"], json.dumps(financials, ensure_ascii=False), datetime.now(timezone.utc).isoformat()),
+                            (
+                                str(uuid4()),
+                                security_id,
+                                target.isoformat(),
+                                financials["source"],
+                                json.dumps(financials, ensure_ascii=False),
+                                datetime.now(timezone.utc).isoformat(),
+                            ),
                         )
                         vault.connection.commit()
-            if security_id.startswith("CN:") and instrument == "FUND":
+            if refresh_research and security_id.startswith("CN:") and instrument == "FUND":
                 existing_fund = vault.connection.execute(
                     "SELECT 1 FROM fund_snapshots WHERE security_id = ? AND cutoff_date = ?",
                     (security_id, target.isoformat()),
@@ -542,10 +591,22 @@ def create_app(
                     if fund is not None:
                         vault.connection.execute(
                             "INSERT OR IGNORE INTO fund_snapshots VALUES (?, ?, ?, ?, ?, ?)",
-                            (str(uuid4()), security_id, target.isoformat(), fund["source"], json.dumps(fund, ensure_ascii=False), datetime.now(timezone.utc).isoformat()),
+                            (
+                                str(uuid4()),
+                                security_id,
+                                target.isoformat(),
+                                fund["source"],
+                                json.dumps(fund, ensure_ascii=False),
+                                datetime.now(timezone.utc).isoformat(),
+                            ),
                         )
                         vault.connection.commit()
-            if security_id.startswith(("CN:", "HK:")) and instrument == "STOCK" and not research.materials_synced(security_id, target):
+            if (
+                refresh_research
+                and security_id.startswith(("CN:", "HK:"))
+                and instrument == "STOCK"
+                and not research.materials_synced(security_id, target)
+            ):
                 try:
                     materials = (
                         fetch_company_announcements(symbol, target)
@@ -569,6 +630,7 @@ def create_app(
         if refresh_market:
             refresh_market_sections(["indices", "lhb", "industry_flow", "pulse", "market_news"])
         return target
+
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         yield
@@ -577,7 +639,7 @@ def create_app(
         with vault.lock:
             vault.close()
 
-    app = FastAPI(title="投资札记", version="0.3.24", lifespan=lifespan)
+    app = FastAPI(title="投资札记", version="0.3.28", lifespan=lifespan)
 
     @app.get("/api/data-quality/{security_id:path}")
     def data_quality(security_id: str) -> dict[str, object]:
@@ -604,11 +666,17 @@ def create_app(
             return _bootstrap(vault, evidence, research, archive_target=archive_target, now=clock())
 
     @app.post("/api/holdings/refresh")
-    def refresh_holdings() -> dict[str, object]:
+    def refresh_holdings(scope: Literal["all", "quotes", "materials"] = "all") -> dict[str, object]:
         with vault.lock:
-            archive_target = archive_completed_closes(force=True, refresh_market=False)
+            archive_target = archive_completed_closes(
+                force=True,
+                refresh_market=False,
+                refresh_quotes=scope != "materials",
+                refresh_research=scope != "quotes",
+            )
         return {
             "refreshed": True,
+            "scope": scope,
             "target_date": archive_target.isoformat() if archive_target else None,
             "requested_at": datetime.now(timezone.utc).isoformat(),
         }
@@ -674,18 +742,31 @@ def create_app(
     @app.get("/api/ledger/export")
     def export_ledger() -> JSONResponse:
         with vault.lock:
-            return JSONResponse(vault.export_json(), headers={"Content-Disposition": 'attachment; filename="ledger.json"'})
+            return JSONResponse(
+                vault.export_json(), headers={"Content-Disposition": 'attachment; filename="ledger.json"'}
+            )
 
     @app.post("/api/research/notes")
     def add_note(payload: NotePayload) -> dict[str, str]:
         with vault.lock:
-            return {"note_id": research.add_note(security_id=payload.security_id, body=payload.body)}
+            return {
+                "note_id": research.add_note(
+                    security_id=payload.security_id,
+                    body=payload.body,
+                    title=payload.title,
+                    market_session=payload.market_session,
+                )
+            }
 
     @app.put("/api/research/notes/{note_id}")
     def revise_note(note_id: str, payload: NotePayload) -> dict[str, str]:
         try:
             with vault.lock:
-                return {"revision_id": research.revise_note(note_id, security_id=payload.security_id, body=payload.body)}
+                return {
+                    "revision_id": research.revise_note(
+                        note_id, security_id=payload.security_id, body=payload.body
+                    )
+                }
         except ValueError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
 
@@ -801,6 +882,42 @@ def create_app(
         except AIUnavailableError as error:
             raise HTTPException(status_code=503, detail=str(error)) from error
 
+    @app.get("/api/ai/providers")
+    def ai_providers() -> dict[str, object]:
+        configured = credentials.list_configured()
+        return {
+            "providers": [
+                {
+                    "provider_id": provider_id,
+                    "name": value["name"],
+                    "auth_kind": value["auth_kind"],
+                    "models": value["models"],
+                    # Codex authentication is reported by /api/ai/status. Keeping the
+                    # static catalog independent prevents a slow CLI startup from
+                    # hiding every BYOK option in Settings.
+                    "configured": provider_id == "codex" or provider_id in configured,
+                    "masked": configured.get(provider_id, {}).get("masked"),
+                    "updated_at": configured.get(provider_id, {}).get("updated_at"),
+                }
+                for provider_id, value in PROVIDER_CATALOG.items()
+            ]
+        }
+
+    @app.put("/api/ai/providers/{provider_id}/credential")
+    def put_ai_credential(provider_id: str, payload: AICredentialPayload) -> dict[str, object]:
+        try:
+            return credentials.set_api_key(provider_id, payload.key)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+
+    @app.delete("/api/ai/providers/{provider_id}/credential")
+    def delete_ai_credential(provider_id: str) -> dict[str, object]:
+        try:
+            credentials.delete_api_key(provider_id)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        return {"provider_id": provider_id, "deleted": True}
+
     @app.get("/api/ai/settings")
     def get_ai_settings() -> dict[str, object]:
         return ai_settings.get()
@@ -809,7 +926,10 @@ def create_app(
     def put_ai_model_setting(task: str, payload: AIModelSettingPayload) -> dict[str, object]:
         try:
             return ai_settings.put(
-                task, model_id=payload.model_id, reasoning_effort=payload.reasoning_effort
+                task,
+                provider_id=payload.provider_id,
+                model_id=payload.model_id,
+                reasoning_effort=payload.reasoning_effort,
             )
         except ValueError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
@@ -883,7 +1003,9 @@ def create_app(
     @app.post("/api/ai/chats/{thread_id}/messages")
     def send_ai_chat_message(thread_id: str, payload: ChatMessagePayload) -> dict[str, object]:
         try:
-            return chats.send(thread_id=thread_id, content=payload.content.strip(), role=get_role(payload.role_id))
+            return chats.send(
+                thread_id=thread_id, content=payload.content.strip(), role=get_role(payload.role_id)
+            )
         except ValueError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
         except AIUnavailableError as error:
@@ -913,16 +1035,21 @@ def create_app(
 
     @app.post("/api/market/refresh")
     def refresh_market(payload: MarketRefreshPayload) -> dict[str, object]:
-        selected = ["indices", "lhb", "industry_flow", "pulse", "market_news"] if payload.section == "all" else [payload.section]
-        if payload.section == "industry_flow":
-            selected.append("pulse")
+        selected = (
+            ["indices", "lhb", "industry_flow", "pulse", "market_news"]
+            if payload.section == "all"
+            else [payload.section]
+        )
         with vault.lock:
             completed, failed = refresh_market_sections(selected)
+            market = _latest_market_snapshots(vault)
+            market["report_stage"] = market_report_stage(clock())
         return {
             "completed": completed,
             "failed": failed,
             "requested_at": datetime.now(timezone.utc).isoformat(),
             "report_stage": market_report_stage(clock()),
+            "market": market,
         }
 
     web_dist = web_dist_directory()

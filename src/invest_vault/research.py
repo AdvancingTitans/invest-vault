@@ -95,12 +95,32 @@ class ResearchStore:
             raise
         return revision
 
-    def add_note(self, *, security_id: str, body: str, commit: bool = True) -> str:
+    def add_note(
+        self,
+        *,
+        security_id: str,
+        body: str,
+        title: str | None = None,
+        market_session: str | None = None,
+        commit: bool = True,
+    ) -> str:
         if not body.strip():
             raise ValueError("note body cannot be empty")
+        if market_session not in (None, "盘前", "盘中", "盘后"):
+            raise ValueError("market session must be 盘前, 盘中 or 盘后")
         note_id, created_at = str(uuid4()), _now()
         self.vault.connection.execute(
-            "INSERT INTO notes VALUES (?, ?, ?, ?)", (note_id, security_id, body.strip(), created_at)
+            """INSERT INTO notes
+            (note_id, security_id, body, created_at, title, market_session)
+            VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                note_id,
+                security_id,
+                body.strip(),
+                created_at,
+                title.strip() if title else None,
+                market_session,
+            ),
         )
         self._timeline(security_id, "note", note_id, created_at, "已添加研究笔记")
         if commit:
@@ -272,7 +292,8 @@ class ResearchStore:
         self.vault.connection.execute("BEGIN IMMEDIATE")
         try:
             self.vault.connection.execute(
-                "INSERT INTO notes VALUES (?, ?, ?, ?)", (note_id, security_id, body.strip(), created_at)
+                "INSERT INTO notes (note_id, security_id, body, created_at) VALUES (?, ?, ?, ?)",
+                (note_id, security_id, body.strip(), created_at),
             )
             self.vault.connection.execute(
                 "INSERT INTO note_material_refs VALUES (?, ?, ?, ?)",

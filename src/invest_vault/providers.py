@@ -194,7 +194,7 @@ def parse_tencent_history(payload: str, symbol: str, trade_date: str) -> dict[st
     previous = _float(rows[row_index - 1][2], "previous_close") if row_index > 0 else None
     price = _float(row[2], "price")
     change = price - previous if previous else None
-    name_fields = ((data.get("qt") or {}).get(code) or [])
+    name_fields = (data.get("qt") or {}).get(code) or []
     return {
         "symbol": symbol,
         "market": "a",
@@ -227,7 +227,7 @@ def parse_tencent_security_history(
     row = rows[row_index]
     previous = _float(rows[row_index - 1][2], "previous_close") if row_index > 0 else None
     price = _float(row[2], "price")
-    quote_fields = ((data.get("qt") or {}).get(provider_code) or [])
+    quote_fields = (data.get("qt") or {}).get(provider_code) or []
     change = price - previous if previous else None
     return {
         "symbol": symbol,
@@ -298,7 +298,9 @@ def fetch_public_quote(symbol: str, request: Callable[[str], bytes] = _request) 
         try:
             return parse_sina_quote(request(sina_url).decode("gbk"), symbol)
         except Exception as second_error:
-            raise RuntimeError(f"quote providers unavailable: Tencent={first_error}; Sina={second_error}") from second_error
+            raise RuntimeError(
+                f"quote providers unavailable: Tencent={first_error}; Sina={second_error}"
+            ) from second_error
 
 
 def fetch_security_valuation(
@@ -319,20 +321,83 @@ def fetch_security_valuation(
     if len(fields) < (59 if region == "HK" else 47):
         raise ValueError("腾讯估值响应字段不完整")
     trade_date = _canonical_date(fields[30])
+    price = _number(fields[3])
+    previous_close = _number(fields[4])
+    change = price - previous_close if price is not None and previous_close not in (None, 0) else None
     return {
         "security_id": security_id,
         "name": fields[1],
         "symbol": symbol,
-        "price": _number(fields[3]),
+        "price": price,
+        "previous_close": previous_close,
+        "change": change,
+        "change_percent": round(change / previous_close * 100, 4)
+        if change is not None and previous_close
+        else None,
+        "volume": _number(fields[6]),
+        "amount": _number(fields[37]),
+        "turnover": _number(fields[38]),
         "pe_ttm": _number(fields[39]),
         "pb": _number(fields[58] if region == "HK" else fields[46]),
         "market_cap_100m": _number(fields[44]),
         "currency": "HKD" if region == "HK" else "CNY",
         "as_of": trade_date,
+        "trade_date": trade_date,
         "source": "腾讯证券公开行情",
         "source_ref": f"https://qt.gtimg.cn/q={provider_code}",
+        "source_chain": ["tencent_quote"],
+        "quality_flags": [],
         "valuation_note": "PE/PB为行情源当前口径，不等于历史分位或内在价值估算。",
     }
+
+
+def fetch_security_live_quote(
+    security_id: str, request: Callable[[str], bytes] = _request
+) -> dict[str, object]:
+    """Fetch a current A/HK quote and retain a verified daily fallback for HK disconnects."""
+
+    parts = security_id.split(":")
+    if len(parts) < 4:
+        raise ValueError("invalid security id")
+    region, symbol, instrument = parts[0], parts[2], parts[3]
+    if region == "CN":
+        return fetch_public_quote(symbol, request=request)
+    if region != "HK" or instrument != "STOCK":
+        raise ValueError("当前行情仅支持A股、上市基金和港股个股")
+    try:
+        return fetch_security_valuation(security_id, request=request)
+    except Exception as primary_error:
+        history = fetch_security_trading_history(security_id, limit=5, request=request)
+        rows = list(history["rows"])
+        latest = rows[-1]
+        previous = _number(rows[-2].get("close")) if len(rows) > 1 else None
+        price = _number(latest.get("close"))
+        if price is None:
+            raise ValueError("港股日线 fallback 缺少有效收盘价") from primary_error
+        change = price - previous if previous not in (None, 0) else None
+        return {
+            "symbol": symbol,
+            "market": "hk",
+            "asset_type": "stock",
+            "name": str(latest.get("name") or history.get("name") or symbol),
+            "price": price,
+            "previous_close": previous,
+            "change": change,
+            "change_percent": round(change / previous * 100, 4) if change is not None and previous else None,
+            "volume": latest.get("volume"),
+            "amount": latest.get("amount"),
+            "turnover": latest.get("turnover"),
+            "pe_ttm": None,
+            "pb": None,
+            "market_cap_100m": None,
+            "currency": "HKD",
+            "trade_date": str(latest["date"]),
+            "source": "tencent_kline",
+            "source_ref": str(history["source_ref"]),
+            "source_chain": ["tencent_quote", "tencent_kline"],
+            "quality_flags": ["intraday_quote_unavailable", "valuation_unavailable"],
+            "fallback_reason": f"腾讯港股实时行情不可用：{primary_error}",
+        }
 
 
 def fetch_profit_forecast(
@@ -356,32 +421,39 @@ def fetch_profit_forecast(
         year, eps = average.get(f"YEAR{index}"), _number(average.get(f"EPS{index}"))
         if year is None or eps is None:
             continue
-        consensus.append({
-            "year": int(year),
-            "year_mark": average.get(f"YEAR_MARK{index}"),
-            "eps": eps,
-            "pe": _number(average.get(f"PE{index}")),
-            "eps_growth_percent": (
-                round((eps / previous_eps - 1) * 100, 4) if previous_eps not in (None, 0) else None
-            ),
-        })
+        consensus.append(
+            {
+                "year": int(year),
+                "year_mark": average.get(f"YEAR_MARK{index}"),
+                "eps": eps,
+                "pe": _number(average.get(f"PE{index}")),
+                "eps_growth_percent": (
+                    round((eps / previous_eps - 1) * 100, 4) if previous_eps not in (None, 0) else None
+                ),
+            }
+        )
         previous_eps = eps
     revisions = []
     for row in payload.get("ycmx") or []:
         forecasts = [
-            {"year": int(row[f"YEAR{index}"]), "eps": _number(row.get(f"EPS{index}")),
-             "parent_net_profit": _number(row.get(f"PARENT_NETPROFIT{index}"))}
+            {
+                "year": int(row[f"YEAR{index}"]),
+                "eps": _number(row.get(f"EPS{index}")),
+                "parent_net_profit": _number(row.get(f"PARENT_NETPROFIT{index}")),
+            }
             for index in range(1, 5)
             if row.get(f"YEAR{index}") is not None and _number(row.get(f"EPS{index}")) is not None
         ]
         if forecasts:
-            revisions.append({
-                "publish_date": str(row.get("PUBLISH_DATE") or "")[:10],
-                "institution": str(row.get("ORG_NAME_ABBR") or ""),
-                "researcher": str(row.get("RESEARCHER") or ""),
-                "rating": row.get("RATING"),
-                "forecasts": forecasts,
-            })
+            revisions.append(
+                {
+                    "publish_date": str(row.get("PUBLISH_DATE") or "")[:10],
+                    "institution": str(row.get("ORG_NAME_ABBR") or ""),
+                    "researcher": str(row.get("RESEARCHER") or ""),
+                    "rating": row.get("RATING"),
+                    "forecasts": forecasts,
+                }
+            )
     revisions.sort(key=lambda row: str(row["publish_date"]), reverse=True)
     institutions = {str(row["institution"]) for row in revisions if row["institution"]}
     return {
@@ -412,19 +484,31 @@ def fetch_peer_valuations(
     sector_code = str((classifications[0] if classifications else {}).get("code") or "")
     if not re.fullmatch(r"BK\d{4}", sector_code):
         raise ValueError("未取得可用于候选可比公司的行业代码")
-    params = urllib.parse.urlencode({
-        "pn": 1, "pz": 20, "po": 1, "np": 1, "fltt": 2, "invt": 2,
-        "fid": "f20", "fs": f"b:{sector_code}", "fields": "f12,f14,f2,f9,f20,f23",
-    })
+    params = urllib.parse.urlencode(
+        {
+            "pn": 1,
+            "pz": 20,
+            "po": 1,
+            "np": 1,
+            "fltt": 2,
+            "invt": 2,
+            "fid": "f20",
+            "fs": f"b:{sector_code}",
+            "fields": "f12,f14,f2,f9,f20,f23",
+        }
+    )
     url = f"https://push2.eastmoney.com/api/qt/clist/get?{params}"
     payload = _eastmoney_json(url, request)
     raw = (payload.get("data") or {}).get("diff") or []
     rows = list(raw.values()) if isinstance(raw, dict) else list(raw)
     peers = [
         {
-            "symbol": str(row.get("f12") or ""), "name": str(row.get("f14") or ""),
-            "price": _number(row.get("f2")), "pe_dynamic": _number(row.get("f9")),
-            "pb": _number(row.get("f23")), "market_cap": _number(row.get("f20")),
+            "symbol": str(row.get("f12") or ""),
+            "name": str(row.get("f14") or ""),
+            "price": _number(row.get("f2")),
+            "pe_dynamic": _number(row.get("f9")),
+            "pb": _number(row.get("f23")),
+            "market_cap": _number(row.get("f20")),
         }
         for row in rows
         if str(row.get("f12") or "") != symbol and str(row.get("f14") or "")
@@ -469,9 +553,12 @@ def fetch_company_supplemental_evidence(
         if row.get("ITEM_NAME")
     ][:40]
     managers = [
-        {"name": row.get("PERSON_NAME"), "position": row.get("POSITION"),
-         "start_date": str(row.get("OFFICE_BEGIN_DATE") or "")[:10],
-         "end_date": str(row.get("OFFICE_END_DATE") or "")[:10] or None}
+        {
+            "name": row.get("PERSON_NAME"),
+            "position": row.get("POSITION"),
+            "start_date": str(row.get("OFFICE_BEGIN_DATE") or "")[:10],
+            "end_date": str(row.get("OFFICE_END_DATE") or "")[:10] or None,
+        }
         for row in management.get("gglb") or []
         if row.get("PERSON_NAME")
     ][:20]
@@ -520,7 +607,9 @@ def fetch_security_price_history(
     region, symbol, instrument = parts[0], parts[2], parts[3]
     if region == "CN" and instrument == "FUND":
         end = target_trade_date()
-        rows = _fund_nav_rows(symbol, end - timedelta(days=max(limit * 2, 400)), end, request, page_size=limit)
+        rows = _fund_nav_rows(
+            symbol, end - timedelta(days=max(limit * 2, 400)), end, request, page_size=limit
+        )
         closes = [
             {
                 "date": str(row["FSRQ"]),
@@ -565,12 +654,16 @@ def fetch_security_trading_history(
     else:
         raise ValueError("该市场交易历史尚未通过稳定性验证")
     params = urllib.parse.urlencode({"param": f"{provider_code},day,,,{limit},qfq"})
-    payload = json.loads(request(f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?{params}").decode("utf-8"))
+    payload = json.loads(
+        request(f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?{params}").decode("utf-8")
+    )
     data = (payload.get("data") or {}).get(provider_code) or {}
     raw_rows = data.get("qfqday") or data.get("day") or []
     rows = [
         {
-            "date": str(row[0]), "open": _number(row[1]), "close": _number(row[2]),
+            "date": str(row[0]),
+            "open": _number(row[1]),
+            "close": _number(row[2]),
             "high": _number(row[3]) if len(row) > 3 else None,
             "low": _number(row[4]) if len(row) > 4 else None,
             "volume": _number(row[5]) if len(row) > 5 else None,
@@ -580,8 +673,10 @@ def fetch_security_trading_history(
     ][-limit:]
     if len(rows) < 2:
         raise ValueError("交易历史样本不足")
+    quote_fields = (data.get("qt") or {}).get(provider_code) or []
     return {
         "security_id": security_id,
+        "name": quote_fields[1] if len(quote_fields) > 1 else symbol,
         "rows": rows,
         "sample_count": len(rows),
         "as_of": rows[-1]["date"],
@@ -656,7 +751,12 @@ def _fund_nav_rows(
         page = list(data.get("LSJZList") or [])
         rows.extend(page)
         total = int(payload.get("TotalCount") or data.get("TotalCount") or 0)
-        if not page or len(rows) >= page_size or (total and len(rows) >= total) or (not total and len(page) < request_size):
+        if (
+            not page
+            or len(rows) >= page_size
+            or (total and len(rows) >= total)
+            or (not total and len(page) < request_size)
+        ):
             break
     return sorted((row for row in rows if row.get("FSRQ")), key=lambda row: str(row["FSRQ"]))
 
@@ -735,10 +835,10 @@ def parse_fund_profile(
     cutoff_date: str,
 ) -> dict[str, object]:
     managers = []
-    for row in (_js_json(profile_js, "Data_currentFundManager") or []):
+    for row in _js_json(profile_js, "Data_currentFundManager") or []:
         if not isinstance(row, dict) or not row.get("name"):
             continue
-        profit = (((row.get("profit") or {}).get("series") or [{}])[0].get("data") or [])
+        profit = ((row.get("profit") or {}).get("series") or [{}])[0].get("data") or []
         managers.append(
             {
                 "name": str(row["name"]),
@@ -760,7 +860,12 @@ def parse_fund_profile(
     ]
     returns = {
         label: value
-        for label, variable in (("近1月", "syl_1y"), ("近3月", "syl_3y"), ("近6月", "syl_6y"), ("近1年", "syl_1n"))
+        for label, variable in (
+            ("近1月", "syl_1y"),
+            ("近3月", "syl_3y"),
+            ("近6月", "syl_6y"),
+            ("近1年", "syl_1n"),
+        )
         if (value := _number(_js_string(profile_js, variable))) is not None
     }
     scale_raw = _js_json(profile_js, "Data_fluctuationScale") or {}
@@ -770,9 +875,9 @@ def parse_fund_profile(
         {
             "as_of": str(as_of),
             "size_yi": _number(point.get("y")) if isinstance(point, dict) else None,
-            "quarter_change_percent": _number(
-                str(point.get("mom") or "").replace("%", "")
-            ) if isinstance(point, dict) else None,
+            "quarter_change_percent": _number(str(point.get("mom") or "").replace("%", ""))
+            if isinstance(point, dict)
+            else None,
         }
         for as_of, point in zip(scale_categories, scale_series)
         if as_of and isinstance(point, dict) and _number(point.get("y")) is not None
@@ -799,7 +904,10 @@ def parse_fund_holdings_periods(symbol: str, raw: str) -> list[dict[str, object]
 
     text = raw.replace('\\"', '"').replace("\\/", "/")
     starts = [match.start() for match in re.finditer(r"<div[^>]+class=['\"][^'\"]*boxitem", text)]
-    sections = [text[start : starts[index + 1] if index + 1 < len(starts) else len(text)] for index, start in enumerate(starts)]
+    sections = [
+        text[start : starts[index + 1] if index + 1 < len(starts) else len(text)]
+        for index, start in enumerate(starts)
+    ]
     periods: list[dict[str, object]] = []
     for section in sections:
         period_match = re.search(r"(20\d{2})年\s*([1-4])季度", section)
@@ -850,17 +958,18 @@ def fetch_fund_snapshot(
     rows = _fund_nav_rows(symbol, cutoff - timedelta(days=45), cutoff, request)
     profile_url = f"https://fund.eastmoney.com/pingzhongdata/{symbol}.js?v={cutoff.isoformat()}"
     basic_url = f"https://fundf10.eastmoney.com/jbgk_{symbol}.html"
-    holdings_url = (
-        "https://fundf10.eastmoney.com/FundArchivesDatas.aspx?"
-        + urllib.parse.urlencode(
-            {"type": "jjcc", "code": symbol, "topline": 10, "year": cutoff.year - 1, "month": "", "rt": cutoff.isoformat()}
-        )
+    holdings_url = "https://fundf10.eastmoney.com/FundArchivesDatas.aspx?" + urllib.parse.urlencode(
+        {
+            "type": "jjcc",
+            "code": symbol,
+            "topline": 10,
+            "year": cutoff.year - 1,
+            "month": "",
+            "rt": cutoff.isoformat(),
+        }
     )
-    current_holdings_url = (
-        "https://fundf10.eastmoney.com/FundArchivesDatas.aspx?"
-        + urllib.parse.urlencode(
-            {"type": "jjcc", "code": symbol, "topline": 10, "year": "", "month": "", "rt": cutoff.isoformat()}
-        )
+    current_holdings_url = "https://fundf10.eastmoney.com/FundArchivesDatas.aspx?" + urllib.parse.urlencode(
+        {"type": "jjcc", "code": symbol, "topline": 10, "year": "", "month": "", "rt": cutoff.isoformat()}
     )
     profile = request(profile_url).decode("utf-8", "replace")
     basic = request(basic_url).decode("utf-8", "replace")
@@ -941,15 +1050,17 @@ def fetch_sector_price_history(
 ) -> dict[str, object]:
     if not re.fullmatch(r"BK\d{4}", sector_code):
         raise ValueError("无效的东方财富板块代码")
-    params = urllib.parse.urlencode({
-        "secid": f"90.{sector_code}",
-        "fields1": "f1,f2,f3,f4,f5,f6",
-        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
-        "klt": 101,
-        "fqt": 1,
-        "end": 20500101,
-        "lmt": min(max(limit, 2), 260),
-    })
+    params = urllib.parse.urlencode(
+        {
+            "secid": f"90.{sector_code}",
+            "fields1": "f1,f2,f3,f4,f5,f6",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+            "klt": 101,
+            "fqt": 1,
+            "end": 20500101,
+            "lmt": min(max(limit, 2), 260),
+        }
+    )
     source_ref = f"https://push2his.eastmoney.com/api/qt/stock/kline/get?{params}"
     payload = _eastmoney_json(source_ref, request)
     data = payload.get("data") or {}
@@ -958,13 +1069,19 @@ def fetch_sector_price_history(
         fields = str(item).split(",")
         if len(fields) < 7 or _number(fields[2]) in (None, 0):
             continue
-        rows.append({
-            "date": fields[0], "open": _number(fields[1]), "close": _number(fields[2]),
-            "high": _number(fields[3]), "low": _number(fields[4]), "volume": _number(fields[5]),
-            "amount": _number(fields[6]),
-            "change_percent": _number(fields[8]) if len(fields) > 8 else None,
-            "turnover_percent": _number(fields[10]) if len(fields) > 10 else None,
-        })
+        rows.append(
+            {
+                "date": fields[0],
+                "open": _number(fields[1]),
+                "close": _number(fields[2]),
+                "high": _number(fields[3]),
+                "low": _number(fields[4]),
+                "volume": _number(fields[5]),
+                "amount": _number(fields[6]),
+                "change_percent": _number(fields[8]) if len(fields) > 8 else None,
+                "turnover_percent": _number(fields[10]) if len(fields) > 10 else None,
+            }
+        )
     if len(rows) < 2:
         raise ValueError("板块历史量价样本不足")
     return {
@@ -1020,7 +1137,9 @@ def _period(row: dict[str, Any]) -> str:
 
 
 def _period_label(value: str) -> str:
-    suffix = {"03-31": "一季报", "06-30": "半年报", "09-30": "三季报", "12-31": "年报"}.get(value[5:], "报告期")
+    suffix = {"03-31": "一季报", "06-30": "半年报", "09-30": "三季报", "12-31": "年报"}.get(
+        value[5:], "报告期"
+    )
     return f"{value[:4]}年{suffix}" if len(value) >= 10 else value
 
 
@@ -1032,9 +1151,23 @@ def fetch_financial_snapshot(
     if not re.fullmatch(r"\d{6}", symbol):
         raise ValueError("财务指标目前仅支持A股")
     filter_str = f'(SECURITY_CODE="{symbol}")'
-    summary = _datacenter_rows("RPT_LICO_FN_CPD", filter_str=filter_str, page_size=12, sort_columns="REPORTDATE", request=request)
-    balance = _datacenter_rows("RPT_DMSK_FN_BALANCE", filter_str=filter_str, page_size=12, sort_columns="REPORT_DATE", request=request)
-    cashflow = _datacenter_rows("RPT_DMSK_FN_CASHFLOW", filter_str=filter_str, page_size=12, sort_columns="REPORT_DATE", request=request)
+    summary = _datacenter_rows(
+        "RPT_LICO_FN_CPD", filter_str=filter_str, page_size=12, sort_columns="REPORTDATE", request=request
+    )
+    balance = _datacenter_rows(
+        "RPT_DMSK_FN_BALANCE",
+        filter_str=filter_str,
+        page_size=12,
+        sort_columns="REPORT_DATE",
+        request=request,
+    )
+    cashflow = _datacenter_rows(
+        "RPT_DMSK_FN_CASHFLOW",
+        filter_str=filter_str,
+        page_size=12,
+        sort_columns="REPORT_DATE",
+        request=request,
+    )
     balance_by_period = {_period(row): row for row in balance if _period(row)}
     cashflow_by_period = {_period(row): row for row in cashflow if _period(row)}
     periods: list[dict[str, object]] = []
@@ -1062,7 +1195,9 @@ def fetch_financial_snapshot(
                 "debt_asset_ratio": _number(balance_row.get("DEBT_ASSET_RATIO")),
                 "total_assets": _number(balance_row.get("TOTAL_ASSETS")),
                 "total_liabilities": _number(balance_row.get("TOTAL_LIABILITIES")),
-                "total_equity": _number(balance_row.get("TOTAL_EQUITY") or balance_row.get("TOTAL_PARENT_EQUITY")),
+                "total_equity": _number(
+                    balance_row.get("TOTAL_EQUITY") or balance_row.get("TOTAL_PARENT_EQUITY")
+                ),
                 "current_assets": _number(balance_row.get("TOTAL_CURRENT_ASSETS")),
                 "current_liabilities": _number(balance_row.get("TOTAL_CURRENT_LIAB")),
                 "cash_and_equivalents": _number(balance_row.get("MONETARYFUNDS")),
@@ -1110,7 +1245,13 @@ def fetch_public_news(
     if not clean_keyword:
         raise ValueError("资讯关键词不能为空")
     params = urllib.parse.urlencode(
-        {"keyword": clean_keyword, "size": min(max(size, 1), 20), "news_type": 1, "lang": "zh-CN", "sort_type": 2}
+        {
+            "keyword": clean_keyword,
+            "size": min(max(size, 1), 20),
+            "news_type": 1,
+            "lang": "zh-CN",
+            "sort_type": 2,
+        }
     )
     source_ref = f"https://ai-news-search.futunn.com/news_search?{params}"
     payload = json.loads(request(source_ref).decode("utf-8"))
@@ -1139,7 +1280,9 @@ def fetch_public_news(
             continue
         seen.add(title)
         try:
-            published_at = datetime.fromtimestamp(float(item.get("publish_time")), tz=timezone.utc).isoformat()
+            published_at = datetime.fromtimestamp(
+                float(item.get("publish_time")), tz=timezone.utc
+            ).isoformat()
         except (TypeError, ValueError, OSError):
             published_at = None
         rows.append(
@@ -1174,9 +1317,26 @@ def fetch_market_news(
     observed = observed.astimezone(timezone.utc)
     cutoff = observed - timedelta(hours=24)
     market_terms = (
-        "市场", "收盘", "午评", "早评", "盘前", "盘后", "全线", "指数",
-        "大盘", "行情", "板块", "资金流", "成交额", "领涨", "领跌",
-        "震荡", "回落", "反弹", "走高", "走低",
+        "市场",
+        "收盘",
+        "午评",
+        "早评",
+        "盘前",
+        "盘后",
+        "全线",
+        "指数",
+        "大盘",
+        "行情",
+        "板块",
+        "资金流",
+        "成交额",
+        "领涨",
+        "领跌",
+        "震荡",
+        "回落",
+        "反弹",
+        "走高",
+        "走低",
     )
     # ponytail: this bounded headline heuristic excludes obvious issuer events; upgrade to
     # provider-side market-topic tags if the public gateway exposes them.
@@ -1215,13 +1375,15 @@ def fetch_market_news(
                 continue
             seen_titles.add(normalized_title)
             seen_urls.add(url)
-            rows.append({
-                "region": region,
-                "title": title,
-                "published_at": published_at.isoformat(),
-                "url": url,
-                "source": str(item.get("source") or "富途公开资讯搜索"),
-            })
+            rows.append(
+                {
+                    "region": region,
+                    "title": title,
+                    "published_at": published_at.isoformat(),
+                    "url": url,
+                    "source": str(item.get("source") or "富途公开资讯搜索"),
+                }
+            )
     if not successful_queries:
         raise ValueError("24小时大盘资讯来源暂不可用")
     rows.sort(key=lambda item: str(item["published_at"]), reverse=True)
@@ -1282,18 +1444,22 @@ def _fetch_eastmoney_market_breadth(
     pages_fetched = 0
     changes: dict[str, float] = {}
     for page in range(1, 101):
-        params = urllib.parse.urlencode({
-            "pn": page,
-            "pz": page_size,
-            "po": 1,
-            "np": 1,
-            "fltt": 2,
-            "invt": 2,
-            "fid": "f3",
-            "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
-            "fields": "f12,f3",
-        })
-        payload = json.loads(request(f"https://push2.eastmoney.com/api/qt/clist/get?{params}").decode("utf-8-sig"))
+        params = urllib.parse.urlencode(
+            {
+                "pn": page,
+                "pz": page_size,
+                "po": 1,
+                "np": 1,
+                "fltt": 2,
+                "invt": 2,
+                "fid": "f3",
+                "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
+                "fields": "f12,f3",
+            }
+        )
+        payload = json.loads(
+            request(f"https://push2.eastmoney.com/api/qt/clist/get?{params}").decode("utf-8-sig")
+        )
         data = payload.get("data") or {}
         total = int(data.get("total") or 0)
         raw_rows = data.get("diff") or []
@@ -1349,12 +1515,21 @@ def _fetch_sina_market_breadth(
     termination = ""
     size = max(1, min(page_size, 100))
     for page in range(1, 101):
-        params = urllib.parse.urlencode({
-            "page": page, "num": size, "sort": "symbol", "asc": 1,
-            "node": "hs_a", "symbol": "", "_s_r_a": "page",
-        })
+        params = urllib.parse.urlencode(
+            {
+                "page": page,
+                "num": size,
+                "sort": "symbol",
+                "asc": 1,
+                "node": "hs_a",
+                "symbol": "",
+                "_s_r_a": "page",
+            }
+        )
         rows = json.loads(
-            request(f"https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData?{params}").decode("utf-8")
+            request(
+                f"https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData?{params}"
+            ).decode("utf-8")
         )
         if not isinstance(rows, list):
             raise ValueError("新浪全市场行情返回格式无效")
@@ -1377,7 +1552,9 @@ def _fetch_sina_market_breadth(
     return {
         "available": True,
         "trade_date": trade_date.isoformat(),
-        "up": up, "down": down, "flat": flat,
+        "up": up,
+        "down": down,
+        "flat": flat,
         "ratio": round(up / down, 4) if down else None,
         "scope": "A股全市场个股（新浪分页至结束）",
         "source": "新浪全市场行情",
@@ -1424,7 +1601,9 @@ def fetch_global_index_price_volume(
         raw_rows = data.get("qfqday") or data.get("day") or []
         rows = [
             {
-                "date": str(row[0]), "open": _number(row[1]), "close": _number(row[2]),
+                "date": str(row[0]),
+                "open": _number(row[1]),
+                "close": _number(row[2]),
                 "high": _number(row[3]) if len(row) > 3 else None,
                 "low": _number(row[4]) if len(row) > 4 else None,
                 "volume": _number(row[5]) if len(row) > 5 else None,
@@ -1437,20 +1616,32 @@ def fetch_global_index_price_volume(
         source_ref = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
         if len(rows) < 2 and code == "bj899050":
             try:
-                query = urllib.parse.urlencode({
-                    "secid": "0.899050",
-                    "fields1": "f1,f2,f3,f4,f5,f6",
-                    "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
-                    "klt": 101, "fqt": 1, "beg": 0, "end": 20500101, "lmt": limit,
-                })
+                query = urllib.parse.urlencode(
+                    {
+                        "secid": "0.899050",
+                        "fields1": "f1,f2,f3,f4,f5,f6",
+                        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+                        "klt": 101,
+                        "fqt": 1,
+                        "beg": 0,
+                        "end": 20500101,
+                        "lmt": limit,
+                    }
+                )
                 payload = json.loads(
-                    request(f"https://push2his.eastmoney.com/api/qt/stock/kline/get?{query}").decode("utf-8-sig")
+                    request(f"https://push2his.eastmoney.com/api/qt/stock/kline/get?{query}").decode(
+                        "utf-8-sig"
+                    )
                 )
                 rows = [
                     {
-                        "date": fields[0], "open": _number(fields[1]), "close": _number(fields[2]),
-                        "high": _number(fields[3]), "low": _number(fields[4]),
-                        "volume": _number(fields[5]), "amount": _number(fields[6]),
+                        "date": fields[0],
+                        "open": _number(fields[1]),
+                        "close": _number(fields[2]),
+                        "high": _number(fields[3]),
+                        "low": _number(fields[4]),
+                        "volume": _number(fields[5]),
+                        "amount": _number(fields[6]),
                     }
                     for item in ((payload.get("data") or {}).get("klines") or [])
                     if len(fields := str(item).split(",")) >= 7 and _number(fields[2]) not in (None, 0)
@@ -1460,20 +1651,31 @@ def fetch_global_index_price_volume(
             except Exception:
                 rows = []
             if len(rows) < 2:
-                query = urllib.parse.urlencode({
-                    "symbol": "bj899050", "scale": 240, "ma": "no", "datalen": limit,
-                })
+                query = urllib.parse.urlencode(
+                    {
+                        "symbol": "bj899050",
+                        "scale": 240,
+                        "ma": "no",
+                        "datalen": limit,
+                    }
+                )
                 try:
                     history = json.loads(
-                        request(f"https://quotes.sina.cn/cn/api/json_v2.php/CN_MarketDataService.getKLineData?{query}").decode("utf-8")
+                        request(
+                            f"https://quotes.sina.cn/cn/api/json_v2.php/CN_MarketDataService.getKLineData?{query}"
+                        ).decode("utf-8")
                     )
                 except Exception:
                     history = []
                 rows = [
                     {
-                        "date": str(item.get("day") or "")[:10], "open": _number(item.get("open")),
-                        "close": _number(item.get("close")), "high": _number(item.get("high")),
-                        "low": _number(item.get("low")), "volume": _number(item.get("volume")), "amount": None,
+                        "date": str(item.get("day") or "")[:10],
+                        "open": _number(item.get("open")),
+                        "close": _number(item.get("close")),
+                        "high": _number(item.get("high")),
+                        "low": _number(item.get("low")),
+                        "volume": _number(item.get("volume")),
+                        "amount": None,
                     }
                     for item in history or []
                     if _number(item.get("close")) not in (None, 0)
@@ -1492,9 +1694,13 @@ def fetch_global_index_price_volume(
             history = json.loads(match.group(1)) if match else []
             rows = [
                 {
-                    "date": str(item.get("d") or ""), "open": _number(item.get("o")),
-                    "close": _number(item.get("c")), "high": _number(item.get("h")),
-                    "low": _number(item.get("l")), "volume": _number(item.get("v")), "amount": None,
+                    "date": str(item.get("d") or ""),
+                    "open": _number(item.get("o")),
+                    "close": _number(item.get("c")),
+                    "high": _number(item.get("h")),
+                    "low": _number(item.get("l")),
+                    "volume": _number(item.get("v")),
+                    "amount": None,
                 }
                 for item in history
                 if _number(item.get("c")) not in (None, 0)
@@ -1574,7 +1780,9 @@ def market_session_metadata(
     observed = now or datetime.now(timezone.utc)
     session = _market_session(observed, market, quote_date)
     quote_day = date.fromisoformat(quote_date)
-    local_day = observed.astimezone(SHANGHAI if market in {"CN", "HK"} else ZoneInfo("America/New_York")).date()
+    local_day = observed.astimezone(
+        SHANGHAI if market in {"CN", "HK"} else ZoneInfo("America/New_York")
+    ).date()
     label_day = local_day if session in {"盘前", "盘中"} else quote_day
     suffix = "实时数据" if session != "盘后" else "收盘数据"
     label = f"{label_day.month}月{label_day.day}日{session}{suffix}"
@@ -1695,8 +1903,12 @@ def summarize_price_volume_history(rows: list[dict[str, object]]) -> dict[str, o
         if not isinstance(high, (int, float)) or not isinstance(low, (int, float)):
             continue
         previous = float(valid[max(0, len(valid) - 15 + index - 1)]["close"])
-        true_ranges.append(max(float(high) - float(low), abs(float(high) - previous), abs(float(low) - previous)))
-    metrics["atr_14"] = round(sum(true_ranges[-14:]) / len(true_ranges[-14:]), 4) if len(true_ranges) >= 14 else None
+        true_ranges.append(
+            max(float(high) - float(low), abs(float(high) - previous), abs(float(low) - previous))
+        )
+    metrics["atr_14"] = (
+        round(sum(true_ranges[-14:]) / len(true_ranges[-14:]), 4) if len(true_ranges) >= 14 else None
+    )
     metrics["interpretation_boundary"] = "历史量价统计是描述性证据，不构成趋势预测或买卖信号。"
     return metrics
 
@@ -1712,7 +1924,9 @@ def fetch_index_overview(
     for provider_code, name in codes.items():
         target = trade_date.isoformat()
         params = urllib.parse.urlencode({"param": f"{provider_code},day,,{target},80,qfq"})
-        payload = json.loads(request(f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?{params}").decode("utf-8"))
+        payload = json.loads(
+            request(f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?{params}").decode("utf-8")
+        )
         data = (payload.get("data") or {}).get(provider_code) or {}
         history = data.get("qfqday") or data.get("day") or []
         index = next((i for i, row in enumerate(history) if row and row[0] == target), None)
@@ -1723,7 +1937,9 @@ def fetch_index_overview(
         previous = float(history[index - 1][2]) if index > 0 else None
         bounded_history = [
             {
-                "date": str(item[0]), "open": _number(item[1]), "close": _number(item[2]),
+                "date": str(item[0]),
+                "open": _number(item[1]),
+                "close": _number(item[2]),
                 "high": _number(item[3]) if len(item) > 3 else None,
                 "low": _number(item[4]) if len(item) > 4 else None,
                 "volume": _number(item[5]) if len(item) > 5 else None,
@@ -1731,17 +1947,23 @@ def fetch_index_overview(
             for item in history[: index + 1]
             if len(item) > 2 and _number(item[2]) not in (None, 0)
         ]
-        rows.append({
-            "code": provider_code[2:], "name": name, "close": close,
-            "change_percent": (close / previous - 1) * 100 if previous else None,
-            "volume": _number(row[5]) if len(row) > 5 else None,
-            "amount": _number(row[6]) if len(row) > 6 else None,
-            "price_volume": summarize_price_volume_history(bounded_history),
-        })
+        rows.append(
+            {
+                "code": provider_code[2:],
+                "name": name,
+                "close": close,
+                "change_percent": (close / previous - 1) * 100 if previous else None,
+                "volume": _number(row[5]) if len(row) > 5 else None,
+                "amount": _number(row[6]) if len(row) > 6 else None,
+                "price_volume": summarize_price_volume_history(bounded_history),
+            }
+        )
     return {"date": trade_date.isoformat(), "rows": rows, "source": "腾讯财经日线"}
 
 
-def fetch_lhb(trade_date: date, request: Callable[[str], bytes] = _request, limit: int = 8) -> dict[str, object]:
+def fetch_lhb(
+    trade_date: date, request: Callable[[str], bytes] = _request, limit: int = 8
+) -> dict[str, object]:
     raw = _datacenter_rows(
         "RPT_DAILYBILLBOARD_DETAILS",
         filter_str=f"(TRADE_DATE='{trade_date.isoformat()}')",
@@ -1767,26 +1989,40 @@ def fetch_lhb(trade_date: date, request: Callable[[str], bytes] = _request, limi
     return {"date": trade_date.isoformat(), "rows": rows, "source": "东方财富数据中心龙虎榜"}
 
 
-def fetch_industry_money_flow(trade_date: date, request: Callable[[str], bytes] = _request) -> dict[str, object]:
+def fetch_industry_money_flow(
+    trade_date: date, request: Callable[[str], bytes] = _request
+) -> dict[str, object]:
     def ranked_rows(descending: bool) -> list[dict[str, object]]:
-        params = urllib.parse.urlencode({
-            "pn": 1,
-            "pz": 100,
-            "po": 1 if descending else 0,
-            "np": 1,
-            "fltt": 2,
-            "invt": 2,
-            "fid": "f62",
-            "fs": "m:90+t:2",
-            "fields": "f12,f14,f2,f3,f62,f184,f124",
-        })
-        payload = json.loads(request(f"https://push2delay.eastmoney.com/api/qt/clist/get?{params}").decode("utf-8"))
+        params = urllib.parse.urlencode(
+            {
+                "pn": 1,
+                "pz": 100,
+                "po": 1 if descending else 0,
+                "np": 1,
+                "fltt": 2,
+                "invt": 2,
+                "fid": "f62",
+                "fs": "m:90+t:2",
+                "fields": "f12,f14,f2,f3,f62,f184,f124",
+            }
+        )
+        payload = json.loads(
+            request(f"https://push2delay.eastmoney.com/api/qt/clist/get?{params}").decode("utf-8")
+        )
         result = []
         for row in list((payload.get("data") or {}).get("diff") or []):
             timestamp = int(row.get("f124") or 0)
             source_date = datetime.fromtimestamp(timestamp, SHANGHAI).date() if timestamp else None
             if source_date == trade_date and row.get("f62") is not None:
-                result.append({"code": row.get("f12"), "name": row.get("f14"), "change_percent": _number(row.get("f3")), "net_amount": _number(row.get("f62")), "net_ratio": _number(row.get("f184"))})
+                result.append(
+                    {
+                        "code": row.get("f12"),
+                        "name": row.get("f14"),
+                        "change_percent": _number(row.get("f3")),
+                        "net_amount": _number(row.get("f62")),
+                        "net_ratio": _number(row.get("f184")),
+                    }
+                )
         return result
 
     inbound_rows = ranked_rows(True)
@@ -1795,7 +2031,12 @@ def fetch_industry_money_flow(trade_date: date, request: Callable[[str], bytes] 
         raise ValueError("行业资金流响应不含目标交易日时间戳")
     inbound = [row for row in inbound_rows if float(row["net_amount"] or 0) > 0][:5]
     outbound = [row for row in outbound_rows if float(row["net_amount"] or 0) < 0][:5]
-    return {"date": trade_date.isoformat(), "inbound": inbound, "outbound": outbound, "source": "东方财富行业板块资金流（延迟节点）"}
+    return {
+        "date": trade_date.isoformat(),
+        "inbound": inbound,
+        "outbound": outbound,
+        "source": "东方财富行业板块资金流（延迟节点）",
+    }
 
 
 def _stock_analysis_limit_pools(trade_date: date) -> dict[str, Any]:
@@ -1840,14 +2081,16 @@ def fetch_market_pulse(
                 if published_at < cutoff or not title or title in seen:
                     continue
                 seen.add(title)
-                news.append({
-                    "symbol": holding.get("symbol"),
-                    "name": holding.get("name") or holding.get("symbol"),
-                    "title": title,
-                    "published_at": published_at.isoformat(),
-                    "url": str(item.get("url") or ""),
-                    "source": str(item.get("source") or payload.get("source") or "公开财经资讯"),
-                })
+                news.append(
+                    {
+                        "symbol": holding.get("symbol"),
+                        "name": holding.get("name") or holding.get("symbol"),
+                        "title": title,
+                        "published_at": published_at.isoformat(),
+                        "url": str(item.get("url") or ""),
+                        "source": str(item.get("source") or payload.get("source") or "公开财经资讯"),
+                    }
+                )
         news.sort(key=lambda item: str(item["published_at"]), reverse=True)
         return {
             "date": trade_date.isoformat(),
@@ -1877,13 +2120,16 @@ def fetch_market_pulse(
     theme_counts = Counter(str(item.get("hybk") or "未分类") for item in up)
     first_board = sum(int((item.get("zttj") or {}).get("ct") or 1) <= 1 for item in up)
     leaders = sorted(
-        ({
-            "symbol": str(item.get("c") or ""),
-            "name": str(item.get("n") or item.get("c") or ""),
-            "theme": str(item.get("hybk") or ""),
-            "board_days": int((item.get("zttj") or {}).get("ct") or 1),
-            "seal_fund_yi": float(item.get("fund") or 0) / 100_000_000,
-        } for item in up),
+        (
+            {
+                "symbol": str(item.get("c") or ""),
+                "name": str(item.get("n") or item.get("c") or ""),
+                "theme": str(item.get("hybk") or ""),
+                "board_days": int((item.get("zttj") or {}).get("ct") or 1),
+                "seal_fund_yi": float(item.get("fund") or 0) / 100_000_000,
+            }
+            for item in up
+        ),
         key=lambda item: (int(item["board_days"]), float(item["seal_fund_yi"])),
         reverse=True,
     )[:10]
@@ -1915,7 +2161,9 @@ def fetch_market_pulse(
             "available": bool(down_data or failed_data),
             "limit_down_count": down_count,
             "failed_breakout_count": failed_count,
-            "failed_breakout_ratio": failed_count / (up_count + failed_count) if up_count or failed_count else None,
+            "failed_breakout_ratio": failed_count / (up_count + failed_count)
+            if up_count or failed_count
+            else None,
             "rows": risk_rows,
         },
         "source": "stock-analysis 4.12.0 · 东方财富涨跌停池",
@@ -1925,7 +2173,7 @@ def fetch_market_pulse(
 
 def parse_company_announcements(payload: str, symbol: str, cutoff: str) -> list[dict[str, str]]:
     rows = []
-    for item in ((json.loads(payload).get("data") or {}).get("list") or []):
+    for item in (json.loads(payload).get("data") or {}).get("list") or []:
         codes = item.get("codes") or []
         if not any(str(code.get("stock_code")) == symbol for code in codes):
             continue
@@ -1978,9 +2226,20 @@ def parse_hkex_announcements(payload: str, symbol: str, cutoff: str) -> list[dic
     raw_rows = json.loads(str(response.get("result") or "[]"))
     rows: list[dict[str, str]] = []
     financial_terms = (
-        "年度業績", "年度业绩", "中期業績", "中期业绩", "季度業績", "季度业绩",
-        "年報", "年报", "中期報告", "中期报告", "ANNUAL RESULTS", "INTERIM RESULTS",
-        "ANNUAL REPORT", "INTERIM REPORT",
+        "年度業績",
+        "年度业绩",
+        "中期業績",
+        "中期业绩",
+        "季度業績",
+        "季度业绩",
+        "年報",
+        "年报",
+        "中期報告",
+        "中期报告",
+        "ANNUAL RESULTS",
+        "INTERIM RESULTS",
+        "ANNUAL REPORT",
+        "INTERIM REPORT",
     )
     for item in raw_rows:
         codes = set(re.findall(r"\d{5}", _plain_text(item.get("STOCK_CODE"))))
@@ -1999,7 +2258,9 @@ def parse_hkex_announcements(payload: str, symbol: str, cutoff: str) -> list[dic
         upper_title = title.upper()
         rows.append(
             {
-                "material_type": "财务报告" if any(term in upper_title for term in financial_terms) else "公司公告",
+                "material_type": "财务报告"
+                if any(term in upper_title for term in financial_terms)
+                else "公司公告",
                 "title": title,
                 "published_at": published_at.isoformat(),
                 "source_name": "香港交易所披露易",

@@ -281,7 +281,9 @@ class Vault:
                 note_id TEXT PRIMARY KEY,
                 security_id TEXT NOT NULL,
                 body TEXT NOT NULL,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                title TEXT,
+                market_session TEXT CHECK (market_session IN ('盘前', '盘中', '盘后') OR market_session IS NULL)
             );
             CREATE TABLE IF NOT EXISTS note_revisions (
                 revision_id TEXT PRIMARY KEY,
@@ -402,6 +404,12 @@ class Vault:
                 provider_id TEXT PRIMARY KEY, provider_type TEXT NOT NULL, enabled INTEGER NOT NULL,
                 model_config_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS ai_provider_credentials (
+                provider_id TEXT PRIMARY KEY,
+                encrypted_secret TEXT NOT NULL,
+                masked_suffix TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS research_threads (
                 thread_id TEXT PRIMARY KEY, thread_type TEXT NOT NULL, title TEXT NOT NULL,
                 security_id TEXT, portfolio_id TEXT, provider_type TEXT NOT NULL,
@@ -465,11 +473,26 @@ class Vault:
         self.connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (8)")
         self.connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (9)")
         self.connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (10)")
-        if self.connection.execute(
-            "SELECT 1 FROM schema_migrations WHERE version = 11"
-        ).fetchone() is None:
+        if self.connection.execute("SELECT 1 FROM schema_migrations WHERE version = 11").fetchone() is None:
             self._purge_legacy_deleted_records()
             self.connection.execute("INSERT INTO schema_migrations(version) VALUES (11)")
+        self.connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (12)")
+        note_columns = {str(row["name"]) for row in self.connection.execute("PRAGMA table_info(notes)")}
+        if "title" not in note_columns:
+            self.connection.execute("ALTER TABLE notes ADD COLUMN title TEXT")
+        self.connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (13)")
+        note_columns = {str(row["name"]) for row in self.connection.execute("PRAGMA table_info(notes)")}
+        if "market_session" not in note_columns:
+            self.connection.execute("ALTER TABLE notes ADD COLUMN market_session TEXT")
+        if self.connection.execute("SELECT 1 FROM schema_migrations WHERE version = 14").fetchone() is None:
+            for session in ("盘前", "盘中", "盘后"):
+                self.connection.execute(
+                    """UPDATE notes SET market_session = ?
+                    WHERE security_id = 'MARKET:GLOBAL:OVERVIEW' AND market_session IS NULL
+                    AND (title LIKE ? OR body LIKE ?)""",
+                    (session, f"% {session}报告（%", f"行情阶段%{session}%"),
+                )
+            self.connection.execute("INSERT INTO schema_migrations(version) VALUES (14)")
         self.connection.commit()
 
     def _purge_legacy_deleted_records(self) -> None:
@@ -567,9 +590,12 @@ class Vault:
 
         connection.commit()
         for path in attachment_paths:
-            if connection.execute(
-                "SELECT 1 FROM attachments WHERE storage_path = ? LIMIT 1", (str(path),)
-            ).fetchone() is None:
+            if (
+                connection.execute(
+                    "SELECT 1 FROM attachments WHERE storage_path = ? LIMIT 1", (str(path),)
+                ).fetchone()
+                is None
+            ):
                 path.unlink(missing_ok=True)
 
     def append(self, entry: LedgerEntry) -> bool:
@@ -629,7 +655,16 @@ class Vault:
                     record.bought_on,
                 )
                 if existing is not None:
-                    fields = ("record_id", "holding_id", "revision_number", "is_deleted", "security_id", "asset_type", "invested_amount_cny", "bought_on")
+                    fields = (
+                        "record_id",
+                        "holding_id",
+                        "revision_number",
+                        "is_deleted",
+                        "security_id",
+                        "asset_type",
+                        "invested_amount_cny",
+                        "bought_on",
+                    )
                     if tuple(str(existing[key]) for key in fields) == tuple(str(value) for value in values):
                         skipped += 1
                         continue
@@ -795,8 +830,12 @@ class Vault:
 
     def portfolio_profile(self) -> dict[str, str | None]:
         cash = sum(
-            (Decimal(amount) for row in self.connection.execute("SELECT account_id FROM accounts")
-             for currency, amount in self.project_cash(str(row["account_id"])).items() if currency == "CNY"),
+            (
+                Decimal(amount)
+                for row in self.connection.execute("SELECT account_id FROM accounts")
+                for currency, amount in self.project_cash(str(row["account_id"])).items()
+                if currency == "CNY"
+            ),
             Decimal("0"),
         )
         preference = self.connection.execute(
@@ -823,18 +862,20 @@ class Vault:
         delta = cash - current
         if delta:
             event_id = str(uuid4())
-            self.append(LedgerEntry(
-                record_id=f"cash-profile-{event_id}",
-                idempotency_key=f"cash-profile:{event_id}",
-                kind="cash",
-                account_id="manual-cash",
-                security_id="",
-                occurred_at=datetime.now().astimezone().isoformat(),
-                quantity="0",
-                cash_amount=self._decimal_text(delta),
-                currency="CNY",
-                action="set_cash_balance_adjustment",
-            ))
+            self.append(
+                LedgerEntry(
+                    record_id=f"cash-profile-{event_id}",
+                    idempotency_key=f"cash-profile:{event_id}",
+                    kind="cash",
+                    account_id="manual-cash",
+                    security_id="",
+                    occurred_at=datetime.now().astimezone().isoformat(),
+                    quantity="0",
+                    cash_amount=self._decimal_text(delta),
+                    currency="CNY",
+                    action="set_cash_balance_adjustment",
+                )
+            )
         self.connection.execute("INSERT OR IGNORE INTO portfolios(portfolio_id) VALUES ('default')")
         self.connection.execute(
             "INSERT INTO portfolio_preferences VALUES ('default', ?, ?) "
