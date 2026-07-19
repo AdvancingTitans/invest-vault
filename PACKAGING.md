@@ -12,20 +12,20 @@ uv run --extra dev --with pyinstaller python scripts/build_sidecar.py
 npx --yes @tauri-apps/cli@latest build --bundles app
 codesign --force --deep --sign - \
   "src-tauri/target/release/bundle/macos/投资札记.app"
-hdiutil create -volname "投资札记 0.3.30" \
+hdiutil create -volname "投资札记 0.3.31" \
   -srcfolder "src-tauri/target/release/bundle/macos/投资札记.app" \
   -ov -format UDZO \
-  "src-tauri/target/release/bundle/dmg/Invest-Vault_0.3.30-local-aarch64.dmg"
+  "src-tauri/target/release/bundle/dmg/Invest-Vault_0.3.31-local-aarch64.dmg"
 ```
 
 The `hdiutil` step intentionally creates a plain DMG. It avoids Finder/AppleScript automation and is suitable for an unsigned local build. Public distribution still requires Apple signing and notarization.
 
-The PyInstaller sidecar also freezes `skills/stock-analysis/` as read-only data. Verify the final sidecar, not only the source tree:
+The PyInstaller sidecar also freezes `skills/stock-analysis/` and the scoped `skills/agent-reach/` fallback as read-only data. Verify the final sidecar, not only the source tree:
 
 ```bash
 uv run --with pyinstaller pyi-archive_viewer -l \
   "src-tauri/target/release/bundle/macos/投资札记.app/Contents/MacOS/invest-vault-service" \
-  | rg 'skills/stock-analysis/(SKILL.md|config/lenses/buffett.json|scripts/lens_registry.py)'
+  | rg 'skills/(stock-analysis/(SKILL.md|config/lenses/buffett.json|scripts/lens_registry.py)|agent-reach/(SKILL.md|references/search.md))'
 ```
 
 ## Windows build

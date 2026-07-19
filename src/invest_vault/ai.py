@@ -218,6 +218,7 @@ class CodexAppServerProvider:
         timeout: float = 120.0,
         chat_timeout: float = 300.0,
         market_skill_directory: Path | None = None,
+        reach_skill_directory: Path | None = None,
     ) -> None:
         self.runtime_directory = Path(runtime_directory)
         self.executable = executable or self._find_executable()
@@ -225,6 +226,7 @@ class CodexAppServerProvider:
         self.timeout = timeout
         self.chat_timeout = chat_timeout
         self.market_skill_directory = market_skill_directory or self._bundled_market_skill_directory()
+        self.reach_skill_directory = reach_skill_directory or self._bundled_reach_skill_directory()
         self._process: subprocess.Popen[str] | None = None
         self._reader: threading.Thread | None = None
         self._stderr_reader: threading.Thread | None = None
@@ -237,6 +239,7 @@ class CodexAppServerProvider:
         self._next_id = 1
         self._fatal_error: str | None = None
         self._runtime_market_skill: dict[str, str] | None | bool = False
+        self._runtime_reach_skill: dict[str, str] | None | bool = False
         self._model_settings: dict[str, dict[str, str | None]] = {}
 
     @staticmethod
@@ -245,6 +248,13 @@ class CodexAppServerProvider:
         if frozen_root:
             return Path(frozen_root) / "skills" / "stock-analysis"
         return Path(__file__).parents[2] / "skills" / "stock-analysis"
+
+    @staticmethod
+    def _bundled_reach_skill_directory() -> Path:
+        frozen_root = getattr(sys, "_MEIPASS", None)
+        if frozen_root:
+            return Path(frozen_root) / "skills" / "agent-reach"
+        return Path(__file__).parents[2] / "skills" / "agent-reach"
 
     @staticmethod
     def _find_executable() -> str | None:
@@ -329,7 +339,7 @@ class CodexAppServerProvider:
             self._stderr_reader.start()
             self._request(
                 "initialize",
-                {"clientInfo": {"name": "invest_vault", "title": "Invest Vault", "version": "0.3.30"}},
+                {"clientInfo": {"name": "invest_vault", "title": "Invest Vault", "version": "0.3.31"}},
                 ensure_started=False,
             )
             self._send({"method": "initialized", "params": {}})
@@ -597,6 +607,43 @@ class CodexAppServerProvider:
             self._runtime_market_skill = None
         return self._runtime_market_skill or None
 
+    def _find_runtime_reach_skill(self) -> dict[str, str] | None:
+        """Resolve the pinned read-only web fallback without requiring a user install."""
+
+        if self._runtime_reach_skill is not False:
+            return self._runtime_reach_skill or None
+        bundled = self.reach_skill_directory.resolve()
+        if (bundled / "SKILL.md").is_file():
+            self._runtime_reach_skill = {
+                "type": "skill",
+                "name": "agent-reach",
+                "path": str(bundled),
+            }
+            return self._runtime_reach_skill
+        try:
+            result = self._request(
+                "skills/list",
+                {"cwds": [str(self.runtime_directory.resolve())], "forceReload": False},
+                timeout=20,
+            )
+            match = next(
+                (
+                    item
+                    for group in result.get("data") or []
+                    for item in group.get("skills") or []
+                    if item.get("name") == "agent-reach" and item.get("enabled", True)
+                ),
+                None,
+            )
+            self._runtime_reach_skill = (
+                {"type": "skill", "name": "agent-reach", "path": str(match["path"])}
+                if match and match.get("path")
+                else None
+            )
+        except AIUnavailableError:
+            self._runtime_reach_skill = None
+        return self._runtime_reach_skill or None
+
     def chat(
         self,
         *,
@@ -634,6 +681,7 @@ class CodexAppServerProvider:
             )
         )
         skill_input = self._find_runtime_market_skill() if use_runtime_market_skill else None
+        reach_skill_input = self._find_runtime_reach_skill() if use_runtime_market_skill else None
         skill_rules = (
             "本轮以已内置的 stock-analysis 4.14.0 skill 作为证据路由、六人投研委员会和报告纪律的"
             "主契约；只引用应用提供的结构化事实，不读取其他文件或改写本地账本。"
@@ -644,13 +692,15 @@ class CodexAppServerProvider:
             (
                 f"你是 Invest Vault 的{role_name}，使用以下分析框架而非模仿或冒充真人。",
                 f"关注：{role['focus']}。核心问题：{role['questions']}。风险重点：{role['risk_focus']}。",
-                "只使用应用提供的上下文和用户消息，不自行联网。",
+                "优先使用应用提供的结构化上下文和用户消息。只有结构化证据仍明确缺失时，"
+                "才可按 agent-reach 的只读 search/web 路由联网补证；保留标题、URL、发布时间与访问时间，"
+                "搜索摘要只能作为线索，未读到原文不得升级为原文事实。",
                 skill_rules,
                 report_rules,
                 "用户可见正文和过程说明只描述协调员、研究引擎、证据与报告方法，不主动展示"
                 "stock-analysis 名称、版本号或问题匹配规则。",
                 "应用会按 AVAILABLE_SKILLS 调用受控只读工具，SKILL_RUN 和对应 EVIDENCE-SKILL 结果可作为证据；",
-                "技能仍报告缺口时不得自行补全。",
+                "结构化来源和 agent-reach 均未补齐时必须保留缺口，不得自行补全。",
                 "回答前先读取专家证据覆盖检查：只把 available 当作完整证据，conditional 必须说明口径边界，",
                 "missing 必须具体说明缺少哪项；不要用笼统的‘现有证据不足’替代逐项结果。",
                 "事实结论必须在结构化 cited_evidence_ids 字段引用证据 ID，但正文绝不显示任何 EVIDENCE、",
@@ -676,6 +726,8 @@ class CodexAppServerProvider:
         inputs: list[dict[str, object]] = []
         if skill_input:
             inputs.append(skill_input)
+        if reach_skill_input:
+            inputs.append(reach_skill_input)
         inputs.append({"type": "text", "text": f"应用上下文：\n{context}\n\n对话：\n{transcript}"})
         turn = self._request(
             "turn/start",
