@@ -256,6 +256,23 @@ def test_bundled_stock_analysis_skill_is_used_without_user_installation(tmp_path
     }
 
 
+def test_bundled_agent_reach_skill_is_used_without_user_installation(tmp_path: Path) -> None:
+    bundled = tmp_path / "skills" / "agent-reach"
+    bundled.mkdir(parents=True)
+    (bundled / "SKILL.md").write_text("---\nname: agent-reach\n---\n", encoding="utf-8")
+    provider = CodexAppServerProvider(
+        tmp_path / "runtime",
+        executable="/bin/false",
+        reach_skill_directory=bundled,
+    )
+
+    assert provider._find_runtime_reach_skill() == {
+        "type": "skill",
+        "name": "agent-reach",
+        "path": str(bundled.resolve()),
+    }
+
+
 def test_ai_status_and_chatgpt_login_do_not_expose_tokens(tmp_path: Path) -> None:
     provider = FakeAIProvider()
     with TestClient(create_app(tmp_path, automatic_updates=False, ai_provider=provider)) as client:
@@ -403,6 +420,7 @@ def test_roles_and_recoverable_role_chat(tmp_path: Path) -> None:
             "public-topic-evidence",
             "market-context-evidence",
             "supplemental-company-evidence",
+            "execution-liquidity-evidence",
             "framework-readiness",
         }
         assert roles[0]["role_id"] == "general"

@@ -627,7 +627,7 @@ def test_role_routes_required_evidence_without_question_keywords(tmp_path: Path,
     assert market["evidence"][0]["value"]["security_price_volume"]["volume_zscore"] is not None
     readiness = next(result for result in results if result["skill_id"] == "framework-readiness")
     assert readiness["evidence"][0]["value"]["role_id"] == "buffett"
-    assert "财务质量与现金创造" in readiness["evidence"][0]["value"]["available"]
+    assert "财务质量、三表与现金创造" in readiness["evidence"][0]["value"]["available"]
 
 
 def test_all_fifteen_expert_roles_have_complete_routing_and_readiness_contracts() -> None:
@@ -636,6 +636,14 @@ def test_all_fifteen_expert_roles_have_complete_routing_and_readiness_contracts(
     assert role_ids == set(FRAMEWORK_SKILLS) - {"general"}
     assert role_ids == set(FRAMEWORK_REQUIREMENTS) - {"general"}
     assert all("market-context-evidence" in FRAMEWORK_SKILLS[role_id] for role_id in role_ids)
+    execution_roles = {
+        "buffett", "klarman", "o_neil", "dalio", "soros", "livermore",
+        "minervini", "simons", "feng_liu",
+    }
+    assert all(
+        "execution-liquidity-evidence" in FRAMEWORK_SKILLS[role_id]
+        for role_id in execution_roles
+    )
     for role_id in role_ids:
         routed = set(FRAMEWORK_SKILLS[role_id])
         required_skills = {

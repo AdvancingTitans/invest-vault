@@ -582,11 +582,56 @@ const symbolOf = (securityId: string) => securityId.split(":")[2];
 const tone = (value: number | null) =>
   value === null ? "" : value >= 0 ? "up" : "down";
 
+const EXPERT_AVATAR_BY_IDENTITY: Record<string, string> = {
+  buffett: "buffett",
+  munger: "munger",
+  graham: "graham",
+  klarman: "klarman",
+  lynch: "lynch",
+  o_neil: "o_neil",
+  wood: "wood",
+  dalio: "dalio",
+  soros: "soros",
+  livermore: "livermore",
+  minervini: "minervini",
+  simons: "simons",
+  duan_yongping: "duan_yongping",
+  zhang_kun: "zhang_kun",
+  feng_liu: "feng_liu",
+  巴菲特: "buffett",
+  芒格: "munger",
+  格雷厄姆: "graham",
+  卡拉曼: "klarman",
+  "彼得·林奇": "lynch",
+  欧奈尔: "o_neil",
+  伍德: "wood",
+  达利欧: "dalio",
+  索罗斯: "soros",
+  利弗莫尔: "livermore",
+  米勒维尼: "minervini",
+  西蒙斯: "simons",
+  段永平: "duan_yongping",
+  张坤: "zhang_kun",
+  冯柳: "feng_liu",
+};
+
 function RoleAvatar({ name, identity = name }: { name: string; identity?: string }) {
   const compact = name.replace(/[\s·]/g, "");
   const initials = compact.length > 2 ? compact.slice(0, 2) : compact || "研";
   const avatarTone = [...identity].reduce((sum, character) => sum + character.charCodeAt(0), 0) % 6;
-  return <span className={`role-avatar role-avatar-${avatarTone}`} aria-hidden="true">{initials}</span>;
+  const avatarId = EXPERT_AVATAR_BY_IDENTITY[identity] ?? EXPERT_AVATAR_BY_IDENTITY[name];
+  return (
+    <span
+      className={`role-avatar role-avatar-${avatarTone}`}
+      role={avatarId ? "img" : undefined}
+      aria-label={avatarId ? `${name}头像` : undefined}
+      aria-hidden={avatarId ? undefined : true}
+    >
+      {avatarId
+        ? <img src={`/expert-avatars/${avatarId}.webp`} alt="" />
+        : initials}
+    </span>
+  );
 }
 
 function workflowSpeaker(event: ChatEvent): string {
@@ -4962,7 +5007,7 @@ export function App() {
         </nav>
         <div className="side-foot">
           <span className="local-dot">● 本地优先 · 数据私有</span>
-        <span>v0.3.30</span>
+        <span>v0.3.31</span>
         </div>
       </aside>
       <main id="content">

@@ -11,6 +11,7 @@ a = Analysis(
     datas=[
         ("web/dist", "web/dist"),
         ("skills/stock-analysis", "skills/stock-analysis"),
+        ("skills/agent-reach", "skills/agent-reach"),
     ],
     hiddenimports=hiddenimports,
     hookspath=[],

@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi.testclient import TestClient
 
+from invest_vault.ai_roles import AI_ROLES
 from invest_vault.api import create_app, web_dist_directory
 
 ENTRY = {
@@ -830,6 +831,8 @@ def test_invest_vault_bundles_pinned_stock_analysis_runtime_without_external_ins
     assert 'version: "4.14.0"' in skill.read_text(encoding="utf-8")
     assert 'collect_submodules("stock_analysis")' in spec
     assert '("skills/stock-analysis", "skills/stock-analysis")' in spec
+    assert '("skills/agent-reach", "skills/agent-reach")' in spec
+    assert app_root.joinpath("skills", "agent-reach", "SKILL.md").is_file()
 
 
 def test_market_page_exposes_global_manual_refresh_and_activity_fields() -> None:
@@ -1533,12 +1536,21 @@ def test_page_switch_refreshes_and_new_visuals_stay_inside_existing_surfaces() -
 
 
 def test_research_rooms_use_named_surfaces_and_role_avatars() -> None:
-    source = (Path(__file__).parents[1] / "web" / "src" / "workbench.tsx").read_text(encoding="utf-8")
+    web_root = Path(__file__).parents[1] / "web"
+    source = (web_root / "src" / "workbench.tsx").read_text(encoding="utf-8")
+    role_ids = {str(role["role_id"]) for role in AI_ROLES if role["role_id"] != "general"}
+    avatar_ids = {path.stem for path in (web_root / "public" / "expert-avatars").glob("*.webp")}
 
     assert 'aria-label="大盘议事厅"' in source
     assert 'aria-label="投研大师"' in source
     assert '"投研委员会"' in source
     assert "function RoleAvatar" in source
+    assert "EXPERT_AVATAR_BY_IDENTITY" in source
+    assert 'aria-label={avatarId ? `${name}头像` : undefined}' in source
+    assert avatar_ids == role_ids
+    assert 'identity={roomPersona.id}' in source
+    assert 'identity={item.name}' in source
+    assert 'identity={event.actor_type === "user" ? "vault-owner" : event.actor_id}' in source
     assert 'className="role-roster"' in source
     assert "专家风格行情报告" not in source
     assert "AI 投资委员会" not in source

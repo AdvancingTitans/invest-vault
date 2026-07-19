@@ -707,7 +707,7 @@ def create_app(
         with vault.lock:
             vault.close()
 
-    app = FastAPI(title="投资札记", version="0.3.30", lifespan=lifespan)
+    app = FastAPI(title="投资札记", version="0.3.31", lifespan=lifespan)
 
     @app.get("/api/data-quality/{security_id:path}")
     def data_quality(security_id: str) -> dict[str, object]:
