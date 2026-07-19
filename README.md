@@ -77,7 +77,7 @@ A 股颜色遵循红涨绿跌：净流入、涨停数量、板数与上涨主线
 0.3.31 的 SHA-256：
 
 ```text
-750d5bfe6666e22c0e9276b9fa536e303c0f680f5f2f80d943c974df3a7de9fd  Invest-Vault_0.3.31-local-aarch64.dmg
+e1b21afebd196c0cf796aca7b8461832d93c23d3aa7412cb80b955fbb1f9f3ac  Invest-Vault_0.3.31-local-aarch64.dmg
 ```
 
 在“终端”中执行：
