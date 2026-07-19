@@ -6,7 +6,7 @@ from typing import Any
 
 from stock_analysis.committee_selection import select_committee
 
-STOCK_ANALYSIS_SKILL_VERSION = "4.12.0"
+STOCK_ANALYSIS_SKILL_VERSION = "4.14.0"
 
 
 def _role(role_id: str, name: str, focus: str, questions: str, risk: str) -> dict[str, Any]:
@@ -50,7 +50,7 @@ COMMITTEE_FUNCTIONS = {
 }
 
 DEEP_RESEARCH_TERMS = (
-    "深度", "复盘", "投委会", "完整报告", "研究报告", "全面分析", "持仓逻辑", "原投资逻辑",
+    "深度", "复盘", "投委会", "投研委员会", "完整报告", "研究报告", "全面分析", "持仓逻辑", "原投资逻辑",
     "证伪", "情景分析", "归因", "风险审查", "行业格局", "组合影响", "六模块", "m1", "m6",
 )
 
@@ -79,7 +79,7 @@ def committee_plan(security_id: str, question: str) -> dict[str, Any]:
             {"role_id": role_id, "function": COMMITTEE_FUNCTIONS[role_id]}
             for role_id in role_ids
         ],
-        "reason": "stock-analysis 依据研究问题选择 6 位相关且互补的委员",
+        "reason": "协调员依据研究问题选择 6 位相关且互补的委员",
         "skill_version": STOCK_ANALYSIS_SKILL_VERSION,
         "stages": ["planning", "evidence", "analysis", "conflicts", "risk_review", "reporting"],
         "completion_criteria": ["逐项说明证据范围", "保留未解决分歧", "给出条件化观察清单", "附可读信源"],

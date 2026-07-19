@@ -504,7 +504,7 @@ def test_market_pulse_uses_stock_analysis_limit_pools_for_m3_and_m4() -> None:
     )
 
     assert result["kind"] == "limit_pools"
-    assert result["skill_version"] == "4.12.0"
+    assert result["skill_version"] == "4.14.0"
     assert result["m3"] == {
         "available": True,
         "limit_up_count": 2,

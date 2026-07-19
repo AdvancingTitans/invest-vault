@@ -2062,7 +2062,42 @@ textarea:focus-visible {
   color: var(--danger);
 }
 .holding-card-add {
-  margin-top: 10px;
+  min-height: 238px;
+  border: 1px dashed #3c4b60;
+  border-radius: 0;
+  background: #0e1218;
+  color: var(--muted);
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 8px;
+  padding: 24px;
+  text-align: center;
+}
+.holding-card-add > span {
+  width: 42px;
+  height: 42px;
+  border: 1px solid #53657d;
+  border-radius: 50%;
+  color: var(--action);
+  display: grid;
+  place-items: center;
+  font-size: 26px;
+  line-height: 1;
+}
+.holding-card-add strong {
+  color: var(--ink);
+  font-size: 14px;
+}
+.holding-card-add small {
+  max-width: 190px;
+  color: var(--subtle);
+  line-height: 1.55;
+}
+.holding-card-add:hover,
+.holding-card-add:focus-visible {
+  border-color: var(--action);
+  background: #141b24;
 }
 .card-capacity {
   margin: 8px 0 0 !important;
@@ -2933,6 +2968,7 @@ main,
 }
 
 .holding-grid {
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
   gap: 1px;
   overflow: hidden;
   border: 1px solid var(--border);
@@ -3121,6 +3157,478 @@ textarea:focus {
   background: #12161c;
   color: var(--ink);
   box-shadow: var(--shadow-lg);
+}
+
+/* Research rooms and evidence visualizations · v0.3.30 */
+.role-avatar {
+  display: inline-grid;
+  width: 38px;
+  height: 38px;
+  flex: 0 0 38px;
+  place-items: center;
+  border: 1px solid rgba(124, 156, 255, 0.34);
+  border-radius: 10px;
+  background: #1a2130;
+  color: #dce5ff;
+  font-size: 11px;
+  font-weight: 750;
+  letter-spacing: -0.02em;
+}
+
+.role-avatar-1 { background: #192332; }
+.role-avatar-2 { background: #202333; }
+.role-avatar-3 { background: #18252d; }
+.role-avatar-4 { background: #24212d; }
+.role-avatar-5 { background: #202630; }
+
+.assistant-titlebar {
+  align-items: flex-start;
+  padding: 13px 16px 12px;
+  background: #12161d;
+}
+
+.assistant-titlebar .assistant-identity {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 10px;
+}
+
+.assistant-identity > div {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.assistant-identity strong {
+  font-size: 16px;
+  letter-spacing: -0.015em;
+}
+
+.assistant-identity span:not(.role-avatar) {
+  max-width: 68ch;
+  color: var(--muted);
+  line-height: 1.45;
+  text-wrap: pretty;
+}
+
+.assistant-titlebar > .button-row {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 4px;
+}
+
+.chat-mode-picker {
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-bottom: 1px solid var(--border);
+  padding: 9px 16px;
+  background: var(--canvas);
+}
+
+.mode-picker-copy {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.mode-picker-copy strong {
+  color: var(--ink);
+  font-size: 12px;
+}
+
+.mode-picker-copy span {
+  color: var(--muted);
+  font-size: 11px;
+  text-wrap: pretty;
+}
+
+.mode-picker-actions {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 5px;
+}
+
+.role-picker {
+  grid-template-columns: minmax(180px, 0.78fr) minmax(240px, 1.22fr);
+  align-items: center;
+  padding-block: 10px;
+  background: #10141a;
+}
+
+.role-picker p {
+  grid-column: 2;
+  line-height: 1.45;
+}
+
+.committee-routing {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  border-color: rgba(124, 156, 255, 0.3);
+  border-radius: 8px;
+  background: rgba(124, 156, 255, 0.06);
+}
+
+.committee-routing > div {
+  display: grid;
+  gap: 2px;
+}
+
+.committee-routing .role-avatar {
+  width: 32px;
+  height: 32px;
+  flex-basis: 32px;
+  border-radius: 8px;
+}
+
+.market-report-controls {
+  display: grid;
+  grid-template-columns: minmax(230px, 1fr) minmax(210px, 0.62fr) auto;
+  align-items: end;
+  gap: 12px;
+  padding-block: 14px;
+  background: #0f1319;
+}
+
+.report-control-copy {
+  display: grid;
+  align-self: center;
+  gap: 4px;
+}
+
+.report-control-copy strong {
+  color: var(--ink);
+  font-size: 13px;
+}
+
+.report-control-copy span {
+  max-width: 58ch;
+  color: var(--muted);
+  font-size: 11.5px;
+  line-height: 1.45;
+  text-wrap: pretty;
+}
+
+.market-report-controls .room-primary-action {
+  min-height: 40px;
+  white-space: nowrap;
+}
+
+.market-room-empty {
+  display: flex;
+  max-width: 680px;
+  align-items: flex-start;
+  gap: 12px;
+  margin: auto;
+  padding: 26px;
+}
+
+.market-room-empty > div {
+  display: grid;
+  gap: 6px;
+}
+
+.market-room-empty strong {
+  font-size: 16px;
+}
+
+.market-room-empty p {
+  max-width: 64ch;
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.6;
+  text-wrap: pretty;
+}
+
+.chat-message,
+.context-event {
+  display: grid;
+  grid-template-columns: 38px minmax(0, 1fr);
+  align-items: start;
+  gap: 5px 10px;
+}
+
+.chat-message {
+  border-radius: 5px 12px 12px 12px;
+  padding: 11px 13px;
+}
+
+.chat-message.user {
+  border-radius: 12px 5px 12px 12px;
+}
+
+.chat-message > header,
+.chat-message > .rich-text,
+.chat-message > .chat-sources,
+.chat-message > small,
+.context-event > header,
+.context-event > p,
+.context-event > small,
+.context-event > a,
+.context-event > .role-roster {
+  grid-column: 2;
+}
+
+.chat-message > .role-avatar,
+.context-event > .role-avatar {
+  grid-column: 1;
+  grid-row: 1 / span 4;
+}
+
+.role-roster {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.role-chip {
+  display: inline-flex;
+  min-width: 134px;
+  align-items: center;
+  gap: 7px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #141920;
+  padding: 6px 8px;
+}
+
+.role-chip .role-avatar {
+  width: 30px;
+  height: 30px;
+  flex-basis: 30px;
+  border-radius: 7px;
+  font-size: 9px;
+}
+
+.role-chip > span {
+  display: grid;
+  gap: 1px;
+}
+
+.role-chip b {
+  color: var(--ink);
+  font-size: 11px;
+}
+
+.role-chip small {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.distribution-wrap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 10.5px;
+}
+
+.distribution-bar {
+  display: flex;
+  min-width: 130px;
+  height: 7px;
+  flex: 1 1 180px;
+  overflow: hidden;
+  border-radius: 4px;
+  background: #252b34;
+}
+
+.distribution-bar > span { min-width: 3px; }
+.distribution-up { background: var(--danger); }
+.distribution-down { background: var(--success); }
+.distribution-neutral { background: var(--muted); }
+.distribution-unavailable { background: #303640; }
+
+.portfolio-insight-strip,
+.market-breadth-strip {
+  display: grid;
+  grid-template-columns: minmax(260px, 1fr) minmax(190px, 0.55fr);
+  align-items: center;
+  gap: 18px;
+  border-top: 1px solid var(--border-light);
+  border-bottom: 1px solid var(--border-light);
+  margin: 0 0 16px;
+  padding: 10px 0 11px;
+}
+
+.market-breadth-strip {
+  margin-bottom: 18px;
+  padding-top: 0;
+}
+
+.insight-label {
+  display: block;
+  margin-bottom: 5px;
+  color: var(--muted);
+  font-size: 10.5px;
+  font-weight: 650;
+}
+
+.concentration-readout {
+  display: grid;
+  gap: 2px;
+}
+
+.concentration-readout strong {
+  font-size: 18px;
+}
+
+.concentration-readout small,
+.fund-nav-chart small {
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+.mini-line-chart {
+  display: block;
+  width: 100%;
+  height: 38px;
+  overflow: visible;
+}
+
+.mini-line-chart polyline {
+  stroke: var(--action);
+  stroke-width: 1.8;
+}
+
+.mini-line-chart.chart-up polyline { stroke: var(--danger); }
+.mini-line-chart.chart-down polyline { stroke: var(--success); }
+.mini-line-chart.chart-warning polyline { stroke: var(--warning); }
+.mini-chart-baseline { stroke: var(--border); stroke-width: 1; }
+.mini-chart-empty { color: var(--muted); font-size: 10px; }
+
+.financial-trend-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(110px, 1fr));
+  gap: 1px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  margin-bottom: 14px;
+  background: var(--border);
+}
+
+.financial-trend {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+  background: #141820;
+  padding: 9px 10px 5px;
+}
+
+.financial-trend > span { color: var(--muted); font-size: 10px; }
+.financial-trend > strong { font-size: 13px; }
+
+.fund-return-strip {
+  display: flex;
+  grid-column: 1 / -1;
+  flex-wrap: wrap;
+  gap: 1px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--border);
+}
+
+.fund-return-strip > span {
+  display: grid;
+  min-width: 102px;
+  flex: 1 1 112px;
+  gap: 2px;
+  background: #151920;
+  padding: 7px 9px;
+}
+
+.fund-return-strip small { color: var(--muted); font-size: 9.5px; }
+.fund-return-strip b { font-size: 12px; }
+
+.fund-nav-chart,
+.fund-scale-trend {
+  display: grid;
+  grid-template-columns: minmax(130px, 0.4fr) minmax(180px, 1fr);
+  align-items: center;
+  gap: 12px;
+  border-bottom: 1px solid var(--border-light);
+  margin-bottom: 10px;
+  padding-bottom: 9px;
+}
+
+.fund-scale-trend > div {
+  display: grid;
+  gap: 2px;
+}
+
+.fund-scale-trend strong { font-size: 13px; }
+.compact-empty { margin: 0 0 8px; padding: 7px 0; }
+
+@media (max-width: 860px) {
+  .market-report-controls {
+    grid-template-columns: minmax(0, 1fr) minmax(190px, 0.8fr);
+  }
+
+  .market-report-controls .room-primary-action {
+    grid-column: 1 / -1;
+    width: 100%;
+  }
+
+  .financial-trend-grid {
+    grid-template-columns: repeat(2, minmax(110px, 1fr));
+  }
+}
+
+@media (max-width: 620px) {
+  .assistant-titlebar,
+  .chat-mode-picker {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .assistant-titlebar > .button-row,
+  .mode-picker-actions {
+    justify-content: flex-end;
+  }
+
+  .market-report-controls,
+  .role-picker,
+  .portfolio-insight-strip,
+  .market-breadth-strip,
+  .fund-nav-chart,
+  .fund-scale-trend {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .role-picker p {
+    grid-column: 1;
+  }
+
+  .market-report-controls .room-primary-action {
+    grid-column: 1;
+  }
+
+  .distribution-wrap {
+    flex-wrap: wrap;
+  }
+
+  .distribution-bar {
+    flex-basis: 100%;
+  }
+
+  .chat-message,
+  .context-event {
+    grid-template-columns: 32px minmax(0, 1fr);
+  }
+
+  .chat-message > .role-avatar,
+  .context-event > .role-avatar {
+    width: 32px;
+    height: 32px;
+    flex-basis: 32px;
+    border-radius: 8px;
+    font-size: 9px;
+  }
 }
 
 /* 0.3.27 focused research and refresh refinements */
@@ -5374,6 +5882,11 @@ main,
   border: 1px solid var(--border);
   border-radius: 10px;
   background: var(--border);
+}
+
+/* Collapse unused grid tracks so a short watchlist never leaves a false card slot. */
+.holding-deck .holding-grid {
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
 }
 
 .holding-card {

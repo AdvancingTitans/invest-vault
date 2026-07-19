@@ -329,7 +329,7 @@ class CodexAppServerProvider:
             self._stderr_reader.start()
             self._request(
                 "initialize",
-                {"clientInfo": {"name": "invest_vault", "title": "Invest Vault", "version": "0.3.29"}},
+                {"clientInfo": {"name": "invest_vault", "title": "Invest Vault", "version": "0.3.30"}},
                 ensure_started=False,
             )
             self._send({"method": "initialized", "params": {}})
@@ -610,7 +610,7 @@ class CodexAppServerProvider:
             raise AIUnavailableError("请先使用 ChatGPT 登录 Codex")
         role_name = str(role["name"])
         report_rules = (
-            "你只能生成当前盘前、盘中或盘后市场复盘。投委会报告固定顺序为：执行摘要；"
+            "你只能生成当前盘前、盘中或盘后市场复盘。投研委员会报告固定顺序为：执行摘要；"
             "大盘指数概览；持仓分析；六模块深度复盘（M1指数与市场广度、M2板块资金、"
             "M3赚钱效应与上涨主线、M4下跌与流动性风险、M5风格分组、M6抗跌方向）；"
             "综合持仓建议与风险提示。指数和持仓必须使用Markdown表格。每个模块使用加粗的关键判断，"
@@ -624,9 +624,9 @@ class CodexAppServerProvider:
             "股市有风险，投资需谨慎。"
             if role.get("report_kind") == "market"
             else (
-                "你是投委会报告编辑器，必须执行 stock-analysis 4.12.0 Research 机构报告骨架："
+                "你是投研委员会报告编辑器，必须执行 stock-analysis 4.14.0 Research 机构报告骨架："
                 "执行摘要；核心矛盾或基金产品契约；财务或底层持仓；资本配置或业绩风险；"
-                "估值与交易实现；六人投委会审议；风险与催化剂；条件化动作。"
+                "估值与交易实现；六人投研委员会审议；风险与催化剂；条件化动作。"
                 "报告综合已验证的质量、增长、估值和风险事实；覆盖率、内部缺口 ID、快照 ID 与"
                 "工程审计结果不得出现在用户正文。不要输出强制买入或卖出结论。"
                 if role.get("role_id") == "report_editor"
@@ -635,7 +635,7 @@ class CodexAppServerProvider:
         )
         skill_input = self._find_runtime_market_skill() if use_runtime_market_skill else None
         skill_rules = (
-            "本轮以已内置的 stock-analysis 4.12.0 skill 作为证据路由、六人投委会和报告纪律的"
+            "本轮以已内置的 stock-analysis 4.14.0 skill 作为证据路由、六人投研委员会和报告纪律的"
             "主契约；只引用应用提供的结构化事实，不读取其他文件或改写本地账本。"
             if skill_input
             else "不读取文件。"
@@ -647,6 +647,8 @@ class CodexAppServerProvider:
                 "只使用应用提供的上下文和用户消息，不自行联网。",
                 skill_rules,
                 report_rules,
+                "用户可见正文和过程说明只描述协调员、研究引擎、证据与报告方法，不主动展示"
+                "stock-analysis 名称、版本号或问题匹配规则。",
                 "应用会按 AVAILABLE_SKILLS 调用受控只读工具，SKILL_RUN 和对应 EVIDENCE-SKILL 结果可作为证据；",
                 "技能仍报告缺口时不得自行补全。",
                 "回答前先读取专家证据覆盖检查：只把 available 当作完整证据，conditional 必须说明口径边界，",
@@ -1365,7 +1367,7 @@ class ResearchChatStore:
                 }
             elif not is_investment_question(content):
                 reply = {
-                    "content": "研究助手只回答金融、理财和投资相关问题。请围绕当前标的的经营、财务、估值、市场、组合或风险继续提问。",
+                    "content": "投研大师只讨论金融、理财和投资相关问题。请围绕当前标的的经营、财务、估值、市场、组合或风险继续提问。",
                     "cited_evidence_ids": [],
                     "assumptions": [],
                     "unknowns": [],
@@ -1459,10 +1461,10 @@ class ResearchChatStore:
                 (thread_id,),
             ).fetchone()
             if running:
-                raise ValueError("当前投委会仍在研究中，请等待本轮完成")
+                raise ValueError("当前投研委员会仍在研究中，请等待本轮完成")
             plan = committee_plan(str(thread["security_id"]), content)
             self.vault.connection.execute(
-                "INSERT INTO research_runs VALUES (?, ?, 'stock-analysis-4.12.0-committee-v1', 'running', 'planning', ?, ?, ?, NULL, NULL)",
+                "INSERT INTO research_runs VALUES (?, ?, 'stock-analysis-4.14.0-committee-v1', 'running', 'planning', ?, ?, ?, NULL, NULL)",
                 (
                     run_id,
                     thread_id,
@@ -1509,7 +1511,7 @@ class ResearchChatStore:
 
         if not deep_request:
             reply = {
-                "content": "这个问题更适合普通助手快速回答。投委会模式用于个股、基金或行情复盘的深度报告；请切换到普通助手，或补充研究范围、关注风险和希望复盘的时间区间。",
+                "content": "这个问题更适合投研大师快速回答。投研委员会用于个股、基金或行情复盘的深度报告；请切换到投研大师，或补充研究范围、关注风险和希望复盘的时间区间。",
                 "cited_evidence_ids": [],
                 "assumptions": [],
                 "unknowns": [],
@@ -1692,7 +1694,7 @@ class ResearchChatStore:
                         messages=[
                             {
                                 "role": "user",
-                                "content": f"作为投委会研究员，围绕以下深度问题提交独立意见：{content}",
+                                "content": f"作为投研委员会研究员，围绕以下深度问题提交独立意见：{content}",
                             }
                         ],
                         context=context[:45_000],
@@ -1772,11 +1774,11 @@ class ResearchChatStore:
         opinion_text = json.dumps(opinions, ensure_ascii=False)[:24_000]
         report_role = {
             "role_id": "report_editor",
-            "name": "投委会报告编辑器",
+            "name": "投研委员会报告编辑器",
             "focus": "证据边界、专家共识、关键分歧、组合风险和可复核条件",
             "questions": "哪些逻辑仍成立、哪些已削弱、哪些缺口会改变判断？",
             "risk_focus": "证据错配、虚假共识、数据缺口和无条件行动建议",
-            "report_contract": "stock-analysis 4.12.0；市场使用执行摘要、指数、持仓、M1-M6、建议风险骨架；公司或基金使用 Research 机构报告骨架",
+            "report_contract": "stock-analysis 4.14.0；市场使用执行摘要、指数、持仓、M1-M6、建议风险骨架；公司或基金使用 Research 机构报告骨架",
         }
         if str(thread["security_id"]) == MARKET_OVERVIEW_SECURITY_ID:
             report_role["report_kind"] = "market"
@@ -1812,7 +1814,7 @@ class ResearchChatStore:
                 for evidence_id in report["cited_evidence_ids"]
                 for source in source_index.get(evidence_id, [])
             ]
-            report.update({"role_id": "report_editor", "role_name": "投委会报告", "report": True})
+            report.update({"role_id": "report_editor", "role_name": "投研委员会报告", "report": True})
             unresolved = list(
                 dict.fromkeys(str(item) for opinion in opinions for item in opinion.get("unknowns", []))
             )[:8]

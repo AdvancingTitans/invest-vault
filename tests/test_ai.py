@@ -143,7 +143,7 @@ def test_market_report_supports_expert_style_and_committee_scene() -> None:
         "zhang_kun",
         "graham",
     ]
-    assert plan["skill_version"] == "4.12.0"
+    assert plan["skill_version"] == "4.14.0"
 
 
 def test_market_overview_accepts_committee_report_thread(tmp_path: Path) -> None:
@@ -440,7 +440,7 @@ def test_chat_refuses_off_topic_without_spending_a_provider_turn(tmp_path: Path)
         ).json()
 
     assert reply["refused"] is True
-    assert "只回答金融" in reply["content"]
+    assert "只讨论金融" in reply["content"]
     assert provider.chat_calls == 0
 
 

@@ -54,6 +54,7 @@ from .providers import (
 )
 from .research import ResearchStore
 from .runtime import diagnostics
+from .upstream_version import check_upstream_version
 
 
 def web_dist_directory() -> Path:
@@ -417,17 +418,84 @@ def create_app(
     def refresh_market_sections(selected: list[str]) -> tuple[list[str], dict[str, str]]:
         market_target = current_market_date(clock())
         report_stage = market_report_stage(clock())
+
+        def latest_daily_payload(
+            loader: Callable[[date], dict[str, object]],
+            requested: date,
+            complete: Callable[[dict[str, object]], bool],
+        ) -> dict[str, object]:
+            """Use the newest complete trading-day payload without relabelling its date."""
+
+            candidate = requested
+            newest_incomplete: dict[str, object] | None = None
+            errors: list[str] = []
+            for _ in range(8):
+                try:
+                    payload = loader(candidate)
+                    if newest_incomplete is None:
+                        newest_incomplete = payload
+                    if complete(payload):
+                        if candidate != requested:
+                            payload = {
+                                **payload,
+                                "fallback_used": True,
+                                "requested_date": requested.isoformat(),
+                            }
+                        return payload
+                except Exception as error:
+                    errors.append(str(error))
+                candidate = previous_trade_date(candidate)
+            if newest_incomplete is not None:
+                return newest_incomplete
+            raise ValueError(errors[0] if errors else "最近交易日数据暂不可用")
+
+        def load_lhb() -> dict[str, object]:
+            return latest_daily_payload(
+                fetch_lhb,
+                target_trade_date(clock()),
+                lambda payload: bool(payload.get("rows")),
+            )
+
+        def load_industry_flow() -> dict[str, object]:
+            return latest_daily_payload(
+                fetch_industry_money_flow,
+                market_target,
+                lambda payload: bool(payload.get("inbound")) and bool(payload.get("outbound")),
+            )
+
+        def load_pulse() -> dict[str, object]:
+            session = str(report_stage["session"])
+            requested = date.fromisoformat(str(report_stage["report_date"]))
+            if session == "盘前":
+                return fetch_market_pulse(
+                    requested,
+                    session=session,
+                    holdings=market_holding_subjects(),
+                    now=clock(),
+                )
+
+            def fetch_for(candidate: date) -> dict[str, object]:
+                return fetch_market_pulse(
+                    candidate,
+                    session=session if candidate == requested else "盘后",
+                    holdings=market_holding_subjects(),
+                    now=clock(),
+                )
+
+            return latest_daily_payload(
+                fetch_for,
+                requested,
+                lambda payload: payload.get("kind") != "limit_pools"
+                or bool((payload.get("m3") or {}).get("available"))
+                or bool((payload.get("m4") or {}).get("available")),
+            )
+
         loaders: dict[str, Callable[[], dict[str, object]]] = {
             "indices": fetch_global_index_overview,
-            "lhb": lambda: fetch_lhb(market_target),
-            "industry_flow": lambda: fetch_industry_money_flow(market_target),
+            "lhb": load_lhb,
+            "industry_flow": load_industry_flow,
             "market_news": lambda: fetch_market_news(now=clock()),
-            "pulse": lambda: fetch_market_pulse(
-                date.fromisoformat(str(report_stage["report_date"])),
-                session=str(report_stage["session"]),
-                holdings=market_holding_subjects(),
-                now=clock(),
-            ),
+            "pulse": load_pulse,
         }
         completed: list[str] = []
         failed: dict[str, str] = {}
@@ -639,7 +707,7 @@ def create_app(
         with vault.lock:
             vault.close()
 
-    app = FastAPI(title="投资札记", version="0.3.29", lifespan=lifespan)
+    app = FastAPI(title="投资札记", version="0.3.30", lifespan=lifespan)
 
     @app.get("/api/data-quality/{security_id:path}")
     def data_quality(security_id: str) -> dict[str, object]:
@@ -964,6 +1032,13 @@ def create_app(
     def ai_skills() -> list[dict[str, str]]:
         return chats.skill_layer.catalog()
 
+    @app.get("/api/research-engine/version")
+    def research_engine_version() -> dict[str, object]:
+        try:
+            return check_upstream_version().as_dict()
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            raise HTTPException(status_code=503, detail=f"暂时无法核对上游版本：{error}") from error
+
     @app.get("/api/ai/chats")
     def list_ai_chats(security_id: str | None = None) -> list[dict[str, object]]:
         with vault.lock:
@@ -1044,9 +1119,11 @@ def create_app(
             completed, failed = refresh_market_sections(selected)
             market = _latest_market_snapshots(vault)
             market["report_stage"] = market_report_stage(clock())
+            retained = [section for section in failed if section in market]
         return {
             "completed": completed,
             "failed": failed,
+            "retained": retained,
             "requested_at": datetime.now(timezone.utc).isoformat(),
             "report_stage": market_report_stage(clock()),
             "market": market,

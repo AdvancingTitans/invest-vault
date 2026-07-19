@@ -1,6 +1,6 @@
 import json
 import sqlite3
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -338,6 +338,48 @@ def test_user_can_refresh_all_market_sections_and_receive_partial_failures(
     assert market["market_news"]["source"] == "富途 fixture"
 
 
+def test_daily_market_modules_fall_back_to_the_latest_complete_trading_day(
+    tmp_path: Path, monkeypatch
+) -> None:
+    lhb_dates: list[str] = []
+    flow_dates: list[str] = []
+
+    def lhb(trade_day: date) -> dict[str, object]:
+        lhb_dates.append(trade_day.isoformat())
+        return {
+            "date": trade_day.isoformat(),
+            "source": "fixture",
+            "rows": [{"name": "甲公司"}] if trade_day.isoformat() == "2026-07-17" else [],
+        }
+
+    def flow(trade_day: date) -> dict[str, object]:
+        flow_dates.append(trade_day.isoformat())
+        if trade_day.isoformat() != "2026-07-17":
+            raise ValueError("目标日资金流尚未完整披露")
+        return {
+            "date": "2026-07-17",
+            "source": "fixture",
+            "inbound": [{"name": "医药"}],
+            "outbound": [{"name": "白酒"}],
+        }
+
+    monkeypatch.setattr("invest_vault.api.fetch_lhb", lhb)
+    monkeypatch.setattr("invest_vault.api.fetch_industry_money_flow", flow)
+    def now() -> datetime:
+        return datetime(2026, 7, 21, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    with TestClient(create_app(tmp_path, automatic_updates=False, now_provider=now)) as client:
+        lhb_result = client.post("/api/market/refresh", json={"section": "lhb"}).json()
+        flow_result = client.post("/api/market/refresh", json={"section": "industry_flow"}).json()
+
+    assert lhb_dates == ["2026-07-20", "2026-07-17"]
+    assert flow_dates == ["2026-07-21", "2026-07-20", "2026-07-17"]
+    assert lhb_result["market"]["lhb"]["date"] == "2026-07-17"
+    assert lhb_result["market"]["lhb"]["fallback_used"] is True
+    assert flow_result["market"]["industry_flow"]["date"] == "2026-07-17"
+    assert flow_result["market"]["industry_flow"]["fallback_used"] is True
+
+
 def test_user_can_record_cash_balance_and_drawdown_limit_for_ai_evidence(tmp_path: Path) -> None:
     with TestClient(create_app(tmp_path, automatic_updates=False)) as client:
         saved = client.post(
@@ -373,11 +415,16 @@ def test_bootstrap_refreshes_all_market_sections_instead_of_reusing_a_saved_day(
 
     def lhb(_):
         calls["lhb"] += 1
-        return {"date": "2026-07-20", "source": "fixture", "rows": []}
+        return {"date": "2026-07-20", "source": "fixture", "rows": [{"name": "甲公司"}]}
 
     def flow(_):
         calls["industry_flow"] += 1
-        return {"date": "2026-07-20", "source": "fixture", "inbound": [], "outbound": []}
+        return {
+            "date": "2026-07-20",
+            "source": "fixture",
+            "inbound": [{"name": "医药"}],
+            "outbound": [{"name": "白酒"}],
+        }
 
     def pulse(*_args, **_kwargs):
         calls["pulse"] += 1
@@ -780,7 +827,7 @@ def test_invest_vault_bundles_pinned_stock_analysis_runtime_without_external_ins
     assert '"src/stock_analysis"' in pyproject
     assert runtime.joinpath("committee_selection.py").is_file()
     assert runtime.joinpath("integrations.py").is_file()
-    assert 'version: "4.12.0"' in skill.read_text(encoding="utf-8")
+    assert 'version: "4.14.0"' in skill.read_text(encoding="utf-8")
     assert 'collect_submodules("stock_analysis")' in spec
     assert '("skills/stock-analysis", "skills/stock-analysis")' in spec
 
@@ -811,25 +858,28 @@ def test_market_page_exposes_global_manual_refresh_and_activity_fields() -> None
     assert 'refreshMarket("pulse")' in holding_news
     assert 'refreshing === "pulse" ? "刷新中…" : "刷新"' in holding_news
     assert 'scene="market"' in source
-    assert "更新市场数据后自动识别" in source
+    assert "刷新后自动识别时段" in source
     assert (
         "<span>报告阶段</span>"
         not in source[source.index("function ResearchAssistant") : source.index("function SecurityWorkbench")]
     )
-    assert "当前报告阶段" in source
-    assert "生成最新行情报告" in source
+    assert "大盘议事厅" in source
+    assert "开始本时段议事" in source
     market_assistant = source[
         source.index("function ResearchAssistant") : source.index("function SecurityWorkbench")
     ]
-    assert "<span>专家风格</span>" in market_assistant
+    assert "<span>主持席</span>" in market_assistant
     assert 'useState("dalio")' in market_assistant
-    assert '<option value="committee">投委会风格</option>' in market_assistant
+    assert '<option value="committee">投研委员会 · 六席会审</option>' in market_assistant
     assert 'marketStyle === "committee"' in market_assistant
     assert '? "AI 市场行情助手"' not in market_assistant
     assert 'scene === "market" ? null' in market_assistant
     assert 'scene === "market" ? null : <div className="chat-composer">' in market_assistant
     assert "forceNew" in market_assistant
-    assert 'scene === "security" && <div className="button-row">' in market_assistant
+    assert market_assistant.count("清空对话") == 1
+    assert market_assistant.count("新对话") == 1
+    assert "按 stock-analysis 的问题匹配规则" not in market_assistant
+    assert "依据研究问题，从 15 位投资专家中邀请 6 位互补委员" in market_assistant
     assert "会话历史" not in market_assistant
     assert 'if (scene === "market") {\n      setThreads([]);' not in market_assistant
     assert "行情阶段\\n${marketStage.label}" in market_assistant
@@ -872,7 +922,12 @@ def test_industry_flow_refresh_does_not_refresh_market_pulse(tmp_path: Path, mon
 
     def flow(_):
         calls["industry_flow"] += 1
-        return {"date": "2026-07-20", "source": "fixture", "inbound": [], "outbound": []}
+        return {
+            "date": "2026-07-20",
+            "source": "fixture",
+            "inbound": [{"name": "医药"}],
+            "outbound": [{"name": "白酒"}],
+        }
 
     def pulse(*_args, **_kwargs):
         calls["pulse"] += 1
@@ -1427,8 +1482,9 @@ def test_holding_deck_has_a_bounded_checkbox_picker_and_ledger_scroll_region() -
 
     assert "HoldingPicker" in source
     assert 'type="checkbox"' in source
-    assert "replaceTrailingCards" in source
-    assert "选择展示持仓" in source
+    assert "appendHoldingCards" in source
+    assert "从持仓账本导入" in source
+    assert 'className="holding-card-add"' in source
     assert ".table-wrap:has(> .holdings-table)" in styles
     assert "position: sticky" in styles
 
@@ -1454,8 +1510,39 @@ def test_assistant_hides_engineering_ids_and_excerpt_keeps_the_user_question() -
     assert "<RichText text={event.payload.content}" in source
     assert "问题\\n${question}" in source
     assert "证据：${event.payload.cited_evidence_ids" not in source
-    assert "每次提问独立分析，不自动带入旧对话" in source
+    assert "每个问题都从当前标的证据重新出发" in source
     assert "清空对话" in source
+
+
+def test_page_switch_refreshes_and_new_visuals_stay_inside_existing_surfaces() -> None:
+    app_root = Path(__file__).parents[1]
+    source = (app_root / "web" / "src" / "workbench.tsx").read_text(encoding="utf-8")
+    styles = (app_root / "web" / "src" / "styles.css").read_text(encoding="utf-8")
+
+    assert "previousPage.current === active" in source
+    assert "正在刷新当前页面的行情、资料与本地记录" in source
+    assert "load(true).catch" in source
+    assert "今日持仓涨跌分布" in source
+    assert "买入金额前三集中度" in source
+    assert "展示指数涨跌广度" in source
+    assert "历史财务趋势" in source
+    assert "近期单位净值走势" in source
+    assert ".portfolio-insight-strip" in styles
+    assert ".financial-trend-grid" in styles
+    assert ".mini-line-chart" in styles
+
+
+def test_research_rooms_use_named_surfaces_and_role_avatars() -> None:
+    source = (Path(__file__).parents[1] / "web" / "src" / "workbench.tsx").read_text(encoding="utf-8")
+
+    assert 'aria-label="大盘议事厅"' in source
+    assert 'aria-label="投研大师"' in source
+    assert '"投研委员会"' in source
+    assert "function RoleAvatar" in source
+    assert 'className="role-roster"' in source
+    assert "专家风格行情报告" not in source
+    assert "AI 投资委员会" not in source
+    assert "AI 研究助手" not in source
 
 
 def test_today_note_preview_is_clamped_inside_its_grid_cell() -> None:

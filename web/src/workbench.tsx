@@ -88,6 +88,11 @@ type FundProfile = {
     event: string | null;
   }>;
   returns: Record<string, number>;
+  scale_history?: Array<{
+    as_of: string;
+    size_yi: number;
+    quarter_change_percent: number | null;
+  }>;
   fees: {
     management_rate: string | null;
     custodian_rate: string | null;
@@ -143,6 +148,8 @@ type Market = {
   lhb?: {
     date: string;
     source: string;
+    fallback_used?: boolean;
+    requested_date?: string;
     rows: Array<{
       symbol: string;
       name: string;
@@ -156,6 +163,8 @@ type Market = {
   industry_flow?: {
     date: string;
     source: string;
+    fallback_used?: boolean;
+    requested_date?: string;
     inbound: Array<{
       code: string;
       name: string;
@@ -268,6 +277,15 @@ type AISettings = {
     model_id: string | null;
     reasoning_effort: string | null;
   }>;
+};
+
+type ResearchEngineVersion = {
+  bundled_version: string;
+  latest_version: string;
+  update_available: boolean;
+  release_url: string;
+  checked_at: string;
+  update_policy: "app_release";
 };
 type AIProviderOption = {
   provider_id: "codex" | "openai" | "anthropic" | "google" | "deepseek";
@@ -563,6 +581,65 @@ const quotePrice = (value: number | null, currency: "CNY" | "HKD") =>
 const symbolOf = (securityId: string) => securityId.split(":")[2];
 const tone = (value: number | null) =>
   value === null ? "" : value >= 0 ? "up" : "down";
+
+function RoleAvatar({ name, identity = name }: { name: string; identity?: string }) {
+  const compact = name.replace(/[\s·]/g, "");
+  const initials = compact.length > 2 ? compact.slice(0, 2) : compact || "研";
+  const avatarTone = [...identity].reduce((sum, character) => sum + character.charCodeAt(0), 0) % 6;
+  return <span className={`role-avatar role-avatar-${avatarTone}`} aria-hidden="true">{initials}</span>;
+}
+
+function workflowSpeaker(event: ChatEvent): string {
+  if (event.payload.role_name) return event.payload.role_name;
+  if (event.event_type.startsWith("evidence") || event.event_type.startsWith("tool.")) return "证据研究员";
+  if (event.event_type.startsWith("reporting")) return "报告编辑器";
+  return "协调员";
+}
+
+function MiniLineChart({ values, label, toneClass = "action" }: {
+  values: Array<number | null>;
+  label: string;
+  toneClass?: "action" | "up" | "down" | "warning";
+}) {
+  const points = values.filter((value): value is number => value !== null && Number.isFinite(value));
+  if (points.length < 2) return <span className="mini-chart-empty">样本不足</span>;
+  const low = Math.min(...points);
+  const high = Math.max(...points);
+  const range = high - low || 1;
+  const path = points.map((value, index) => {
+    const x = points.length === 1 ? 50 : (index / (points.length - 1)) * 100;
+    const y = 28 - ((value - low) / range) * 24;
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(" ");
+  return (
+    <svg className={`mini-line-chart chart-${toneClass}`} viewBox="0 0 100 32" role="img" aria-label={label} preserveAspectRatio="none">
+      <title>{label}</title>
+      <line x1="0" y1="28" x2="100" y2="28" className="mini-chart-baseline" />
+      <polyline points={path} fill="none" vectorEffect="non-scaling-stroke" />
+    </svg>
+  );
+}
+
+function DistributionBar({ up, down, neutral, unavailable = 0, label }: {
+  up: number;
+  down: number;
+  neutral: number;
+  unavailable?: number;
+  label: string;
+}) {
+  const total = up + down + neutral + unavailable || 1;
+  return (
+    <div className="distribution-wrap">
+      <div className="distribution-bar" role="img" aria-label={`${label}：上涨 ${up}，下跌 ${down}，平盘 ${neutral}，缺失 ${unavailable}`}>
+        {up > 0 && <span className="distribution-up" style={{ width: `${up / total * 100}%` }} />}
+        {down > 0 && <span className="distribution-down" style={{ width: `${down / total * 100}%` }} />}
+        {neutral > 0 && <span className="distribution-neutral" style={{ width: `${neutral / total * 100}%` }} />}
+        {unavailable > 0 && <span className="distribution-unavailable" style={{ width: `${unavailable / total * 100}%` }} />}
+      </div>
+      <span>涨 {up}</span><span>跌 {down}</span><span>平 {neutral}</span>{unavailable > 0 && <span>缺 {unavailable}</span>}
+    </div>
+  );
+}
 const newDraft = (): HoldingDraft => ({
   row_id: globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`,
   symbol: "",
@@ -665,16 +742,13 @@ function PageHeader({
 }
 const cardLimitForWidth = (width: number) =>
   width >= 960 ? 12 : width >= 720 ? 8 : width >= 540 ? 4 : 3;
-const replaceTrailingCards = (
+const appendHoldingCards = (
   current: string[],
   selected: string[],
   limit: number,
 ) => {
-  const promoted = [...new Set(selected)].slice(0, limit);
-  const keep = current
-    .filter((id) => !promoted.includes(id))
-    .slice(0, Math.max(0, limit - promoted.length));
-  return [...keep, ...promoted];
+  const additions = [...new Set(selected)].filter((id) => !current.includes(id));
+  return [...current, ...additions].slice(0, limit);
 };
 
 function HoldingEditor({
@@ -885,6 +959,7 @@ function HoldingPicker({
   apply: (ids: string[]) => void;
 }) {
   const [selected, setSelected] = useState<string[]>([]);
+  const remaining = Math.max(0, limit - visibleIds.length);
   const cancelRef = useRef<HTMLButtonElement>(null);
   useEffect(() => {
     cancelRef.current?.focus();
@@ -902,25 +977,22 @@ function HoldingPicker({
         aria-modal="true"
         aria-labelledby="holding-picker-title"
       >
-        <span className="confirm-kicker">首页卡片</span>
-        <h2 id="holding-picker-title">选择展示持仓</h2>
+        <span className="confirm-kicker">首页关注持仓</span>
+        <h2 id="holding-picker-title">从持仓账本导入</h2>
         <p>
-          勾选未展示的标的；确认后，选中 {selected.length} 张将替换当前末尾{" "}
-          {Math.min(selected.length, visibleIds.length)} 张。
+          还可添加 {remaining} 张卡片；这里只列出尚未在首页展示的个股与基金。
         </p>
         <div className="holding-picker-list">
-          {holdings.map((item) => {
-            const visible = visibleIds.includes(item.security_id);
-            const checked = visible || selected.includes(item.security_id);
+          {holdings.filter((item) => !visibleIds.includes(item.security_id)).map((item) => {
+            const checked = selected.includes(item.security_id);
             return (
               <label
                 key={item.security_id}
-                className={visible ? "is-visible" : ""}
               >
                 <input
                   type="checkbox"
                   checked={checked}
-                  disabled={visible || (!checked && selected.length >= limit)}
+                  disabled={!checked && selected.length >= remaining}
                   onChange={(event) =>
                     setSelected((current) =>
                       event.target.checked
@@ -936,11 +1008,7 @@ function HoldingPicker({
                   </small>
                 </span>
                 <em>
-                  {visible
-                    ? "当前展示"
-                    : selected.includes(item.security_id)
-                      ? "待替换"
-                      : "可选择"}
+                  {selected.includes(item.security_id) ? "待导入" : "可选择"}
                 </em>
               </label>
             );
@@ -951,7 +1019,7 @@ function HoldingPicker({
             取消
           </button>
           <button disabled={!selected.length} onClick={() => apply(selected)}>
-            确认替换 {selected.length} 张
+            导入 {selected.length} 张
           </button>
         </div>
       </section>
@@ -981,7 +1049,6 @@ function HoldingDeck({
   const [draggingId, setDraggingId] = useState<string | null>(null);
   const [limit, setLimit] = useState(3);
   const [pickerOpen, setPickerOpen] = useState(false);
-  const [dismissedIds, setDismissedIds] = useState<string[]>([]);
   const [visibleIds, setVisibleIds] = useState<string[] | null>(() => {
     try {
       const saved = localStorage.getItem("holding-card-slots");
@@ -1000,12 +1067,13 @@ function HoldingDeck({
   }, []);
   useEffect(() => {
     setVisibleIds((current) => {
+      if (!holdings.length) return current;
       const valid = (current ?? [])
         .filter((id) => holdings.some((item) => item.security_id === id))
         .slice(0, limit);
-      for (const item of holdings)
-        if (valid.length < limit && !valid.includes(item.security_id))
-          valid.push(item.security_id);
+      if (current === null)
+        for (const item of holdings)
+          if (valid.length < limit) valid.push(item.security_id);
       return valid;
     });
   }, [holdings, limit]);
@@ -1086,9 +1154,6 @@ function HoldingDeck({
   const unshown = holdings.filter(
     (item) => !(visibleIds ?? []).includes(item.security_id),
   );
-  const next =
-    unshown.find((item) => !dismissedIds.includes(item.security_id)) ??
-    unshown[0];
   return (
     <div className="holding-deck" ref={deckRef}>
       <div className="holding-grid">
@@ -1185,9 +1250,6 @@ function HoldingDeck({
                 setVisibleIds((current) =>
                   (current ?? []).filter((id) => id !== item.security_id),
                 );
-                setDismissedIds((current) => [
-                  ...new Set([...current, item.security_id]),
-                ]);
               }}
               aria-label={`从首页移除 ${item.symbol}`}
             >
@@ -1195,27 +1257,15 @@ function HoldingDeck({
             </button>
           </article>
         ))}
-      </div>
-      <div className="holding-deck-actions">
-        {next && visible.length < limit && (
+        {visible.length < limit && unshown.length > 0 && (
           <button
-            className="secondary"
-            onClick={() => {
-              setVisibleIds((current) => [
-                ...(current ?? []),
-                next.security_id,
-              ]);
-              setDismissedIds((current) =>
-                current.filter((id) => id !== next.security_id),
-              );
-            }}
+            className="holding-card-add"
+            onClick={() => setPickerOpen(true)}
+            aria-label={`添加首页关注持仓，还可添加 ${limit - visible.length} 张`}
           >
-            ＋ 显示其他持仓
-          </button>
-        )}
-        {holdings.length > visible.length && (
-          <button className="secondary" onClick={() => setPickerOpen(true)}>
-            选择展示持仓
+            <span aria-hidden="true">＋</span>
+            <strong>添加关注持仓</strong>
+            <small>从持仓账本选择未展示的个股或基金</small>
           </button>
         )}
       </div>
@@ -1227,10 +1277,7 @@ function HoldingDeck({
           cancel={() => setPickerOpen(false)}
           apply={(selected) => {
             setVisibleIds((current) =>
-              replaceTrailingCards(current ?? [], selected, limit),
-            );
-            setDismissedIds((current) =>
-              current.filter((id) => !selected.includes(id)),
+              appendHoldingCards(current ?? [], selected, limit),
             );
             setPickerOpen(false);
           }}
@@ -1400,6 +1447,24 @@ function Today({
   const holdingById = Object.fromEntries(
     data.holdings.map((item) => [item.security_id, item]),
   );
+  const moveDistribution = data.holdings.reduce(
+    (counts, item) => {
+      if (item.change_percent === null) counts.unavailable += 1;
+      else if (item.change_percent > 0) counts.up += 1;
+      else if (item.change_percent < 0) counts.down += 1;
+      else counts.neutral += 1;
+      return counts;
+    },
+    { up: 0, down: 0, neutral: 0, unavailable: 0 },
+  );
+  const investedAmounts = data.holdings
+    .map((item) => Number(item.invested_amount_cny || 0))
+    .filter((value) => value > 0)
+    .sort((left, right) => right - left);
+  const totalInvested = investedAmounts.reduce((sum, value) => sum + value, 0);
+  const topThreeConcentration = totalInvested
+    ? investedAmounts.slice(0, 3).reduce((sum, value) => sum + value, 0) / totalInvested * 100
+    : null;
   return (
     <>
       <PageHeader
@@ -1450,6 +1515,17 @@ function Today({
               <div className="value">
                 {calculable.length}/{data.holdings.length}
               </div>
+            </div>
+          </div>
+          <div className="portfolio-insight-strip" aria-label="组合结构概览">
+            <div>
+              <span className="insight-label">今日持仓涨跌分布</span>
+              <DistributionBar {...moveDistribution} label="今日持仓涨跌分布" />
+            </div>
+            <div className="concentration-readout">
+              <span className="insight-label">买入金额前三集中度</span>
+              <strong className="mono">{topThreeConcentration === null ? "—" : `${topThreeConcentration.toFixed(1)}%`}</strong>
+              <small>按本地账本成本计算，不代表实时市值权重</small>
             </div>
           </div>
           <h3 style={{ fontSize: "13px", color: "var(--muted)", margin: "0 0 12px", fontWeight: 600 }}>
@@ -1739,7 +1815,7 @@ function MarketPage({
     setRefreshing(section);
     setRefreshNotice("");
     try {
-      const result = await api<{ completed: string[]; failed: Record<string, string>; report_stage: MarketReportStage; market: Market }>(
+      const result = await api<{ completed: string[]; failed: Record<string, string>; retained: string[]; report_stage: MarketReportStage; market: Market }>(
         "/api/market/refresh",
         { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ section }) },
       );
@@ -1747,7 +1823,7 @@ function MarketPage({
       const failures = Object.values(result.failed);
       setRefreshNotice(
         failures.length
-          ? `已更新 ${result.completed.length} 项；${failures.join("；")}`
+          ? `已更新 ${result.completed.length} 项；${failures.join("；")}${result.retained.length ? "；失败模块继续展示最近归档数据，日期见模块标题" : ""}`
           : "市场数据已刷新",
       );
       return result.report_stage;
@@ -1767,6 +1843,23 @@ function MarketPage({
   };
   const regionName = (region: string) =>
     region === "CN" ? "A股" : region === "HK" ? "港股" : "美股";
+  const indexDistribution = (indices?.rows ?? []).reduce(
+    (counts, row) => {
+      if (row.change_percent === null) counts.unavailable += 1;
+      else if (row.change_percent > 0) counts.up += 1;
+      else if (row.change_percent < 0) counts.down += 1;
+      else counts.neutral += 1;
+      return counts;
+    },
+    { up: 0, down: 0, neutral: 0, unavailable: 0 },
+  );
+  const sortedIndexMoves = (indices?.rows ?? [])
+    .map((row) => row.change_percent)
+    .filter((value): value is number => value !== null)
+    .sort((left, right) => left - right);
+  const medianIndexMove = sortedIndexMoves.length
+    ? sortedIndexMoves[Math.floor(sortedIndexMoves.length / 2)]
+    : null;
   return (
     <>
       <PageHeader
@@ -1796,6 +1889,18 @@ function MarketPage({
           }
         >
           {indices?.rows.length ? (
+            <>
+            <div className="market-breadth-strip">
+              <div>
+                <span className="insight-label">展示指数涨跌广度</span>
+                <DistributionBar {...indexDistribution} label="展示指数涨跌广度" />
+              </div>
+              <div className="concentration-readout">
+                <span className="insight-label">指数涨跌幅中位数</span>
+                <strong className={`mono ${tone(medianIndexMove)}`}>{percent(medianIndexMove)}</strong>
+                <small>仅统计当前表内日期有效的指数，不代表全市场个股广度</small>
+              </div>
+            </div>
             <div className="market-region-grid">
               {(["CN", "HK", "US"] as const).map((region) => (
                 <section className="market-region" key={region}>
@@ -1823,6 +1928,7 @@ function MarketPage({
                 </section>
               ))}
             </div>
+            </>
           ) : (
             <p className="empty">正在获取最新市场行情；失败时可使用右上角刷新重试。</p>
           )}
@@ -1832,7 +1938,7 @@ function MarketPage({
           title="龙虎榜"
           action={
             <div className="card-action-group">
-              {lhb && <span className="meta">{lhb.date} · {lhb.source}</span>}
+              {lhb && <span className="meta">{lhb.date} · {lhb.source}{lhb.fallback_used ? " · 最近可用交易日" : ""}</span>}
               <button className="text-button" disabled={refreshing !== null} onClick={() => void refreshMarket("lhb")}>
                 {refreshing === "lhb" ? "刷新中…" : "刷新"}
               </button>
@@ -1882,7 +1988,7 @@ function MarketPage({
           title="行业资金流"
           action={
             <div className="card-action-group">
-              {flow && <span className="meta">{flow.date} · {flow.source}</span>}
+              {flow && <span className="meta">{flow.date} · {flow.source}{flow.fallback_used ? " · 最近可用交易日" : ""}</span>}
               <button className="text-button" disabled={refreshing !== null} onClick={() => void refreshMarket("industry_flow")}>
                 {refreshing === "industry_flow" ? "刷新中…" : "刷新"}
               </button>
@@ -2017,7 +2123,7 @@ function MarketPage({
           </Card>
         )}
       </div>
-      <section className="market-assistant-panel" aria-label="专家风格行情报告">
+      <section className="market-assistant-panel" aria-label="大盘议事厅">
         <ResearchAssistant
           selected={marketOverviewSubject}
           scene="market"
@@ -2251,8 +2357,30 @@ function EditableNotes({
 function FinancialTable({ financials }: { financials: Financials | null }) {
   if (!financials?.periods.length)
     return <p className="empty">尚无已归档的结构化财务指标。</p>;
+  const chronological = [...financials.periods].reverse();
+  const latest = financials.periods[0];
   return (
     <>
+      <div className="financial-trend-grid" aria-label="历史财务趋势">
+        {[
+          ["ROE", chronological.map((row) => row.roe), latest.roe, "action"],
+          ["毛利率", chronological.map((row) => row.gross_margin), latest.gross_margin, "warning"],
+          ["资产负债率", chronological.map((row) => row.debt_asset_ratio), latest.debt_asset_ratio, "down"],
+          ["自由现金流", chronological.map((row) => row.free_cash_flow), latest.free_cash_flow, "up"],
+        ].map(([label, values, current, chartTone]) => (
+          <div className="financial-trend" key={label as string}>
+            <span>{label as string}</span>
+            <strong className="mono">
+              {label === "自由现金流" ? amountYi(current as number | null) : percent(current as number | null)}
+            </strong>
+            <MiniLineChart
+              values={values as Array<number | null>}
+              label={`${label as string} 历史趋势`}
+              toneClass={chartTone as "action" | "up" | "down" | "warning"}
+            />
+          </div>
+        ))}
+      </div>
       <div className="table-wrap">
         <table className="data-table">
           <thead>
@@ -2310,6 +2438,12 @@ function FundSecurity({
   const fund = workspace?.fund;
   const latest = fund?.nav_history[0];
   const events = fund?.nav_history.filter((item) => item.event) ?? [];
+  const chronologicalNav = [...(fund?.nav_history ?? [])].reverse();
+  let peak = 0;
+  const sampleDrawdown = chronologicalNav.reduce((worst, row) => {
+    peak = Math.max(peak, row.nav);
+    return peak > 0 ? Math.min(worst, (row.nav / peak - 1) * 100) : worst;
+  }, 0);
   return (
     <>
       <PageHeader
@@ -2355,9 +2489,21 @@ function FundSecurity({
           <span>买入金额 {invested(selected.invested_amount_cny)}</span>
           <span>截止 {fund?.cutoff_date ?? day(selected.trade_date)}</span>
         </div>
+        <div className="fund-return-strip" aria-label="基金区间表现">
+          {Object.entries(fund?.returns ?? {}).map(([label, value]) => (
+            <span key={label}><small>{label}</small><b className={`mono ${tone(value)}`}>{percent(value)}</b></span>
+          ))}
+          {chronologicalNav.length > 1 && (
+            <span><small>近 {chronologicalNav.length} 个净值样本最大回撤</small><b className="mono down">{percent(sampleDrawdown)}</b></span>
+          )}
+        </div>
       </div>
       <div className="fund-layout">
         <Card title="近期净值" className="fund-nav-history">
+          <div className="fund-nav-chart">
+            <div><span className="insight-label">单位净值走势</span><small>最近 {chronologicalNav.length} 个已披露样本</small></div>
+            <MiniLineChart values={chronologicalNav.map((row) => row.nav)} label="近期单位净值走势" toneClass="action" />
+          </div>
           <div className="table-wrap">
             <table className="data-table compact-table">
               <thead>
@@ -2384,7 +2530,16 @@ function FundSecurity({
             <p className="empty">尚无日期校验通过的基金净值。</p>
           )}
         </Card>
-        <Card title="基金费用">
+        <Card title="基金规模与费用">
+          {fund?.scale_history?.length ? (
+            <div className="fund-scale-trend">
+              <div>
+                <span className="insight-label">最近披露规模</span>
+                <strong className="mono">{fund.scale_history[fund.scale_history.length - 1]?.size_yi.toFixed(2)} 亿元</strong>
+              </div>
+              <MiniLineChart values={fund.scale_history.map((row) => row.size_yi)} label="基金规模历史趋势" toneClass="warning" />
+            </div>
+          ) : <p className="empty compact-empty">尚无可核验的历史规模序列。</p>}
           <dl className="source-list">
             <div>
               <dt>管理费</dt>
@@ -3306,7 +3461,7 @@ function ResearchAssistant({
     setText("");
     setSavedEvent("");
     await loadThreads();
-    setNotice("旧对话已清空；后续提问会创建独立对话");
+    setNotice(scene === "market" ? "本轮议事记录已清空；下次生成会开启新议题" : "旧对话已清空；后续提问会创建独立对话");
   };
   const send = async (
     contentOverride?: string,
@@ -3360,7 +3515,7 @@ function ResearchAssistant({
           setThread(detail);
           if (detail.active_run?.status !== "running") {
             if (detail.active_run?.status === "failed")
-              setNotice("本轮投委会未能完成，已保留当前研究进度。");
+              setNotice("本轮投研委员会未能完成，已保留当前研究进度。");
             break;
           }
           await new Promise((resolve) => window.setTimeout(resolve, 800));
@@ -3388,15 +3543,19 @@ function ResearchAssistant({
   };
   if (!selected) return <p className="empty">添加持仓后可开始研究对话。</p>;
   const role = roles.find((item) => item.role_id === roleId);
+  const marketRole = roles.find((item) => item.role_id === marketStyle);
+  const roomPersona = scene === "market"
+    ? marketStyle === "committee" ? { name: "投研委员会", id: "market-committee" } : { name: marketRole?.name ?? "大盘主持人", id: marketStyle }
+    : mode === "committee" ? { name: "投研委员会", id: "research-committee" } : { name: role?.name ?? "投研大师", id: roleId };
   const marketNoteTitle = (event: ChatEvent) => {
     if (scene !== "market" || !marketStage) return undefined;
     const [year, month, dayOfMonth] = marketStage.report_date.split("-").map(Number);
     const dateLabel = `${year}年${month}月${dayOfMonth}日`;
     if (thread?.thread_type === "committee" && event.event_type !== "report.completed")
-      return `${dateLabel} ${marketStage.session}报告（投委会模式）${event.payload.role_name || "专家"}结论`;
+      return `${dateLabel} ${marketStage.session}报告（投研委员会）${event.payload.role_name || "专家"}结论`;
     const styleName = thread?.thread_type === "committee"
-      ? "投委会"
-      : event.payload.role_name || roles.find((item) => item.role_id === marketStyle)?.name || "研究助手";
+      ? "投研委员会"
+      : event.payload.role_name || roles.find((item) => item.role_id === marketStyle)?.name || "投研大师";
     return `${dateLabel} ${marketStage.session}报告（${styleName}）最终稿`;
   };
   const excerpt = async (event: ChatEvent) => {
@@ -3413,7 +3572,7 @@ function ResearchAssistant({
       ? `\n\n来源\n${event.payload.sources.map((item) => `- ${item.name}${item.as_of ? `（截至 ${item.as_of}）` : ""}${item.url ? ` ${item.url}` : ""}`).join("\n")}`
       : "";
     await saveNote(
-      `${scene === "market" && marketStage ? `行情阶段\n${marketStage.label}\n\n` : ""}问题\n${question}\n\n${event.payload.role_name || "研究助手"}\n${cleanAssistantText(event.payload.content)}${sources}`,
+      `${scene === "market" && marketStage ? `行情阶段\n${marketStage.label}\n\n` : ""}问题\n${question}\n\n${event.payload.role_name || "投研大师"}\n${cleanAssistantText(event.payload.content)}${sources}`,
       marketNoteTitle(event),
       scene === "market" ? marketStage?.session : undefined,
     );
@@ -3422,23 +3581,26 @@ function ResearchAssistant({
   return (
     <section className="chat-main">
       <div className="assistant-titlebar">
-        <div>
-          <strong>
-            {scene === "market"
-              ? "专家风格行情报告"
-              : mode === "committee"
-                ? "AI 投资委员会"
-                : "AI 研究助手"}
-          </strong>
-          <span>
-            {scene === "market"
-              ? `当前报告阶段：${marketStage?.label ?? "更新市场数据后自动识别"}；仅生成大盘行情报告并结合本地持仓给出条件化观察建议`
-              : mode === "committee"
-              ? "深度报告模式；简单问题请用普通助手"
-              : "仅回答投资问题；每次提问独立分析，不自动带入旧对话"}
-          </span>
+        <div className="assistant-identity">
+          <RoleAvatar name={roomPersona.name} identity={roomPersona.id} />
+          <div>
+            <strong>
+              {scene === "market"
+                ? "大盘议事厅"
+                : mode === "committee"
+                  ? "投研委员会"
+                  : "投研大师"}
+            </strong>
+            <span>
+              {scene === "market"
+                ? `${marketStage?.label ?? "刷新后自动识别时段"} · 让不同研究视角围绕指数、资金与持仓同桌发言`
+                : mode === "committee"
+                ? "六位互补委员先核证、再交锋，最后留下共识、分歧和复核条件"
+                : `${roomPersona.name}已就席 · 每个问题都从当前标的证据重新出发`}
+            </span>
+          </div>
         </div>
-        {scene === "security" && <div className="button-row">
+        <div className="button-row">
           {thread && (
             <button className="text-button" onClick={() => void clearThread()}>
               清空对话
@@ -3454,9 +3616,11 @@ function ResearchAssistant({
           >
             新对话
           </button>
-        </div>}
+        </div>
       </div>
-      {scene === "security" && <div className="chat-mode-picker" role="tablist" aria-label="聊天模式">
+      {scene === "security" && <div className="chat-mode-picker" role="tablist" aria-label="投研方式">
+        <div className="mode-picker-copy"><strong>选择研讨方式</strong><span>一位大师聚焦回答，或由委员会展开多视角审议</span></div>
+        <div className="mode-picker-actions">
         <button
           className={mode === "assistant" ? "selected" : "secondary"}
           onClick={() => {
@@ -3466,7 +3630,7 @@ function ResearchAssistant({
             setText("");
           }}
         >
-          普通助手
+          投研大师
         </button>
         <button
           className={mode === "committee" ? "selected" : "secondary"}
@@ -3477,29 +3641,34 @@ function ResearchAssistant({
             setText("");
           }}
         >
-          投委会
+          投研委员会
         </button>
+        </div>
       </div>}
       {scene === "market" ? (
         <div className="market-report-controls">
+          <div className="report-control-copy">
+            <strong>召集本时段议题</strong>
+            <span>系统先刷新全部市场资料，再由主持席自动生成报告，无需输入问题。</span>
+          </div>
           <label>
-            <span>专家风格</span>
+            <span>主持席</span>
             <select value={marketStyle} onChange={(event) => setMarketStyle(event.target.value)}>
-              <option value="committee">投委会风格</option>
+              <option value="committee">投研委员会 · 六席会审</option>
               {roles.filter((item) => item.role_id !== "general").map((item) => (
                 <option key={item.role_id} value={item.role_id}>{item.name}</option>
               ))}
             </select>
           </label>
-          <button disabled={busy} onClick={() => void generateMarketReport()}>
-            {busy ? "正在生成…" : "生成最新行情报告"}
+          <button className="room-primary-action" disabled={busy} onClick={() => void generateMarketReport()}>
+            {busy ? "议事厅正在整理观点…" : "开始本时段议事"}
           </button>
         </div>
       ) : (
         <div className={thread ? "role-picker compact" : "role-picker"}>
           {mode === "assistant" ? (
             <label>
-              <span>投资专家</span>
+              <span>本轮就席大师</span>
               <select
                 value={roleId}
                 onChange={(event) => setRoleId(event.target.value)}
@@ -3513,10 +3682,8 @@ function ResearchAssistant({
             </label>
           ) : (
             <div className="committee-routing">
-              <strong>协调员自动选角</strong>
-              <span>
-                按 stock-analysis 的问题匹配规则，在 15 位投资专家中选择 6 位互补委员。
-              </span>
+              <RoleAvatar name="协调员" identity="coordinator" />
+              <div><strong>协调员自动排席</strong><span>依据研究问题，从 15 位投资专家中邀请 6 位互补委员。</span></div>
             </div>
           )}
           {scene === "security" && mode === "assistant" && role && <p>{role.focus}</p>}
@@ -3525,7 +3692,10 @@ function ResearchAssistant({
       <div className="chat-timeline" ref={timelineRef} aria-live="polite">
         {!thread?.events.length && (
           scene === "market" ? (
-            <p className="empty">生成当前市场行情报告。助手会区分盘前、盘中和盘后数据，并基于本地账本说明持仓暴露与下一步观察条件。</p>
+            <div className="market-room-empty">
+              <RoleAvatar name={roomPersona.name} identity={roomPersona.id} />
+              <div><strong>{roomPersona.name}正在候场</strong><p>点击“开始本时段议事”，议事厅会先核对盘前、盘中或盘后资料，再围绕指数、资金方向与本地持仓形成一份可摘录报告。</p></div>
+            </div>
           ) : mode === "committee" ? (
             <div className="committee-empty-state">
               <div>
@@ -3533,7 +3703,7 @@ function ResearchAssistant({
                 <strong>从证据开始，而不是从结论开始</strong>
                 <p>协调员会拆解问题、核对本地证据、选择 6 位互补委员，最后保留共识、分歧与数据缺口。</p>
               </div>
-              <ol aria-label="投委会研究步骤">
+              <ol aria-label="投研委员会研究步骤">
                 <li><b>01</b><span>制定计划与证据清单</span></li>
                 <li><b>02</b><span>并行审议与反方检查</span></li>
                 <li><b>03</b><span>汇总条件化深度报告</span></li>
@@ -3555,7 +3725,7 @@ function ResearchAssistant({
                 <strong>让问题落到已归档证据上</strong>
                 <p>{role?.name ?? "通用模式"}会围绕当前标的组织事实、判断与缺口；每次提问独立分析，不自动沿用旧结论。</p>
               </div>
-              <ol aria-label="普通助手证据范围">
+              <ol aria-label="投研大师证据范围">
                 <li><b>01</b><span>已归档行情</span></li>
                 <li><b>02</b><span>关联资料与财务</span></li>
                 <li><b>03</b><span>历史笔记与待验证项</span></li>
@@ -3584,7 +3754,7 @@ function ResearchAssistant({
                 risk_review: "正在审查风险与组合影响",
                 reporting: "正在生成最终深度报告",
               } as Record<string, string>
-            )[thread.active_run.current_stage] || "投委会正在研究"}
+            )[thread.active_run.current_stage] || "投研委员会正在研究"}
           </div>
         )}
         {thread?.events.map((event) =>
@@ -3593,6 +3763,7 @@ function ResearchAssistant({
               className={`context-event ${event.event_type.endsWith(".started") ? "running" : ""}`}
               key={event.event_id}
             >
+              <RoleAvatar name={workflowSpeaker(event)} identity={event.actor_id || event.event_type} />
               <header>
                 {event.event_type === "planning.started"
                   ? "协调员正在拆解问题"
@@ -3605,7 +3776,7 @@ function ResearchAssistant({
                         : event.event_type === "reporting.started"
                           ? "报告编辑器正在生成深度报告"
                           : event.event_type === "workflow.failed"
-                            ? "本轮投委会未完成"
+                            ? "本轮投研委员会未完成"
                             : event.event_type === "routing.completed"
                               ? "协调员已完成问题分流"
                               : event.event_type === "plan.completed"
@@ -3621,14 +3792,14 @@ function ResearchAssistant({
                                         : "研究资料已更新"}
               </header>
               {Boolean(event.payload.assignments?.length) && (
-                <p>
-                  研究小组：
-                  {event.payload
-                    .assignments!.map(
-                      (item) => `${item.name}（${item.function}）`,
-                    )
-                    .join("、")}
-                </p>
+                <div className="role-roster" aria-label="本轮研究委员">
+                  {event.payload.assignments!.map((item) => (
+                    <span className="role-chip" key={`${item.name}-${item.function}`}>
+                      <RoleAvatar name={item.name} identity={item.name} />
+                      <span><b>{item.name}</b><small>{item.function}</small></span>
+                    </span>
+                  ))}
+                </div>
               )}
               {!event.payload.assignments?.length &&
                 Boolean(event.payload.selected_roles?.length) && (
@@ -3669,11 +3840,15 @@ function ResearchAssistant({
               className={`chat-message ${event.actor_type} ${event.event_type === "report.completed" ? "report" : ""}`}
               key={event.event_id}
             >
+              <RoleAvatar
+                name={event.actor_type === "user" ? "我" : event.payload.role_name || "投研大师"}
+                identity={event.actor_type === "user" ? "vault-owner" : event.actor_id}
+              />
               <header>
                 <span>
                   {event.actor_type === "user"
                     ? "你"
-                    : event.payload.role_name || "研究助手"}
+                    : event.payload.role_name || "投研大师"}
                 </span>
                 {event.actor_type === "assistant" && saveNote && (
                   <button
@@ -3745,7 +3920,7 @@ function ResearchAssistant({
         <button disabled={busy || !text.trim()} onClick={() => void send()}>
           {busy
             ? mode === "committee"
-              ? "投委会研究中…"
+              ? "委员会研讨中…"
               : "正在分析…"
             : "发送"}
         </button>
@@ -3890,7 +4065,7 @@ function SecurityWorkbench({
         >
           <span />
         </div>
-        <aside className="security-assistant-pane" aria-label="AI 研究助手">
+        <aside className="security-assistant-pane" aria-label="投研大师">
           <ResearchAssistant selected={selected} saveNote={saveNote} />
         </aside>
       </div>
@@ -3904,6 +4079,8 @@ function SettingsPage() {
   const [models, setModels] = useState<AIModel[]>([]);
   const [providers, setProviders] = useState<AIProviderOption[]>([]);
   const [providerKeys, setProviderKeys] = useState<Record<string, string>>({});
+  const [engineVersion, setEngineVersion] = useState<ResearchEngineVersion | null>(null);
+  const [engineMessage, setEngineMessage] = useState("尚未核对上游版本");
   const [message, setMessage] = useState("正在读取 Provider 状态…");
   const [busy, setBusy] = useState(false);
   const load = async () => {
@@ -3929,7 +4106,18 @@ function SettingsPage() {
       setMessage(error instanceof Error ? error.message : "Codex 状态暂不可用，仍可配置 API key");
     }
   };
-  useEffect(() => { void load(); }, []);
+  const checkEngineVersion = async () => {
+    try {
+      const result = await api<ResearchEngineVersion>("/api/research-engine/version");
+      setEngineVersion(result);
+      setEngineMessage(result.update_available
+        ? `发现上游 ${result.latest_version}；请通过新版应用更新，当前不会替换正在运行的代码。`
+        : "内置研究引擎已是最新正式版。");
+    } catch (error) {
+      setEngineMessage(error instanceof Error ? error.message : "暂时无法核对上游版本");
+    }
+  };
+  useEffect(() => { void load(); void checkEngineVersion(); }, []);
   const login = async () => {
     setBusy(true);
     try {
@@ -3997,8 +4185,8 @@ function SettingsPage() {
   };
   const taskLabels: Array<[AIModelTask, string, string]> = [
     ["quick_note", "AI 速记", "整理原始投资笔记"],
-    ["research", "研究助手", "单专家问答与市场报告"],
-    ["committee", "投委会", "六人审议与深度报告"],
+    ["research", "投研大师", "单专家对谈与大盘议事"],
+    ["committee", "投研委员会", "六位委员审议与深度报告"],
   ];
   return <>
     <PageHeader eyebrow="设置" title="AI 与模型" description="可使用本机 Codex 登录态，或为 OpenAI、Anthropic、Google、DeepSeek 配置自带 API key。" />
@@ -4050,6 +4238,24 @@ function SettingsPage() {
               </div>
             </div>
           ))}
+        </div>
+      </section>
+      <section className="card settings-account" aria-labelledby="research-engine-title">
+        <div className="card-header">
+          <div><p className="page-eyebrow">可复现运行时</p><h2 id="research-engine-title">内置研究引擎</h2></div>
+          <span className={`connection-state ${engineVersion && !engineVersion.update_available ? "is-online" : ""}`}>
+            {engineVersion?.update_available ? "有更新" : engineVersion ? "最新" : "待核对"}
+          </span>
+        </div>
+        <dl className="source-list">
+          <div><dt>内置版本</dt><dd>{engineVersion?.bundled_version || "4.14.0"}</dd></div>
+          <div><dt>上游正式版</dt><dd>{engineVersion?.latest_version || "—"}</dd></div>
+          <div><dt>更新方式</dt><dd>随 Invest Vault 新版本审核、测试并更新</dd></div>
+        </dl>
+        <p className="hint" role="status">{engineMessage}</p>
+        <div className="settings-actions">
+          <button className="secondary" onClick={() => void checkEngineVersion()}>重新核对</button>
+          {engineVersion?.release_url && <button className="text-button" onClick={() => void openUrl(engineVersion.release_url)}>查看上游版本</button>}
         </div>
       </section>
       <section className="card settings-models" aria-labelledby="model-settings-title">
@@ -4208,6 +4414,7 @@ function ConfirmDelete({
 
 export function App() {
   const [active, setActive] = useState("today");
+  const previousPage = useRef("today");
   const [data, setData] = useState<Bootstrap | null>(null);
   const [workspaces, setWorkspaces] = useState<Record<string, Workspace>>({});
   const [selectedId, setSelectedId] = useState("");
@@ -4302,6 +4509,14 @@ export function App() {
       if (dailyTimer) window.clearInterval(dailyTimer);
     };
   }, []);
+  useEffect(() => {
+    if (previousPage.current === active) return;
+    previousPage.current = active;
+    setMessage("正在刷新当前页面的行情、资料与本地记录…");
+    load(true).catch((error) =>
+      setMessage(`页面自动刷新未完成：${error instanceof Error ? error.message : String(error)}`),
+    );
+  }, [active]);
   const run = async (
     task: () => Promise<void>,
     pending: string,
@@ -4747,7 +4962,7 @@ export function App() {
         </nav>
         <div className="side-foot">
           <span className="local-dot">● 本地优先 · 数据私有</span>
-        <span>v0.3.29</span>
+        <span>v0.3.30</span>
         </div>
       </aside>
       <main id="content">

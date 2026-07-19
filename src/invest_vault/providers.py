@@ -1,4 +1,4 @@
-"""Invest Vault adapters plus the bundled stock-analysis 4.12 runtime bridge."""
+"""Invest Vault adapters plus the bundled stock-analysis 4.14 runtime bridge."""
 
 from __future__ import annotations
 
@@ -2097,8 +2097,8 @@ def fetch_market_pulse(
             "session": session,
             "kind": "holding_news",
             "news": news[:12],
-            "source": "stock-analysis 4.12.0 · 持仓公开资讯雷达",
-            "skill_version": "4.12.0",
+            "source": "stock-analysis 4.14.0 · 持仓公开资讯雷达",
+            "skill_version": "4.14.0",
         }
 
     pools = pools_loader(trade_date)
@@ -2166,8 +2166,8 @@ def fetch_market_pulse(
             else None,
             "rows": risk_rows,
         },
-        "source": "stock-analysis 4.12.0 · 东方财富涨跌停池",
-        "skill_version": "4.12.0",
+        "source": "stock-analysis 4.14.0 · 东方财富涨跌停池",
+        "skill_version": "4.14.0",
     }
 
 
