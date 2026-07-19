@@ -803,6 +803,13 @@ def test_market_page_exposes_global_manual_refresh_and_activity_fields() -> None
     assert "M3 ·" not in source
     assert "M4 ·" not in source
     assert "持仓股票 24 小时资讯" in source
+    holding_news = source[
+        source.index('title="持仓股票 24 小时资讯"') : source.index(
+            'className="holding-news-pulse"'
+        )
+    ]
+    assert 'refreshMarket("pulse")' in holding_news
+    assert 'refreshing === "pulse" ? "刷新中…" : "刷新"' in holding_news
     assert 'scene="market"' in source
     assert "更新市场数据后自动识别" in source
     assert (

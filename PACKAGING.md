@@ -12,10 +12,10 @@ uv run --extra dev --with pyinstaller python scripts/build_sidecar.py
 npx --yes @tauri-apps/cli@latest build --bundles app
 codesign --force --deep --sign - \
   "src-tauri/target/release/bundle/macos/投资札记.app"
-hdiutil create -volname "投资札记 0.3.28" \
+hdiutil create -volname "投资札记 0.3.29" \
   -srcfolder "src-tauri/target/release/bundle/macos/投资札记.app" \
   -ov -format UDZO \
-  "src-tauri/target/release/bundle/dmg/Invest-Vault_0.3.28-local-aarch64.dmg"
+  "src-tauri/target/release/bundle/dmg/Invest-Vault_0.3.29-local-aarch64.dmg"
 ```
 
 The `hdiutil` step intentionally creates a plain DMG. It avoids Finder/AppleScript automation and is suitable for an unsigned local build. Public distribution still requires Apple signing and notarization.
