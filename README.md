@@ -74,7 +74,11 @@ A 股颜色遵循红涨绿跌：净流入、涨停数量、板数与上涨主线
 
 ### 校验下载文件
 
-0.3.29 的 SHA-256 请以同一 GitHub Release 内附带的 `SHA256SUMS.txt` 为准。
+0.3.29 的 SHA-256：
+
+```text
+27405ba8fbcc50f24ada0794a3c2ee61f6517938d18b994a0d50c4f7b90a2899  Invest-Vault_0.3.29-local-aarch64.dmg
+```
 
 在“终端”中执行：
 
