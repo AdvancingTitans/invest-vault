@@ -1998,7 +1998,15 @@ function MarketPage({
           </>
         )}
         {pulse?.kind === "holding_news" && (
-          <Card className="market-holding-news-card" title="持仓股票 24 小时资讯">
+          <Card
+            className="market-holding-news-card"
+            title="持仓股票 24 小时资讯"
+            action={
+              <button className="text-button" disabled={refreshing !== null} onClick={() => void refreshMarket("pulse")}>
+                {refreshing === "pulse" ? "刷新中…" : "刷新"}
+              </button>
+            }
+          >
             <div className="holding-news-pulse">
               {pulse.news?.length ? pulse.news.map((item) => (
                 <a key={`${item.symbol}-${item.title}`} href={item.url} target="_blank" rel="noreferrer" onClick={(event) => followSource(event, item.url)}>
@@ -4739,7 +4747,7 @@ export function App() {
         </nav>
         <div className="side-foot">
           <span className="local-dot">● 本地优先 · 数据私有</span>
-        <span>v0.3.28</span>
+        <span>v0.3.29</span>
         </div>
       </aside>
       <main id="content">

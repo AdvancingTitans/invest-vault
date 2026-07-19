@@ -329,7 +329,7 @@ class CodexAppServerProvider:
             self._stderr_reader.start()
             self._request(
                 "initialize",
-                {"clientInfo": {"name": "invest_vault", "title": "Invest Vault", "version": "0.3.28"}},
+                {"clientInfo": {"name": "invest_vault", "title": "Invest Vault", "version": "0.3.29"}},
                 ensure_started=False,
             )
             self._send({"method": "initialized", "params": {}})
