@@ -92,7 +92,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if ! gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
-            gh release create "${GITHUB_REF_NAME}" --title "投资札记 ${GITHUB_REF_NAME}" --notes "macOS 包使用 ad-hoc 签名，未经过 Apple 公证。安装前请核对 SHA256SUMS.txt，并按 README 的‘隐私与安全性 → 仍要打开’步骤授权。Windows 构建尚未完成真机验收，因此不随本次 Release 发布。"
+          if ! gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release create "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" --title "投资札记 ${GITHUB_REF_NAME}" --notes "macOS 包使用 ad-hoc 签名，未经过 Apple 公证。安装前请核对 SHA256SUMS.txt，并按 README 的‘隐私与安全性 → 仍要打开’步骤授权。Windows 构建尚未完成真机验收，因此不随本次 Release 发布。"
           fi
-          gh release upload "${GITHUB_REF_NAME}" release/* --clobber
+          gh release upload "${GITHUB_REF_NAME}" release/* --repo "${GITHUB_REPOSITORY}" --clobber
