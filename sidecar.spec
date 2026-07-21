@@ -12,6 +12,7 @@ a = Analysis(
         ("web/dist", "web/dist"),
         ("skills/stock-analysis", "skills/stock-analysis"),
         ("skills/agent-reach", "skills/agent-reach"),
+        ("skills/primary-evidence-reach", "skills/primary-evidence-reach"),
     ],
     hiddenimports=hiddenimports,
     hookspath=[],

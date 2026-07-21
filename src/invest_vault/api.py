@@ -6,6 +6,7 @@ import json
 import re
 import sys
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -35,10 +36,16 @@ from .exports import create_backup, export_holdings_xlsx, export_markdown
 from .ledger import HoldingRecord, LedgerEntry, Vault, VaultSettings
 from .providers import (
     current_market_date,
+    fetch_a_share_earnings_calendar,
+    fetch_a_share_hot_themes,
+    fetch_a_share_index_overview,
     fetch_company_announcements,
+    fetch_cross_market_index_overview,
     fetch_financial_snapshot,
     fetch_fund_snapshot,
-    fetch_global_index_overview,
+    fetch_global_earnings_calendar,
+    fetch_global_market_movers,
+    fetch_global_theme_performance,
     fetch_hkex_announcements,
     fetch_industry_money_flow,
     fetch_lhb,
@@ -69,7 +76,23 @@ class RefreshPayload(BaseModel):
 
 
 class MarketRefreshPayload(BaseModel):
-    section: Literal["all", "indices", "lhb", "industry_flow", "pulse", "market_news"] = "all"
+    section: Literal[
+        "all",
+        "a_share",
+        "global",
+        "indices",
+        "global_indices",
+        "lhb",
+        "industry_flow",
+        "pulse",
+        "a_market_news",
+        "a_share_themes",
+        "a_share_earnings_calendar",
+        "global_market_news",
+        "global_market_movers",
+        "global_earnings_calendar",
+        "global_themes",
+    ] = "all"
 
 
 class LedgerImportPayload(BaseModel):
@@ -418,6 +441,8 @@ def create_app(
     def refresh_market_sections(selected: list[str]) -> tuple[list[str], dict[str, str]]:
         market_target = current_market_date(clock())
         report_stage = market_report_stage(clock())
+        with vault.lock:
+            holding_subjects = market_holding_subjects()
 
         def latest_daily_payload(
             loader: Callable[[date], dict[str, object]],
@@ -470,7 +495,7 @@ def create_app(
                 return fetch_market_pulse(
                     requested,
                     session=session,
-                    holdings=market_holding_subjects(),
+                    holdings=holding_subjects,
                     now=clock(),
                 )
 
@@ -478,7 +503,7 @@ def create_app(
                 return fetch_market_pulse(
                     candidate,
                     session=session if candidate == requested else "盘后",
-                    holdings=market_holding_subjects(),
+                    holdings=holding_subjects,
                     now=clock(),
                 )
 
@@ -491,29 +516,78 @@ def create_app(
             )
 
         loaders: dict[str, Callable[[], dict[str, object]]] = {
-            "indices": fetch_global_index_overview,
+            "indices": fetch_a_share_index_overview,
+            "global_indices": fetch_cross_market_index_overview,
             "lhb": load_lhb,
             "industry_flow": load_industry_flow,
-            "market_news": lambda: fetch_market_news(now=clock()),
+            "a_market_news": lambda: fetch_market_news(
+                now=clock(), regions=("A股",), max_age_hours=None
+            ),
+            "a_share_themes": fetch_a_share_hot_themes,
+            "a_share_earnings_calendar": fetch_a_share_earnings_calendar,
+            "global_market_news": lambda: fetch_market_news(
+                now=clock(), size=8, regions=("港股", "日股", "韩股", "美股")
+            ),
+            "global_market_movers": fetch_global_market_movers,
+            "global_earnings_calendar": fetch_global_earnings_calendar,
+            "global_themes": fetch_global_theme_performance,
             "pulse": load_pulse,
         }
         completed: list[str] = []
         failed: dict[str, str] = {}
-        for section in selected:
+        payloads: dict[str, dict[str, object]] = {}
+
+        def load_section(section: str) -> tuple[str, dict[str, object]]:
+            return section, loaders[section]()
+
+        # Eastmoney-backed modules stay in one serial lane. Independent Tencent,
+        # TradingView and RSS modules may overlap so a page refresh is bounded by
+        # the slowest source instead of the sum of every source latency.
+        serial_sections = [
+            section
+            for section in selected
+            if section in {"lhb", "industry_flow", "pulse", "a_share_themes", "a_share_earnings_calendar"}
+        ]
+        parallel_sections = [section for section in selected if section not in serial_sections]
+        if len(parallel_sections) > 1:
+            with ThreadPoolExecutor(max_workers=min(6, len(parallel_sections))) as executor:
+                futures = {executor.submit(load_section, section): section for section in parallel_sections}
+                for future in as_completed(futures):
+                    section = futures[future]
+                    try:
+                        _, payloads[section] = future.result()
+                    except Exception as error:
+                        failed[section] = str(error)
+        else:
+            for section in parallel_sections:
+                try:
+                    payloads[section] = loaders[section]()
+                except Exception as error:
+                    failed[section] = str(error)
+        for section in serial_sections:
             try:
-                payload = loaders[section]()
+                payloads[section] = loaders[section]()
+            except Exception as error:
+                failed[section] = str(error)
+
+        for section in selected:
+            payload = payloads.get(section)
+            if payload is None:
+                continue
+            try:
                 snapshot_date = str(payload.get("date") or market_target.isoformat())
-                vault.connection.execute(
-                    "INSERT OR REPLACE INTO market_snapshots VALUES (?, ?, ?, ?, ?)",
-                    (
-                        section,
-                        snapshot_date,
-                        str(payload.get("source") or "公开行情"),
-                        json.dumps(payload, ensure_ascii=False),
-                        datetime.now(timezone.utc).isoformat(),
-                    ),
-                )
-                vault.connection.commit()
+                with vault.lock:
+                    vault.connection.execute(
+                        "INSERT OR REPLACE INTO market_snapshots VALUES (?, ?, ?, ?, ?)",
+                        (
+                            section,
+                            snapshot_date,
+                            str(payload.get("source") or "公开行情"),
+                            json.dumps(payload, ensure_ascii=False),
+                            datetime.now(timezone.utc).isoformat(),
+                        ),
+                    )
+                    vault.connection.commit()
                 completed.append(section)
             except Exception as error:
                 failed[section] = str(error)
@@ -696,7 +770,22 @@ def create_app(
                 research.mark_materials_synced(security_id, target)
 
         if refresh_market:
-            refresh_market_sections(["indices", "lhb", "industry_flow", "pulse", "market_news"])
+            refresh_market_sections(
+                [
+                    "indices",
+                    "global_indices",
+                    "lhb",
+                    "industry_flow",
+                    "pulse",
+                    "a_market_news",
+                    "a_share_themes",
+                    "a_share_earnings_calendar",
+                    "global_market_news",
+                    "global_market_movers",
+                    "global_earnings_calendar",
+                    "global_themes",
+                ]
+            )
         return target
 
     @asynccontextmanager
@@ -707,7 +796,7 @@ def create_app(
         with vault.lock:
             vault.close()
 
-    app = FastAPI(title="投资札记", version="0.3.31", lifespan=lifespan)
+    app = FastAPI(title="投资札记", version="0.3.34", lifespan=lifespan)
 
     @app.get("/api/data-quality/{security_id:path}")
     def data_quality(security_id: str) -> dict[str, object]:
@@ -1075,6 +1164,13 @@ def create_app(
         except ValueError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
 
+    @app.post("/api/ai/chats/{thread_id}/cancel")
+    def cancel_ai_chat(thread_id: str) -> dict[str, object]:
+        try:
+            return chats.cancel(thread_id)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+
     @app.post("/api/ai/chats/{thread_id}/messages")
     def send_ai_chat_message(thread_id: str, payload: ChatMessagePayload) -> dict[str, object]:
         try:
@@ -1111,12 +1207,35 @@ def create_app(
     @app.post("/api/market/refresh")
     def refresh_market(payload: MarketRefreshPayload) -> dict[str, object]:
         selected = (
-            ["indices", "lhb", "industry_flow", "pulse", "market_news"]
+            [
+                "indices",
+                "global_indices",
+                "lhb",
+                "industry_flow",
+                "pulse",
+                "a_market_news",
+                "a_share_themes",
+                "a_share_earnings_calendar",
+                "global_market_news",
+                "global_market_movers",
+                "global_earnings_calendar",
+                "global_themes",
+            ]
             if payload.section == "all"
+            else ["indices", "lhb", "industry_flow", "pulse", "a_market_news", "a_share_themes", "a_share_earnings_calendar"]
+            if payload.section == "a_share"
+            else [
+                "global_indices",
+                "global_market_news",
+                "global_market_movers",
+                "global_earnings_calendar",
+                "global_themes",
+            ]
+            if payload.section == "global"
             else [payload.section]
         )
+        completed, failed = refresh_market_sections(selected)
         with vault.lock:
-            completed, failed = refresh_market_sections(selected)
             market = _latest_market_snapshots(vault)
             market["report_stage"] = market_report_stage(clock())
             retained = [section for section in failed if section in market]

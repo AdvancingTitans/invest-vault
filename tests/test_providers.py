@@ -1,16 +1,25 @@
 import json
 import re
 import urllib.parse
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
+import pytest
+
 from invest_vault.providers import (
+    fetch_a_share_earnings_calendar,
+    fetch_a_share_hot_themes,
+    fetch_a_share_index_overview,
     fetch_a_share_market_breadth,
     fetch_company_supplemental_evidence,
+    fetch_cross_market_index_overview,
     fetch_financial_snapshot,
     fetch_fund_nav_close,
+    fetch_global_earnings_calendar,
     fetch_global_index_overview,
     fetch_global_index_price_volume,
+    fetch_global_market_movers,
+    fetch_global_theme_performance,
     fetch_industry_money_flow,
     fetch_market_news,
     fetch_market_pulse,
@@ -295,6 +304,182 @@ def test_global_index_overview_keeps_all_thirteen_closes_and_activity_fields() -
     assert {row["trade_date"] for row in result["rows"]} == {"2026-07-17"}
 
 
+def test_cross_market_overview_balances_hk_jp_kr_us_with_per_market_dates() -> None:
+    tencent_rows = []
+    for code, name in (
+        ("hkHSI", "恒生指数"),
+        ("hkHSTECH", "恒生科技指数"),
+        ("usINX", "标普500"),
+        ("usIXIC", "纳斯达克"),
+    ):
+        fields = [""] * 66
+        fields[1], fields[3], fields[4], fields[6] = name, "100", "99", "12345"
+        fields[30], fields[31], fields[32], fields[37] = "20260717150000", "1", "1.01", "23456"
+        tencent_rows.append(f'v_{code}="{"~".join(fields)}";')
+
+    yahoo_payload = json.dumps({
+        "chart": {
+            "result": [{
+                "timestamp": [1752739200, 1752825600],
+                "indicators": {"quote": [{"close": [40000, 40400], "volume": [1000, 1100]}]},
+            }]
+        }
+    }).encode()
+    naver_payloads = {
+        "KOSPI": b'[["20260716", 1, 1, 1, 3200, 100], ["20260717", 1, 1, 1, 3232, 120]]',
+        "KOSDAQ": b'[["20260716", 1, 1, 1, 800, 200], ["20260717", 1, 1, 1, 792, 220]]',
+    }
+
+    def request(url: str) -> bytes:
+        if "qt.gtimg.cn" in url:
+            return "\n".join(tencent_rows).encode("gbk")
+        if "query1.finance.yahoo.com" in url:
+            return yahoo_payload
+        if "api.finance.naver.com" in url:
+            symbol = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)["symbol"][0]
+            return naver_payloads[symbol]
+        raise AssertionError(url)
+
+    result = fetch_cross_market_index_overview(
+        request=request,
+        now_provider=lambda: datetime(2026, 7, 17, 7, 0, tzinfo=timezone.utc),
+        scan=lambda *_: {
+            "data": [{"s": "TVC:NI225", "d": ["NI225", "Japan 225 Index", 40400, 1, "JPY"]}]
+        },
+    )
+
+    by_market = {
+        market: [row for row in result["rows"] if row["market"] == market]
+        for market in ("HK", "JP", "KR", "US")
+    }
+    assert {market: len(rows) for market, rows in by_market.items()} == {
+        "HK": 2, "JP": 1, "KR": 2, "US": 2,
+    }
+    assert {row["currency"] for row in by_market["JP"]} == {"JPY"}
+    assert {row["currency"] for row in by_market["KR"]} == {"KRW"}
+    assert all(row["trade_date"] for row in result["rows"])
+    assert result["gaps"] == []
+
+
+def test_nikkei_uses_verified_tradingview_change_and_does_not_show_topix() -> None:
+    tencent_rows = []
+    for code, name in (("hkHSI", "恒生指数"), ("hkHSTECH", "恒生科技指数"), ("usINX", "标普500"), ("usIXIC", "纳斯达克")):
+        fields = [""] * 66
+        fields[1], fields[3], fields[4], fields[6] = name, "100", "99", "12345"
+        fields[30], fields[31], fields[32], fields[37] = "20260720150000", "1", "1.01", "23456"
+        tencent_rows.append(f'v_{code}="{"~".join(fields)}";')
+
+    def request(url: str) -> bytes:
+        if "qt.gtimg.cn" in url:
+            return "\n".join(tencent_rows).encode("gbk")
+        if "api.finance.naver.com" in url:
+            return b'[["20260717", 1, 1, 1, 100, 100], ["20260720", 1, 1, 1, 101, 120]]'
+        raise AssertionError(url)
+
+    result = fetch_cross_market_index_overview(
+        request=request,
+        now_provider=lambda: datetime(2026, 7, 20, 8, tzinfo=timezone.utc),
+        scan=lambda *_: {"data": [{"s": "TVC:NI225", "d": ["NI225", "Japan 225 Index", 64141.12, -4.03, "JPY"]}]},
+    )
+    japan = [row for row in result["rows"] if row["market"] == "JP"]
+    assert [(row["name"], row["close"], round(row["change_percent"], 2)) for row in japan] == [
+        ("日经225", 64141.12, -4.03)
+    ]
+    assert all(row["name"] != "东证指数" for row in result["rows"])
+
+
+def test_global_movers_themes_and_monthly_earnings_keep_four_market_coverage() -> None:
+    def now() -> datetime:
+        return datetime(2026, 7, 20, 8, tzinfo=timezone.utc)
+
+    def movers_scan(market: str, _payload: dict[str, object]) -> dict[str, object]:
+        symbol = {"hongkong": "HKEX:700", "japan": "TSE:285A", "korea": "KRX:000660", "america": "NASDAQ:MU"}[market]
+        return {"data": [{"s": symbol, "d": [symbol, f"{market} leader", 100, 5, 1000, "USD", 2_000_000_000_000]}]}
+
+    movers = fetch_global_market_movers(scan=movers_scan, now_provider=now)
+    assert [item["region"] for item in movers["markets"] if item["rows"]] == ["HK", "JP", "KR", "US"]
+
+    def theme_scan(_market: str, payload: dict[str, object]) -> dict[str, object]:
+        tickers = payload["symbols"]["tickers"]  # type: ignore[index]
+        return {"data": [{"s": ticker, "d": [ticker, ticker, 100, 2, "USD"]} for ticker in tickers]}
+
+    themes = fetch_global_theme_performance(scan=theme_scan, now_provider=now)
+    storage = next(item for item in themes["rows"] if item["name"] == "存储与存储芯片")
+    assert storage["available_markets"] == ["HK", "JP", "KR", "US"]
+
+    release = datetime(2026, 7, 25, tzinfo=timezone.utc).timestamp()
+    earnings = fetch_global_earnings_calendar(
+        scan=lambda market, _payload: {"data": [{"s": f"{market}:ONE", "d": ["ONE", f"{market} company", release, 2_000_000_000_000, "USD"]}]},
+        now_provider=now,
+    )
+    assert [item["region"] for item in earnings["markets"] if item["rows"]] == ["HK", "JP", "KR", "US"]
+
+
+def test_a_share_themes_and_earnings_keep_source_scope_and_current_month() -> None:
+    def now() -> datetime:
+        return datetime(2026, 7, 20, 8, tzinfo=timezone.utc)
+    theme_payload = {
+        "data": {
+            "diff": [
+                {"f12": "980138", "f14": "存储芯片", "f2": 2877.93, "f3": 3.2}
+            ]
+        }
+    }
+    themes = fetch_a_share_hot_themes(
+        request=lambda _url: json.dumps(theme_payload).encode(), now_provider=now
+    )
+    assert len(themes["rows"]) == 6
+    assert themes["rows"][0] == {
+        "code": "BK1036", "name": "半导体", "change_percent": None,
+        "close": None, "available": False,
+    }
+    assert themes["rows"][1]["name"] == "存储芯片"
+    assert themes["rows"][1]["close"] == 2877.93
+    assert themes["rows"][1]["available"] is True
+    assert "固定展示半导体" in themes["scope_note"]
+
+    domestic_payload = {
+        "result": {
+            "data": [
+                {
+                    "SECUCODE": "600000.SH",
+                    "SECURITY_NAME_ABBR": "浦发银行",
+                    "APPOINT_PUBLISH_DATE": "2026-07-25 00:00:00",
+                    "REPORT_TYPE_NAME": "2026年 半年报",
+                }
+            ]
+        }
+    }
+    earnings = fetch_a_share_earnings_calendar(
+        request=lambda _url: json.dumps(domestic_payload).encode(),
+        scan=lambda *_: (_ for _ in ()).throw(AssertionError("国内预约表可用时不应调用备用源")),
+        now_provider=now,
+    )
+    assert earnings["month"] == "2026-07"
+    assert earnings["rows"][0]["release_date"] == "2026-07-25"
+    assert earnings["source"] == "东方财富 A股财报预约表"
+
+
+def test_verified_us_indices_do_not_invent_index_volume() -> None:
+    scan_rows = [
+        {"s": "TVC:NI225", "d": ["NI225", "Japan 225 Index", 64141.12, -4.03, "JPY"]},
+        {"s": "SP:SPX", "d": ["SPX", "S&P 500", 7505.26, 0.64, "USD"]},
+        {"s": "NASDAQ:IXIC", "d": ["IXIC", "Nasdaq Composite", 25520.24, -1.40, "USD"]},
+    ]
+    result = fetch_cross_market_index_overview(
+        request=lambda url: (
+            b'v_hkHSI="";\nv_hkHSTECH="";\nv_usINX="";\nv_usIXIC="";'
+            if "qt.gtimg.cn" in url
+            else b'[["20260720", 1, 1, 1, 100, 100]]'
+        ),
+        now_provider=lambda: datetime(2026, 7, 20, 18, tzinfo=timezone.utc),
+        scan=lambda *_: {"data": scan_rows},
+    )
+    us_rows = [row for row in result["rows"] if row["market"] == "US"]
+    assert len(us_rows) == 2
+    assert all(row["volume"] is None for row in us_rows)
+
+
 def test_global_index_overview_keeps_live_values_and_labels_the_active_session() -> None:
     from invest_vault.providers import GLOBAL_INDEX_CODES
 
@@ -317,7 +502,7 @@ def test_global_index_overview_keeps_live_values_and_labels_the_active_session()
         assert "qt.gtimg.cn" in url
         return quote_payload
 
-    result = fetch_global_index_overview(
+    result = fetch_a_share_index_overview(
         request=request,
         now_provider=lambda: datetime(2026, 7, 20, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
     )
@@ -504,7 +689,7 @@ def test_market_pulse_uses_stock_analysis_limit_pools_for_m3_and_m4() -> None:
     )
 
     assert result["kind"] == "limit_pools"
-    assert result["skill_version"] == "4.14.0"
+    assert result["skill_version"] == "4.15.0"
     assert result["m3"] == {
         "available": True,
         "limit_up_count": 2,
@@ -557,7 +742,7 @@ def test_premarket_pulse_shows_only_holding_news_from_the_last_24_hours() -> Non
 
 def test_market_news_is_bounded_recent_deduplicated_and_market_wide() -> None:
     def news_loader(keyword: str, *, size: int = 10) -> dict[str, object]:
-        assert size == 20
+        assert size == 30
         rows = {
             "A股": [
                 {
@@ -596,7 +781,8 @@ def test_market_news_is_bounded_recent_deduplicated_and_market_wide() -> None:
                 },
             ],
         }
-        return {"items": rows[keyword]}
+        region = "A股" if keyword in {"A股大盘", "A股市场", "沪深股市"} else keyword
+        return {"items": rows[region]}
 
     result = fetch_market_news(
         now=datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc),
@@ -610,6 +796,77 @@ def test_market_news_is_bounded_recent_deduplicated_and_market_wide() -> None:
         "A股市场宽幅震荡，银行电力板块领涨",
         "港股收盘：恒指震荡回落",
     ]
+
+
+def test_a_share_market_news_uses_fallback_to_reach_five_recent_items() -> None:
+    observed = datetime(2026, 7, 20, 12, tzinfo=timezone.utc)
+    fallback = [
+        {
+            "region": "A股",
+            "title": f"A股大盘第{index}条盘后行情",
+            "published_at": (observed - timedelta(minutes=index)).isoformat(),
+            "url": f"https://finance.sina.com.cn/{index}",
+            "source": "新浪财经",
+        }
+        for index in range(1, 7)
+    ]
+    result = fetch_market_news(
+        now=observed,
+        size=6,
+        regions=("A股",),
+        news_loader=lambda *_args, **_kwargs: {"items": []},
+        fallback_loader=lambda *_args: fallback,
+    )
+    assert len(result["items"]) == 6
+    assert all(item["region"] == "A股" for item in result["items"])
+
+
+def test_a_share_market_news_has_no_24_hour_limit_but_rejects_non_a_share_issuers() -> None:
+    observed = datetime(2026, 7, 20, 12, tzinfo=timezone.utc)
+
+    def news_loader(_keyword: str, *, size: int = 30) -> dict[str, object]:
+        assert size == 30
+        return {"items": [
+            {
+                "title": "A股市场盘后：沪指震荡，两市成交额回升",
+                "published_at": "2026-07-15T08:00:00+00:00",
+                "url": "https://example.test/a-old",
+                "source": "公开资讯",
+            },
+            {
+                "title": "Armata股价因超级细菌疗法晚期试验进展而飙升",
+                "published_at": "2026-07-20T08:00:00+00:00",
+                "url": "https://example.test/armata",
+                "source": "公开资讯",
+            },
+        ]}
+
+    result = fetch_market_news(
+        now=observed, size=1, regions=("A股",), news_loader=news_loader, max_age_hours=None
+    )
+
+    assert result["window_hours"] is None
+    assert [item["title"] for item in result["items"]] == [
+        "A股市场盘后：沪指震荡，两市成交额回升"
+    ]
+
+
+def test_a_share_market_news_rejects_partial_refresh_instead_of_overwriting_complete_archive() -> None:
+    observed = datetime(2026, 7, 20, 12, tzinfo=timezone.utc)
+    one_valid_item = {
+        "title": "A股市场盘后：沪指震荡，两市成交额回升",
+        "published_at": "2026-07-20T08:00:00+00:00",
+        "url": "https://example.test/a-only",
+        "source": "公开资讯",
+    }
+
+    with pytest.raises(ValueError, match="仅取得 1/6 条严格匹配结果"):
+        fetch_market_news(
+            now=observed,
+            regions=("A股",),
+            news_loader=lambda *_args, **_kwargs: {"items": [one_valid_item]},
+            max_age_hours=None,
+        )
 
 
 def test_hkex_announcements_are_official_symbol_scoped_and_keep_pdf_links() -> None:

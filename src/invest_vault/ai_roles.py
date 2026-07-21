@@ -6,7 +6,7 @@ from typing import Any
 
 from stock_analysis.committee_selection import select_committee
 
-STOCK_ANALYSIS_SKILL_VERSION = "4.14.0"
+STOCK_ANALYSIS_SKILL_VERSION = "4.15.0"
 
 
 def _role(role_id: str, name: str, focus: str, questions: str, risk: str) -> dict[str, Any]:
@@ -69,7 +69,7 @@ def committee_plan(security_id: str, question: str) -> dict[str, Any]:
     """Use stock-analysis' question-driven six-member committee contract."""
 
     is_fund = security_id.endswith(":FUND")
-    is_market = security_id == "MARKET:GLOBAL:OVERVIEW"
+    is_market = security_id in {"MARKET:CN:OVERVIEW", "MARKET:GLOBAL:OVERVIEW"}
     role_ids = list(select_committee(question, asset_type="fund" if is_fund else "company"))
     return {
         "research_question": question.strip(),

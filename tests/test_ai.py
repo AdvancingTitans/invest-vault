@@ -4,17 +4,20 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from invest_vault.ai import (
     AIUnavailableError,
     CodexAppServerProvider,
+    ResearchChatStore,
     is_investment_question,
     market_report_role,
 )
 from invest_vault.ai_roles import committee_plan, get_role
 from invest_vault.ai_skills import SKILL_CATALOG
 from invest_vault.api import create_app
+from invest_vault.ledger import HoldingRecord, Vault
 
 
 class FakeAIProvider:
@@ -132,7 +135,10 @@ def test_market_report_supports_expert_style_and_committee_scene() -> None:
     assert role["role_id"] == "buffett"
     assert role["report_kind"] == "market"
     assert role["name"] == "巴菲特"
-    assert "仅生成盘前、盘中或盘后" in str(role["focus"])
+    assert "当前所有可用且完整的证据" in str(role["focus"])
+    assert "本地持仓给出条件化观察建议" in str(role["focus"])
+    assert "不得回答单股问题" not in str(role)
+    assert "龙虎榜" not in str(role)
     assert plan["scene"] == "market"
     assert len(plan["roles"]) == 6
     assert plan["roles"] == [
@@ -143,7 +149,7 @@ def test_market_report_supports_expert_style_and_committee_scene() -> None:
         "zhang_kun",
         "graham",
     ]
-    assert plan["skill_version"] == "4.14.0"
+    assert plan["skill_version"] == "4.15.0"
 
 
 def test_market_overview_accepts_committee_report_thread(tmp_path: Path) -> None:
@@ -269,6 +275,23 @@ def test_bundled_agent_reach_skill_is_used_without_user_installation(tmp_path: P
     assert provider._find_runtime_reach_skill() == {
         "type": "skill",
         "name": "agent-reach",
+        "path": str(bundled.resolve()),
+    }
+
+
+def test_bundled_primary_evidence_skill_is_used_without_user_installation(tmp_path: Path) -> None:
+    bundled = tmp_path / "skills" / "primary-evidence-reach"
+    bundled.mkdir(parents=True)
+    (bundled / "SKILL.md").write_text("---\nname: primary-evidence-reach\n---\n", encoding="utf-8")
+    provider = CodexAppServerProvider(
+        tmp_path / "runtime",
+        executable="/bin/false",
+        primary_evidence_skill_directory=bundled,
+    )
+
+    assert provider._find_runtime_primary_evidence_skill() == {
+        "type": "skill",
+        "name": "primary-evidence-reach",
         "path": str(bundled.resolve()),
     }
 
@@ -819,7 +842,7 @@ def test_fund_committee_auto_assigns_roles_and_persists_report(tmp_path: Path) -
         "张坤",
         "巴菲特",
     ]
-    assert set(provider.roles_seen[:6]) == {
+    assert set(provider.roles_seen) >= {
         "dalio",
         "klarman",
         "simons",
@@ -1126,3 +1149,112 @@ def test_normal_assistant_loads_stock_analysis_when_evidence_pass_still_has_gaps
         )
 
     assert provider.skill_flags == [True]
+
+
+def test_research_context_is_lossless_and_declares_vault_ledger_as_only_holding_authority(
+    tmp_path: Path,
+) -> None:
+    with Vault(tmp_path / "vault.sqlite3") as vault:
+        vault.import_holdings([
+            HoldingRecord("a", "CN:SSE:600519:STOCK", "a_share", "10000", "2026-01-08")
+        ])
+        service = ResearchChatStore(vault, FakeAIProvider())
+        marker = "末尾证据-不得截断"
+        context = service._context(
+            "MARKET:GLOBAL:OVERVIEW",
+            [{
+                "skill_id": "portfolio-risk-evidence",
+                "name": "组合风险证据",
+                "status": "completed",
+                "gaps": [],
+                "evidence": [{
+                    "evidence_id": "EVIDENCE-SKILL-long",
+                    "value": {
+                        "holding_identities": {"CN:SSE:600519:STOCK": {"symbol": "600519"}},
+                        "ledger_entries": [{"security_id": "CN:SSE:600519:STOCK", "tail": marker}],
+                        "padding": "x" * 70_000,
+                    },
+                }],
+            }],
+        )
+
+        assert marker in context
+        assert len(context) > 70_000
+        assert '"allowed_security_ids": ["CN:SSE:600519:STOCK"]' in context
+        assert '"external_profiles_forbidden": true' in context
+
+
+def test_research_service_rejects_holding_claims_for_symbols_outside_local_ledger(
+    tmp_path: Path,
+) -> None:
+    with Vault(tmp_path / "vault.sqlite3") as vault:
+        vault.import_holdings([
+            HoldingRecord("a", "CN:SSE:600519:STOCK", "a_share", "10000", "2026-01-08")
+        ])
+        service = ResearchChatStore(vault, FakeAIProvider())
+        with pytest.raises(AIUnavailableError, match="TSLA"):
+            service._assert_ledger_holding_claims({"content": "用户持仓 TSLA 需要继续观察。"})
+
+
+def test_user_can_stop_an_active_assistant_generation(tmp_path: Path) -> None:
+    class StoppableProvider(FakeAIProvider):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = threading.Event()
+            self.cancelled = threading.Event()
+
+        def begin_operation(self, operation_id: str) -> None:
+            self.operation_id = operation_id
+
+        def end_operation(self, operation_id: str) -> None:
+            assert operation_id == self.operation_id
+
+        def cancel_operation(self, operation_id: str) -> None:
+            assert operation_id == self.operation_id
+            self.cancelled.set()
+
+        def chat(self, **_kwargs: object) -> dict[str, object]:
+            self.started.set()
+            self.cancelled.wait(timeout=3)
+            raise AIUnavailableError("interrupted")
+
+    class EmptySkillLayer:
+        def catalog(self) -> list[dict[str, str]]:
+            return []
+
+        def run(self, **_kwargs: object) -> list[dict[str, object]]:
+            return []
+
+    provider = StoppableProvider()
+    with TestClient(
+        create_app(
+            tmp_path,
+            automatic_updates=False,
+            ai_provider=provider,
+            research_skill_layer=EmptySkillLayer(),
+        )
+    ) as client:
+        thread = client.post(
+            "/api/ai/chats",
+            json={"security_id": "CN:SSE:600519:STOCK", "role_id": "buffett", "title": "停止测试"},
+        ).json()
+        response: dict[str, object] = {}
+
+        def send() -> None:
+            response["value"] = client.post(
+                f"/api/ai/chats/{thread['thread_id']}/messages",
+                json={"content": "请分析这家公司", "role_id": "buffett"},
+            )
+
+        worker = threading.Thread(target=send)
+        worker.start()
+        assert provider.started.wait(timeout=2)
+        stopped = client.post(f"/api/ai/chats/{thread['thread_id']}/cancel")
+        worker.join(timeout=3)
+        detail = client.get(f"/api/ai/chats/{thread['thread_id']}").json()
+
+    assert stopped.status_code == 200
+    assert stopped.json()["status"] == "cancelled"
+    assert detail["active_run"]["status"] == "cancelled"
+    assert any(event["event_type"] == "workflow.cancelled" for event in detail["events"])
+    assert not worker.is_alive()

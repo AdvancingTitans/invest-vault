@@ -127,12 +127,10 @@ mod tests {
     }
 }
 
-fn stop_service(app: &tauri::AppHandle) {
+fn release_service_handle(app: &tauri::AppHandle) {
     if let Some(state) = app.try_state::<ServiceProcess>() {
         if let Ok(mut process) = state.0.lock() {
-            if let Some(child) = process.take() {
-                let _ = child.kill();
-            }
+            process.take();
         }
     }
 }
@@ -160,15 +158,13 @@ fn start_service(app: &tauri::App) -> Result<u16, String> {
 
     app.manage(ServiceProcess(Mutex::new(Some(child))));
     if !service_is_ready(port, &runtime_token) {
-        stop_service(&app.handle());
-        return Err("本地数据服务未能启动，可能仍有旧版本在后台运行".into());
+        return Err("本地数据服务未能在规定时间内就绪".into());
     }
     Ok(port)
 }
 
 fn show_startup_error(app: &tauri::App, message: &str) {
     eprintln!("投资札记启动失败: {message}");
-    stop_service(&app.handle());
     if let Err(error) = WebviewWindowBuilder::new(
         app,
         "startup-error",
@@ -220,7 +216,10 @@ fn main() {
 
     application.run(|app, event| {
         if matches!(event, RunEvent::Exit | RunEvent::ExitRequested { .. }) {
-            stop_service(app);
+            // Let the sidecar's parent watchdog exit the frozen Python child.
+            // Killing PyInstaller's one-file bootloader can leave it behind with
+            // a zombie child and make the next launch appear lock-conflicted.
+            release_service_handle(app);
         }
     });
 }

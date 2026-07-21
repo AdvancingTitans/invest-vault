@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 import platform
-import signal
+import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,8 +15,11 @@ from .ledger import LedgerEntry, Vault
 from .research import ResearchStore
 
 
-def terminate_current_process(_exit_code: int) -> None:
-    os.kill(os.getpid(), signal.SIGTERM)
+def terminate_current_process(exit_code: int) -> None:
+    # PyInstaller's one-file bootloader can remain alive with a zombie child when
+    # the frozen child sends SIGTERM to itself. A direct exit lets the bootloader
+    # reap the child and terminate normally.
+    os._exit(exit_code)
 
 
 def do_nothing() -> None:
@@ -28,6 +31,21 @@ def process_is_alive(pid: int) -> bool:
         os.kill(pid, 0)
     except OSError:
         return False
+    if os.name != "nt":
+        ps = "/bin/ps" if Path("/bin/ps").exists() else "ps"
+        try:
+            result = subprocess.run(
+                [ps, "-o", "stat=", "-p", str(pid)],
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=1,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return True
+        state = result.stdout.strip()
+        if result.returncode != 0 or not state or state.startswith("Z"):
+            return False
     return True
 
 
@@ -68,8 +86,9 @@ class VaultLock:
             return
         try:
             pid = int(self._path.read_text(encoding="utf-8"))
-            os.kill(pid, 0)
-        except (OSError, ValueError):
+            if not process_is_alive(pid):
+                self._path.unlink(missing_ok=True)
+        except ValueError:
             self._path.unlink(missing_ok=True)
 
     def release(self) -> None:

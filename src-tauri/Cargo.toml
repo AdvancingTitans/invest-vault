@@ -1,6 +1,6 @@
 [package]
 name = "invest-vault"
-version = "0.3.31"
+version = "0.3.34"
 edition = "2021"
 
 [build-dependencies]
