@@ -164,11 +164,15 @@ def test_post_close_archive_reports_the_target_batch_and_partial_holding_coverag
         "fetch_public_quote",
         "fetch_financial_snapshot",
         "fetch_company_announcements",
-        "fetch_global_index_overview",
+        "fetch_a_share_index_overview",
+        "fetch_cross_market_index_overview",
         "fetch_lhb",
         "fetch_industry_money_flow",
         "fetch_market_pulse",
         "fetch_market_news",
+        "fetch_global_market_movers",
+        "fetch_global_earnings_calendar",
+        "fetch_global_theme_performance",
     ):
         monkeypatch.setattr(
             f"invest_vault.api.{loader}", lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("offline"))
@@ -214,11 +218,15 @@ def test_failed_post_close_quote_is_retried_on_the_next_automatic_check(tmp_path
         "fetch_public_quote",
         "fetch_financial_snapshot",
         "fetch_company_announcements",
-        "fetch_global_index_overview",
+        "fetch_a_share_index_overview",
+        "fetch_cross_market_index_overview",
         "fetch_lhb",
         "fetch_industry_money_flow",
         "fetch_market_pulse",
         "fetch_market_news",
+        "fetch_global_market_movers",
+        "fetch_global_earnings_calendar",
+        "fetch_global_theme_performance",
     ):
         monkeypatch.setattr(
             f"invest_vault.api.{loader}", lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("offline"))
@@ -271,7 +279,15 @@ def test_incomplete_industry_flow_archive_is_repaired_on_the_next_automatic_chec
         "invest_vault.api.fetch_market_pulse",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("offline")),
     )
-    for loader in ("fetch_global_index_overview", "fetch_lhb"):
+    for loader in (
+        "fetch_a_share_index_overview",
+        "fetch_cross_market_index_overview",
+        "fetch_lhb",
+        "fetch_market_news",
+        "fetch_global_market_movers",
+        "fetch_global_earnings_calendar",
+        "fetch_global_theme_performance",
+    ):
         monkeypatch.setattr(
             f"invest_vault.api.{loader}", lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("offline"))
         )
@@ -304,7 +320,10 @@ def test_user_can_refresh_all_market_sections_and_receive_partial_failures(
         ],
     }
     flow = {"date": "2026-07-17", "source": "fixture", "inbound": [], "outbound": [{"name": "白酒"}]}
-    monkeypatch.setattr("invest_vault.api.fetch_global_index_overview", lambda: indices)
+    monkeypatch.setattr("invest_vault.api.fetch_a_share_index_overview", lambda: indices)
+    monkeypatch.setattr("invest_vault.api.fetch_cross_market_index_overview", lambda: {
+        "date": "2026-07-17", "source": "global fixture", "rows": []
+    })
     monkeypatch.setattr(
         "invest_vault.api.fetch_lhb", lambda _: (_ for _ in ()).throw(ValueError("龙虎榜源不可用"))
     )
@@ -326,17 +345,63 @@ def test_user_can_refresh_all_market_sections_and_receive_partial_failures(
             "total_count": 0,
         },
     )
+    monkeypatch.setattr("invest_vault.api.fetch_global_market_movers", lambda: {"date": "2026-07-18", "source": "fixture", "markets": []})
+    monkeypatch.setattr("invest_vault.api.fetch_global_earnings_calendar", lambda: {"date": "2026-07-18", "source": "fixture", "markets": []})
+    monkeypatch.setattr("invest_vault.api.fetch_global_theme_performance", lambda: {"date": "2026-07-18", "source": "fixture", "rows": []})
+    monkeypatch.setattr("invest_vault.api.fetch_a_share_hot_themes", lambda: {"date": "2026-07-18", "source": "fixture", "rows": []})
+    monkeypatch.setattr("invest_vault.api.fetch_a_share_earnings_calendar", lambda: {"date": "2026-07-18", "source": "fixture", "rows": []})
 
     with TestClient(create_app(tmp_path, automatic_updates=False)) as client:
         response = client.post("/api/market/refresh", json={"section": "all"})
         market = client.get("/api/bootstrap").json()["market"]
 
     assert response.status_code == 200
-    assert response.json()["completed"] == ["indices", "industry_flow", "pulse", "market_news"]
+    assert response.json()["completed"] == [
+        "indices", "global_indices", "industry_flow", "pulse", "a_market_news", "a_share_themes", "a_share_earnings_calendar", "global_market_news",
+        "global_market_movers", "global_earnings_calendar", "global_themes"
+    ]
     assert response.json()["failed"] == {"lhb": "龙虎榜源不可用"}
     assert market["indices"]["rows"][0]["name"] == "上证指数"
     assert market["industry_flow"]["outbound"] == [{"name": "白酒"}]
-    assert market["market_news"]["source"] == "富途 fixture"
+    assert market["a_market_news"]["source"] == "富途 fixture"
+    assert market["global_market_news"]["source"] == "富途 fixture"
+
+
+def test_global_page_refresh_fetches_independent_sources_in_parallel(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from threading import Lock
+    from time import sleep
+
+    state = {"active": 0, "maximum": 0}
+    state_lock = Lock()
+
+    def payload(*_args, **_kwargs) -> dict[str, object]:
+        with state_lock:
+            state["active"] += 1
+            state["maximum"] = max(state["maximum"], state["active"])
+        sleep(0.04)
+        with state_lock:
+            state["active"] -= 1
+        return {
+            "date": "2026-07-20",
+            "source": "fixture",
+            "rows": [],
+            "markets": [],
+            "items": [],
+        }
+
+    monkeypatch.setattr("invest_vault.api.fetch_cross_market_index_overview", payload)
+    monkeypatch.setattr("invest_vault.api.fetch_market_news", payload)
+    monkeypatch.setattr("invest_vault.api.fetch_global_market_movers", payload)
+    monkeypatch.setattr("invest_vault.api.fetch_global_earnings_calendar", payload)
+    monkeypatch.setattr("invest_vault.api.fetch_global_theme_performance", payload)
+
+    with TestClient(create_app(tmp_path, automatic_updates=False)) as client:
+        response = client.post("/api/market/refresh", json={"section": "global"})
+
+    assert response.status_code == 200
+    assert state["maximum"] >= 2
 
 
 def test_daily_market_modules_fall_back_to_the_latest_complete_trading_day(
@@ -402,7 +467,11 @@ def test_user_can_record_cash_balance_and_drawdown_limit_for_ai_evidence(tmp_pat
 def test_bootstrap_refreshes_all_market_sections_instead_of_reusing_a_saved_day(
     tmp_path: Path, monkeypatch
 ) -> None:
-    calls = {"indices": 0, "lhb": 0, "industry_flow": 0, "pulse": 0, "market_news": 0}
+    calls = {
+        "indices": 0, "global_indices": 0, "lhb": 0, "industry_flow": 0,
+        "pulse": 0, "a_market_news": 0, "global_market_news": 0,
+        "global_market_movers": 0, "global_earnings_calendar": 0, "global_themes": 0,
+    }
 
     def indices():
         calls["indices"] += 1
@@ -412,6 +481,13 @@ def test_bootstrap_refreshes_all_market_sections_instead_of_reusing_a_saved_day(
             "session_label": "7月20日盘中实时数据",
             "source": "fixture",
             "rows": [{"name": "上证指数", "close": 3000 + calls["indices"]}],
+        }
+
+    def global_indices():
+        calls["global_indices"] += 1
+        return {
+            "date": "2026-07-20", "source": "global fixture",
+            "rows": [{"name": "日经225", "close": 40000 + calls["global_indices"]}],
         }
 
     def lhb(_):
@@ -432,14 +508,22 @@ def test_bootstrap_refreshes_all_market_sections_instead_of_reusing_a_saved_day(
         return {"date": "2026-07-20", "source": "fixture", "kind": "holding_news", "news": []}
 
     def market_news(**_kwargs):
-        calls["market_news"] += 1
+        key = "a_market_news" if _kwargs.get("regions") == ("A股",) else "global_market_news"
+        calls[key] += 1
         return {"date": "2026-07-20", "source": "fixture", "items": [], "total_count": 0}
 
-    monkeypatch.setattr("invest_vault.api.fetch_global_index_overview", indices)
+    monkeypatch.setattr("invest_vault.api.fetch_a_share_index_overview", indices)
+    monkeypatch.setattr("invest_vault.api.fetch_cross_market_index_overview", global_indices)
     monkeypatch.setattr("invest_vault.api.fetch_lhb", lhb)
     monkeypatch.setattr("invest_vault.api.fetch_industry_money_flow", flow)
     monkeypatch.setattr("invest_vault.api.fetch_market_pulse", pulse)
     monkeypatch.setattr("invest_vault.api.fetch_market_news", market_news)
+    def global_section(key: str) -> dict[str, object]:
+        calls[key] += 1
+        return {"date": "2026-07-20", "source": "fixture", "rows": [], "markets": []}
+    monkeypatch.setattr("invest_vault.api.fetch_global_market_movers", lambda: global_section("global_market_movers"))
+    monkeypatch.setattr("invest_vault.api.fetch_global_earnings_calendar", lambda: global_section("global_earnings_calendar"))
+    monkeypatch.setattr("invest_vault.api.fetch_global_theme_performance", lambda: global_section("global_themes"))
 
     with TestClient(
         create_app(
@@ -453,7 +537,11 @@ def test_bootstrap_refreshes_all_market_sections_instead_of_reusing_a_saved_day(
 
     assert first["indices"]["rows"][0]["close"] == 3001
     assert second["indices"]["rows"][0]["close"] == 3002
-    assert calls == {"indices": 2, "lhb": 2, "industry_flow": 2, "pulse": 2, "market_news": 2}
+    assert calls == {
+        "indices": 2, "global_indices": 2, "lhb": 2, "industry_flow": 2,
+        "pulse": 2, "a_market_news": 2, "global_market_news": 2,
+        "global_market_movers": 2, "global_earnings_calendar": 2, "global_themes": 2,
+    }
 
 
 def test_bootstrap_uses_intraday_holding_quote_without_overwriting_completed_close(
@@ -491,11 +579,15 @@ def test_bootstrap_uses_intraday_holding_quote_without_overwriting_completed_clo
     for loader in (
         "fetch_financial_snapshot",
         "fetch_company_announcements",
-        "fetch_global_index_overview",
+        "fetch_a_share_index_overview",
+        "fetch_cross_market_index_overview",
         "fetch_lhb",
         "fetch_industry_money_flow",
         "fetch_market_pulse",
         "fetch_market_news",
+        "fetch_global_market_movers",
+        "fetch_global_earnings_calendar",
+        "fetch_global_theme_performance",
     ):
         monkeypatch.setattr(
             f"invest_vault.api.{loader}", lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("offline"))
@@ -828,17 +920,21 @@ def test_invest_vault_bundles_pinned_stock_analysis_runtime_without_external_ins
     assert '"src/stock_analysis"' in pyproject
     assert runtime.joinpath("committee_selection.py").is_file()
     assert runtime.joinpath("integrations.py").is_file()
-    assert 'version: "4.14.0"' in skill.read_text(encoding="utf-8")
+    assert 'version: "4.15.0"' in skill.read_text(encoding="utf-8")
     assert 'collect_submodules("stock_analysis")' in spec
     assert '("skills/stock-analysis", "skills/stock-analysis")' in spec
     assert '("skills/agent-reach", "skills/agent-reach")' in spec
+    assert '("skills/primary-evidence-reach", "skills/primary-evidence-reach")' in spec
     assert app_root.joinpath("skills", "agent-reach", "SKILL.md").is_file()
+    assert app_root.joinpath("skills", "primary-evidence-reach", "SKILL.md").is_file()
 
 
-def test_market_page_exposes_global_manual_refresh_and_activity_fields() -> None:
+def test_a_share_and_global_market_pages_are_scoped_and_refreshable() -> None:
     source = (Path(__file__).parents[1] / "web" / "src" / "workbench.tsx").read_text(encoding="utf-8")
 
-    assert 'label: "市场概览"' in source
+    assert 'label: "A股概览"' in source
+    assert 'label: "全球概览"' in source
+    assert 'label: "大盘议事厅"' in source
     assert 'title="刷新全部"' in source
     assert "row.change" in source
     assert "row.amount" in source
@@ -846,9 +942,20 @@ def test_market_page_exposes_global_manual_refresh_and_activity_fields() -> None
     assert 'refreshMarket("indices")' in source
     assert 'refreshMarket("lhb")' in source
     assert 'refreshMarket("industry_flow")' in source
+    assert 'refreshGlobal("global_indices")' in source
+    assert 'refreshGlobal("global_market_news")' in source
+    assert 'refreshGlobal("global_market_movers")' in source
+    assert 'refreshGlobal("global_earnings_calendar")' in source
+    assert 'refreshGlobal("global_themes")' in source
+    assert 'title="四市场领涨榜"' in source
+    assert 'title="跨市场投资主题"' in source
+    assert 'title="本月财报日历"' in source
+    assert 'security_id: "MARKET:GLOBAL:OVERVIEW"' in source
+    assert 'security_id: "MARKET:CN:OVERVIEW"' not in source
     assert "market.pulse" in source
     assert 'title="赚钱效应与上涨主线"' in source
     assert 'title="下跌风险"' in source
+    assert "数据日期 {pulse.date}" in source
     assert source.count('refreshMarket("pulse")') >= 2
     assert "M3 ·" not in source
     assert "M4 ·" not in source
@@ -859,20 +966,27 @@ def test_market_page_exposes_global_manual_refresh_and_activity_fields() -> None
         )
     ]
     assert 'refreshMarket("pulse")' in holding_news
-    assert 'refreshing === "pulse" ? "刷新中…" : "刷新"' in holding_news
+    assert 'isRefreshing("pulse") ? "刷新中…" : "刷新"' in holding_news
     assert 'scene="market"' in source
     assert "刷新后自动识别时段" in source
+    assert "停止生成" in source
+    assert 'event.key === "Enter" && !event.shiftKey' in source
+    assert "结合当前所有可用且完整的证据" in source
     assert (
         "<span>报告阶段</span>"
         not in source[source.index("function ResearchAssistant") : source.index("function SecurityWorkbench")]
     )
     assert "大盘议事厅" in source
+    assert source.count('aria-label="大盘议事厅"') == 1
+    assert 'marketScope="a-share"' not in source
+    assert 'marketScope="global"' not in source
     assert "开始本时段议事" in source
     market_assistant = source[
         source.index("function ResearchAssistant") : source.index("function SecurityWorkbench")
     ]
     assert "<span>主持席</span>" in market_assistant
-    assert 'useState("dalio")' in market_assistant
+    assert 'localStorage.getItem("market-council-style")' in market_assistant
+    assert '|| "dalio"' in market_assistant
     assert '<option value="committee">投研委员会 · 六席会审</option>' in market_assistant
     assert 'marketStyle === "committee"' in market_assistant
     assert '? "AI 市场行情助手"' not in market_assistant
@@ -888,7 +1002,11 @@ def test_market_page_exposes_global_manual_refresh_and_activity_fields() -> None
     assert "行情阶段\\n${marketStage.label}" in market_assistant
     assert "大盘行情笔记" in source
     assert "saveNote={saveMarketNote}" in source
-    market_page = source[source.index("function MarketPage") : source.index("function MaterialList")]
+    market_page = source[source.index("function AShareMarketPage") : source.index("function MaterialList")]
+    a_share_page = source[source.index("function AShareMarketPage") : source.index("function GlobalMarketPage")]
+    global_page = source[source.index("function GlobalMarketPage") : source.index("function MarketCouncilPage")]
+    assert "<ResearchAssistant" not in a_share_page
+    assert "<ResearchAssistant" not in global_page
     investment_notes = source[
         source.index("function Research({") : source.index("function ResearchAssistant")
     ]
@@ -1179,8 +1297,14 @@ def test_today_long_names_and_market_news_use_bounded_vertical_layouts() -> None
     for class_name in ("holding-card-meta", "market-secondary-grid", "market-side-stack", "market-news-list"):
         assert f'className="{class_name}"' in source or class_name in source
         assert f".{class_name}" in styles
-    assert 'refreshMarket("market_news")' in source
+    assert 'refreshMarket("a_market_news")' in source
+    assert 'refreshGlobal("global_market_news")' in source
+    assert 'title="A股大盘新闻"' in source
+    assert 'title="24小时A股大盘新闻"' not in source
     assert "marketNews.items.slice(0, 6)" in source
+    assert "themes.rows.slice(0, 6)" in source
+    assert "grid-template-columns: repeat(2, minmax(0, 1fr));" in styles
+    assert ".market-secondary-grid" in styles and "align-items: stretch" in styles
     assert "grid-template-columns: minmax(0, 1fr);" in styles
     assert "-webkit-line-clamp: 2" in styles
 
@@ -1298,7 +1422,7 @@ def test_research_sidebar_separates_market_overview_from_holdings() -> None:
     source = (Path(__file__).parents[1] / "web" / "src" / "workbench.tsx").read_text(encoding="utf-8")
     research = source[source.index("function Research({") : source.index("function ResearchAssistant")]
 
-    assert "按市场概览" in research
+    assert "按大盘概览" in research
     assert "市场行情报告与结论" not in research
     assert all(label in research for label in ("盘前", "盘中", "盘后"))
     assert "market_session" in research
@@ -1517,14 +1641,17 @@ def test_assistant_hides_engineering_ids_and_excerpt_keeps_the_user_question() -
     assert "清空对话" in source
 
 
-def test_page_switch_refreshes_and_new_visuals_stay_inside_existing_surfaces() -> None:
+def test_page_switch_keeps_cached_data_and_new_visuals_stay_inside_existing_surfaces() -> None:
     app_root = Path(__file__).parents[1]
     source = (app_root / "web" / "src" / "workbench.tsx").read_text(encoding="utf-8")
     styles = (app_root / "web" / "src" / "styles.css").read_text(encoding="utf-8")
 
-    assert "previousPage.current === active" in source
-    assert "正在刷新当前页面的行情、资料与本地记录" in source
-    assert "load(true).catch" in source
+    assert "previousPage.current === active" not in source
+    assert "页面自动刷新未完成" not in source
+    assert 'refreshScope("a_share")' in source
+    assert 'refreshScope("global")' in source
+    assert "本次启动自动刷新已完成" in source
+    assert "beforeMarketReport" not in source
     assert "今日持仓涨跌分布" in source
     assert "买入金额前三集中度" in source
     assert "展示指数涨跌广度" in source
@@ -1540,17 +1667,35 @@ def test_research_rooms_use_named_surfaces_and_role_avatars() -> None:
     source = (web_root / "src" / "workbench.tsx").read_text(encoding="utf-8")
     role_ids = {str(role["role_id"]) for role in AI_ROLES if role["role_id"] != "general"}
     avatar_ids = {path.stem for path in (web_root / "public" / "expert-avatars").glob("*.webp")}
+    functional_avatar_ids = {
+        path.stem for path in (web_root / "public" / "functional-avatars").glob("*.webp")
+    }
 
     assert 'aria-label="大盘议事厅"' in source
     assert 'aria-label="投研大师"' in source
     assert '"投研委员会"' in source
     assert "function RoleAvatar" in source
     assert "EXPERT_AVATAR_BY_IDENTITY" in source
-    assert 'aria-label={avatarId ? `${name}头像` : undefined}' in source
+    assert "FUNCTIONAL_AVATAR_BY_IDENTITY" in source
+    assert 'aria-label={avatarSrc ? `${name}头像` : undefined}' in source
     assert avatar_ids == role_ids
-    assert 'identity={roomPersona.id}' in source
+    assert functional_avatar_ids == {
+        "committee",
+        "committee-roundtable",
+        "coordinator",
+        "evidence_researcher",
+        "general",
+        "market-roundtable",
+        "report_editor",
+        "risk_manager",
+    }
+    assert 'identity={titleAvatarIdentity}' in source
+    assert 'marketStyle === "committee" ? "market-roundtable" : marketStyle' in source
     assert 'identity={item.name}' in source
     assert 'identity={event.actor_type === "user" ? "vault-owner" : event.actor_id}' in source
+    assert 'if (event.event_type.startsWith("reporting")) return "投资经理";' in source
+    assert '"research-committee": "committee-roundtable"' in source
+    assert '"market-roundtable": "market-roundtable"' in source
     assert 'className="role-roster"' in source
     assert "专家风格行情报告" not in source
     assert "AI 投资委员会" not in source

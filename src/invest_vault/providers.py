@@ -1,4 +1,4 @@
-"""Invest Vault adapters plus the bundled stock-analysis 4.14 runtime bridge."""
+"""Invest Vault adapters plus the bundled stock-analysis 4.15 runtime bridge."""
 
 from __future__ import annotations
 
@@ -9,12 +9,17 @@ import re
 import time as time_module
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 from collections import Counter
 from collections.abc import Callable
 from datetime import date, datetime, time, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from html import unescape
 from typing import Any
 from zoneinfo import ZoneInfo
+
+from stock_analysis.market_calendar import previous_or_same_session
+from stock_analysis.market_time import detect_market_session
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 POST_CLOSE_GATE = time(17, 30)
@@ -78,7 +83,7 @@ def fetch_cny_exchange_rate(currency: str, on_date: date | str | None = None) ->
     as_of = str(on_date or current_market_date())
     if normalized == "CNY":
         return {"currency": "CNY", "rate": 1.0, "as_of": as_of, "source": "identity"}
-    if normalized not in {"HKD", "USD"}:
+    if normalized not in {"HKD", "USD", "JPY", "KRW"}:
         raise ValueError(f"暂不支持{normalized}兑人民币汇率")
     url = f"https://api.frankfurter.app/{urllib.parse.quote(as_of)}?from={normalized}&to=CNY"
     request = urllib.request.Request(url, headers={"User-Agent": "Invest-Vault/0.3"})
@@ -1307,15 +1312,18 @@ def fetch_market_news(
     *,
     now: datetime | None = None,
     size: int = 6,
+    regions: tuple[str, ...] = ("A股", "港股", "美股"),
     news_loader: Callable[..., dict[str, object]] = fetch_public_news,
+    fallback_loader: Callable[[datetime, tuple[str, ...]], list[dict[str, object]]] | None = None,
+    max_age_hours: int | None = 24,
 ) -> dict[str, object]:
-    """Return a bounded 24-hour cross-market news projection."""
+    """Return a bounded, newest-first market-news projection for explicit regions."""
 
     observed = now or datetime.now(timezone.utc)
     if observed.tzinfo is None:
         observed = observed.replace(tzinfo=timezone.utc)
     observed = observed.astimezone(timezone.utc)
-    cutoff = observed - timedelta(hours=24)
+    cutoff = observed - timedelta(hours=max_age_hours) if max_age_hours is not None else None
     market_terms = (
         "市场",
         "收盘",
@@ -1345,57 +1353,252 @@ def fetch_market_news(
     seen_titles: set[str] = set()
     seen_urls: set[str] = set()
     successful_queries = 0
-    for region in ("A股", "港股", "美股"):
-        try:
-            payload = news_loader(region, size=20)
-            successful_queries += 1
-        except Exception:
-            continue
-        for item in payload.get("items") or []:
-            title = str(item.get("title") or "").strip()
-            url = str(item.get("url") or "").strip()
-            published = str(item.get("published_at") or "")
-            try:
-                published_at = datetime.fromisoformat(published.replace("Z", "+00:00"))
-            except ValueError:
-                continue
-            if published_at.tzinfo is None:
-                published_at = published_at.replace(tzinfo=timezone.utc)
-            published_at = published_at.astimezone(timezone.utc)
-            if not (cutoff <= published_at <= observed + timedelta(minutes=5)):
-                continue
-            if (
-                region not in title
-                or not any(term in title for term in market_terms)
-                or any(term in title for term in issuer_terms)
-            ):
-                continue
-            normalized_title = re.sub(r"\W+", "", title).casefold()
-            if not title or not url or normalized_title in seen_titles or url in seen_urls:
-                continue
-            seen_titles.add(normalized_title)
-            seen_urls.add(url)
-            rows.append(
-                {
-                    "region": region,
-                    "title": title,
-                    "published_at": published_at.isoformat(),
-                    "url": url,
-                    "source": str(item.get("source") or "富途公开资讯搜索"),
-                }
+    query_terms = {
+        "A股": ("A股大盘", "A股市场", "沪深股市"),
+    }
+
+    def headline_matches(region: str, title: str) -> bool:
+        if region == "A股":
+            a_share_terms = (
+                "A股", "沪深", "沪指", "上证", "深证", "深成指", "创业板",
+                "科创板", "北交所", "北证", "两市", "全A",
             )
+            return (
+                any(term.casefold() in title.casefold() for term in a_share_terms)
+                and any(term.casefold() in title.casefold() for term in market_terms)
+                and not any(term.casefold() in title.casefold() for term in issuer_terms)
+            )
+        return (
+            region.casefold() in title.casefold()
+            and any(term.casefold() in title.casefold() for term in market_terms)
+            and not any(term.casefold() in title.casefold() for term in issuer_terms)
+        )
+
+    def append_item(region: str, item: dict[str, object]) -> None:
+        title = str(item.get("title") or "").strip()
+        url = str(item.get("url") or "").strip()
+        published = str(item.get("published_at") or "")
+        try:
+            published_at = datetime.fromisoformat(published.replace("Z", "+00:00"))
+        except ValueError:
+            return
+        if published_at.tzinfo is None:
+            published_at = published_at.replace(tzinfo=timezone.utc)
+        published_at = published_at.astimezone(timezone.utc)
+        if published_at > observed + timedelta(minutes=5) or (cutoff and published_at < cutoff):
+            return
+        if not headline_matches(region, title):
+            return
+        normalized_title = re.sub(r"\W+", "", title).casefold()
+        if not title or not url or normalized_title in seen_titles or url in seen_urls:
+            return
+        seen_titles.add(normalized_title)
+        seen_urls.add(url)
+        rows.append(
+            {
+                "region": region,
+                "title": title,
+                "published_at": published_at.isoformat(),
+                "url": url,
+                "source": str(item.get("source") or "富途公开资讯搜索"),
+            }
+        )
+
+    for region in regions:
+        for query in query_terms.get(region, (region,)):
+            try:
+                payload = news_loader(query, size=30)
+                successful_queries += 1
+            except Exception:
+                continue
+            for item in payload.get("items") or []:
+                append_item(region, item)
+    if news_loader is fetch_public_news or fallback_loader is not None:
+        fallback_rows: list[dict[str, object]] = []
+        try:
+            fallback_rows.extend(
+                fallback_loader(observed, regions)
+                if fallback_loader is not None
+                else _fetch_sina_roll_market_news(observed, regions, max_age_hours=max_age_hours)
+            )
+        except Exception:
+            pass
+        for region, url, source, title_terms in (
+            (
+                "日股",
+                "https://www.zaikei.co.jp/rss/sections/market.xml",
+                "財経新聞 Market RSS",
+                ("日経", "東京株", "東証", "日本株", "株式市場", "新興市場", "グロース"),
+            ),
+            (
+                "日股",
+                "https://toyokeizai.net/list/feed/rss",
+                "東洋経済 Online RSS",
+                ("株", "投資", "相場", "日経", "市場", "決算", "配当"),
+            ),
+            (
+                "日股",
+                "https://www.jpx.co.jp/rss/markets_news.xml",
+                "JPX 市场新闻 RSS",
+                None,
+            ),
+            ("韩股", "https://www.hankyung.com/feed/finance", "韩国经济 Finance RSS", None),
+        ):
+            if region not in regions:
+                continue
+            try:
+                fallback_rows.extend(
+                    _fetch_rss_market_news(
+                        url,
+                        region,
+                        source,
+                        observed,
+                        title_terms=title_terms,
+                    )
+                )
+            except Exception:
+                continue
+        for item in fallback_rows:
+            append_item(str(item.get("region") or ""), item)
     if not successful_queries:
-        raise ValueError("24小时大盘资讯来源暂不可用")
+        if not rows:
+            raise ValueError("大盘资讯来源暂不可用")
     rows.sort(key=lambda item: str(item["published_at"]), reverse=True)
     limit = min(max(size, 1), 10)
+    selected: list[dict[str, object]] = []
+    if len(regions) > 1:
+        for region in regions:
+            match = next((item for item in rows if item["region"] == region), None)
+            if match and match not in selected:
+                selected.append(match)
+    for item in rows:
+        if item not in selected:
+            selected.append(item)
+        if len(selected) >= limit:
+            break
+    if regions == ("A股",) and len(selected) < limit:
+        raise ValueError(
+            f"A股大盘新闻仅取得 {len(selected)}/{limit} 条严格匹配结果，保留最近完整归档"
+        )
+    sources = sorted({str(item.get("source") or "") for item in selected if item.get("source")})
     return {
         "date": observed.astimezone(SHANGHAI).date().isoformat(),
         "observed_at": observed.isoformat(),
-        "window_hours": 24,
+        "window_hours": max_age_hours,
         "total_count": len(rows),
-        "items": rows[:limit],
-        "source": "富途公开资讯搜索",
+        "items": selected[:limit],
+        "source": " + ".join(sources) or "公开资讯",
     }
+
+
+def _parse_publication_time(value: str) -> datetime | None:
+    clean = value.strip()
+    if not clean:
+        return None
+    try:
+        parsed = parsedate_to_datetime(clean)
+    except (TypeError, ValueError, OverflowError):
+        try:
+            parsed = datetime.fromisoformat(clean.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _fetch_rss_market_news(
+    url: str,
+    region: str,
+    source: str,
+    observed: datetime,
+    request: Callable[[str], bytes] = _request,
+    *,
+    title_terms: tuple[str, ...] | None = None,
+) -> list[dict[str, object]]:
+    cutoff = observed - timedelta(hours=24)
+    root = ET.fromstring(request(url))
+    rows: list[dict[str, object]] = []
+    for item in [*root.findall(".//item"), *root.findall(".//{http://www.w3.org/2005/Atom}entry")]:
+        title = "".join(item.findtext("title", default="")).strip()
+        link = item.findtext("link", default="").strip()
+        if not link:
+            atom_link = item.find("{http://www.w3.org/2005/Atom}link")
+            link = str(atom_link.get("href") or "") if atom_link is not None else ""
+        published = next(
+            (
+                item.findtext(tag, default="")
+                for tag in (
+                    "pubDate",
+                    "{http://purl.org/dc/elements/1.1/}date",
+                    "{http://www.w3.org/2005/Atom}updated",
+                    "{http://www.w3.org/2005/Atom}published",
+                )
+                if item.findtext(tag, default="")
+            ),
+            "",
+        )
+        published_at = _parse_publication_time(published)
+        if (
+            not title
+            or not link
+            or published_at is None
+            or not cutoff <= published_at <= observed + timedelta(minutes=5)
+            or (title_terms is not None and not any(term in title for term in title_terms))
+        ):
+            continue
+        rows.append(
+            {
+                "region": region,
+                "title": html.unescape(re.sub(r"<[^>]+>", "", title)).strip(),
+                "published_at": published_at.isoformat(),
+                "url": link,
+                "source": source,
+            }
+        )
+    return rows[:10]
+
+
+def _fetch_sina_roll_market_news(
+    observed: datetime,
+    regions: tuple[str, ...],
+    request: Callable[[str], bytes] = _request,
+    *,
+    max_age_hours: int | None = 24,
+) -> list[dict[str, object]]:
+    cutoff = observed - timedelta(hours=max_age_hours) if max_age_hours is not None else None
+    aliases = {
+        "A股": ("A股", "沪深", "上证", "深证", "创业板", "北证", "两市", "ETF", "私募", "公募", "券商", "北向"),
+        "港股": ("港股", "恒生", "恒指", "香港股市"),
+        "日股": ("日股", "日经", "日本股市", "东京股市"),
+        "韩股": ("韩股", "韩国股市", "KOSPI", "KOSDAQ"),
+        "美股": ("美股", "纳指", "道指", "标普", "华尔街"),
+    }
+    rows: list[dict[str, object]] = []
+    for page in range(1, 11 if max_age_hours is None else 4):
+        params = urllib.parse.urlencode({"pageid": 153, "lid": 2509, "num": 100, "page": page})
+        payload = json.loads(request(f"https://feed.mix.sina.com.cn/api/roll/get?{params}").decode("utf-8"))
+        for item in ((payload.get("result") or {}).get("data") or []):
+            title = html.unescape(re.sub(r"<[^>]+>", "", str(item.get("title") or ""))).strip()
+            timestamp = _number(item.get("ctime") or item.get("intime"))
+            if not title or timestamp is None:
+                continue
+            published_at = datetime.fromtimestamp(timestamp, timezone.utc)
+            if published_at > observed + timedelta(minutes=5) or (cutoff and published_at < cutoff):
+                continue
+            for region in regions:
+                if any(term.casefold() in title.casefold() for term in aliases[region]):
+                    rows.append(
+                        {
+                            "region": region,
+                            "title": title,
+                            "published_at": published_at.isoformat(),
+                            "url": str(item.get("url") or item.get("wapurl") or ""),
+                            "source": str(item.get("media_name") or "新浪财经"),
+                        }
+                    )
+                    break
+    return rows
 
 
 INDEX_CODES = {
@@ -1428,6 +1631,403 @@ GLOBAL_INDEX_CODES = (
     ("usIXIC", "纳斯达克", "US", "USD"),
     ("usDJI", "道琼斯", "US", "USD"),
 )
+
+A_SHARE_INDEX_CODES = tuple(row for row in GLOBAL_INDEX_CODES if row[2] == "CN")
+GLOBAL_TENCENT_INDEX_CODES = (
+    ("hkHSI", "恒生指数", "HK", "HKD"),
+    ("hkHSTECH", "恒生科技指数", "HK", "HKD"),
+    ("usINX", "标普500", "US", "USD"),
+    ("usIXIC", "纳斯达克", "US", "USD"),
+)
+KR_NAVER_INDEX_CODES = (
+    ("KOSPI", "韩国综合指数"),
+    ("KOSDAQ", "KOSDAQ"),
+)
+
+TRADINGVIEW_SCAN_URL = "https://scanner.tradingview.com/{market}/scan"
+TRADINGVIEW_MARKETS = {
+    "HK": ("hongkong", 1_000_000_000, "港股"),
+    "JP": ("japan", 100_000_000_000, "日股"),
+    "KR": ("korea", 1_000_000_000_000, "韩股"),
+    "US": ("america", 1_000_000_000, "美股"),
+}
+GLOBAL_THEME_TICKERS = {
+    "存储与存储芯片": {
+        "HK": ("HKEX:981", "HKEX:1347"),
+        "JP": ("TSE:285A", "TSE:6857"),
+        "KR": ("KRX:000660", "KRX:005930"),
+        "US": ("NASDAQ:MU", "NASDAQ:WDC", "NASDAQ:STX"),
+    },
+    "光通信与光器件": {
+        "HK": ("HKEX:2342", "HKEX:763"),
+        "JP": ("TSE:5801", "TSE:5803", "TSE:5802"),
+        "KR": ("KRX:138080", "KRX:050890"),
+        "US": ("NASDAQ:COHR", "NASDAQ:LITE", "NASDAQ:AAOI"),
+    },
+    "半导体设备": {
+        "HK": ("HKEX:522", "HKEX:353"),
+        "JP": ("TSE:8035", "TSE:6857", "TSE:7735"),
+        "KR": ("KRX:042700", "KRX:039030"),
+        "US": ("NASDAQ:AMAT", "NASDAQ:LRCX", "NASDAQ:KLAC"),
+    },
+    "AI算力": {
+        "HK": ("HKEX:700", "HKEX:1810", "HKEX:9888"),
+        "JP": ("TSE:9984", "TSE:6701"),
+        "KR": ("KRX:005930", "KRX:000660", "KRX:035420"),
+        "US": ("NASDAQ:NVDA", "NASDAQ:AMD", "NASDAQ:AVGO"),
+    },
+}
+
+
+def _post_json(url: str, payload: dict[str, object]) -> dict[str, object]:
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"User-Agent": "Mozilla/5.0", "Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=15) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _tradingview_scan(market: str, payload: dict[str, object]) -> dict[str, object]:
+    return _post_json(TRADINGVIEW_SCAN_URL.format(market=market), payload)
+
+
+def fetch_global_market_movers(
+    *,
+    scan: Callable[[str, dict[str, object]], dict[str, object]] = _tradingview_scan,
+    now_provider: Callable[[], datetime] | None = None,
+) -> dict[str, object]:
+    """Return liquid large-cap gainers for HK/JP/KR/US with an explicit scope."""
+
+    observed = (now_provider or (lambda: datetime.now(timezone.utc)))()
+    markets: list[dict[str, object]] = []
+    gaps: list[str] = []
+    for region, (scanner, minimum_cap, label) in TRADINGVIEW_MARKETS.items():
+        try:
+            payload = scan(
+                scanner,
+                {
+                    "filter": [
+                        {"left": "type", "operation": "equal", "right": "stock"},
+                        {"left": "market_cap_basic", "operation": "greater", "right": minimum_cap},
+                        {"left": "volume", "operation": "greater", "right": 0},
+                    ],
+                    "columns": ["name", "description", "close", "change", "volume", "currency", "market_cap_basic"],
+                    "sort": {"sortBy": "change", "sortOrder": "desc"},
+                    "range": [0, 4],
+                },
+            )
+            rows = []
+            for item in payload.get("data") or []:
+                values = item.get("d") or []
+                if len(values) < 7 or _number(values[2]) in (None, 0) or _number(values[3]) is None:
+                    continue
+                rows.append(
+                    {
+                        "symbol": str(item.get("s") or values[0]),
+                        "name": str(values[1] or values[0]),
+                        "close": _number(values[2]),
+                        "change_percent": _number(values[3]),
+                        "volume": _number(values[4]),
+                        "currency": str(values[5] or ""),
+                        "market_cap": _number(values[6]),
+                    }
+                )
+            if not rows:
+                raise ValueError("没有通过流动性与市值筛选的有效样本")
+            markets.append({"region": region, "label": label, "rows": rows})
+        except Exception as error:
+            gaps.append(f"{label}领涨榜：{error}")
+            markets.append({"region": region, "label": label, "rows": []})
+    if not any(item["rows"] for item in markets):
+        raise ValueError("全球领涨榜暂不可用")
+    return {
+        "date": observed.astimezone(SHANGHAI).date().isoformat(),
+        "observed_at": observed.isoformat(),
+        "markets": markets,
+        "source": "TradingView 免登录市场扫描",
+        "scope_note": "各市场按本币总市值与当日成交筛选后的大盘股样本领涨榜，不等同于无门槛全市场涨幅榜。",
+        "gaps": gaps,
+    }
+
+
+def fetch_global_theme_performance(
+    *,
+    scan: Callable[[str, dict[str, object]], dict[str, object]] = _tradingview_scan,
+    now_provider: Callable[[], datetime] | None = None,
+) -> dict[str, object]:
+    """Build transparent equal-weight theme proxies from named public quotes."""
+
+    observed = (now_provider or (lambda: datetime.now(timezone.utc)))()
+    tickers = list(dict.fromkeys(
+        ticker
+        for regions in GLOBAL_THEME_TICKERS.values()
+        for region_tickers in regions.values()
+        for ticker in region_tickers
+    ))
+    payload = scan(
+        "global",
+        {
+            "symbols": {"tickers": tickers, "query": {"types": []}},
+            "columns": ["name", "description", "close", "change", "currency"],
+        },
+    )
+    quotes = {
+        str(item.get("s")): item.get("d") or []
+        for item in payload.get("data") or []
+    }
+    rows = []
+    for theme, regions in GLOBAL_THEME_TICKERS.items():
+        market_rows = []
+        for region in ("HK", "JP", "KR", "US"):
+            samples = []
+            for ticker in regions.get(region, ()):
+                values = quotes.get(ticker) or []
+                change = _number(values[3]) if len(values) > 3 else None
+                if change is not None:
+                    samples.append({"symbol": ticker, "name": str(values[1] or values[0]), "change_percent": change})
+            if samples:
+                market_rows.append(
+                    {
+                        "region": region,
+                        "change_percent": round(sum(float(item["change_percent"]) for item in samples) / len(samples), 4),
+                        "sample_count": len(samples),
+                        "constituents": samples,
+                    }
+                )
+        rows.append(
+            {
+                "name": theme,
+                "markets": market_rows,
+                "available_markets": [item["region"] for item in market_rows],
+            }
+        )
+    return {
+        "date": observed.astimezone(SHANGHAI).date().isoformat(),
+        "observed_at": observed.isoformat(),
+        "rows": rows,
+        "source": "TradingView 免登录行情",
+        "method_note": "主题涨跌幅为预先披露代表证券的等权平均，仅用于跨市场主题温度比较，不冒充交易所主题指数。",
+    }
+
+
+def fetch_a_share_hot_themes(
+    request: Callable[[str], bytes] = _request,
+    *,
+    now_provider: Callable[[], datetime] | None = None,
+) -> dict[str, object]:
+    """Return a stable, investment-oriented A-share theme basket."""
+
+    observed = (now_provider or (lambda: datetime.now(timezone.utc)))()
+    themes = (
+        ("90.BK1036", "BK1036", "半导体"),
+        ("0.980138", "980138", "存储芯片"),
+        ("90.BK1134", "BK1134", "算力概念"),
+        ("2.931160", "931160", "通信设备"),
+        ("2.931071", "931071", "人工智能"),
+        ("90.BK1184", "BK1184", "人形机器人"),
+    )
+    params = urllib.parse.urlencode(
+        {
+            "fltt": 2,
+            "secids": ",".join(item[0] for item in themes),
+            "fields": "f2,f3,f4,f12,f13,f14",
+        }
+    )
+    payload = _eastmoney_json(f"https://push2.eastmoney.com/api/qt/ulist.np/get?{params}", request)
+    diff = (payload.get("data") or {}).get("diff") or []
+    items = diff.values() if isinstance(diff, dict) else diff
+    by_code = {str(item.get("f12") or ""): item for item in items}
+    if not by_code:
+        raise ValueError("东方财富未返回有效投资主题行情")
+    rows = []
+    for _secid, code, canonical_name in themes:
+        item = by_code.get(code, {})
+        rows.append({
+            "code": code,
+            "name": str(item.get("f14") or canonical_name),
+            "change_percent": _number(item.get("f3")),
+            "close": _number(item.get("f2")),
+            "available": bool(item.get("f14") and _number(item.get("f3")) is not None),
+        })
+    return {
+        "date": observed.astimezone(SHANGHAI).date().isoformat(),
+        "observed_at": observed.isoformat(),
+        "rows": rows,
+        "source": "东方财富公开主题/指数行情",
+        "scope_note": "固定展示半导体、存储芯片、算力、通信设备、人工智能与人形机器人六个可核验主题，不按当日涨幅追逐临时概念；不同指数编制口径不可直接比较点位。",
+    }
+
+
+def fetch_a_share_earnings_calendar(
+    request: Callable[[str], bytes] = _request,
+    *,
+    scan: Callable[[str, dict[str, object]], dict[str, object]] = _tradingview_scan,
+    now_provider: Callable[[], datetime] | None = None,
+) -> dict[str, object]:
+    """Return representative A-share earnings still scheduled this month."""
+
+    observed = (now_provider or (lambda: datetime.now(timezone.utc)))()
+    local_day = observed.astimezone(SHANGHAI).date()
+    month_start = date(local_day.year, local_day.month, 1)
+    month_end = date(local_day.year + (local_day.month == 12), local_day.month % 12 + 1, 1) - timedelta(days=1)
+    domestic_params = urllib.parse.urlencode(
+        {
+            "reportName": "RPT_PUBLIC_BS_APPOIN",
+            "columns": "SECURITY_CODE,SECURITY_NAME_ABBR,APPOINT_PUBLISH_DATE,ACTUAL_PUBLISH_DATE,REPORT_DATE,REPORT_TYPE_NAME,IS_PUBLISH,SECUCODE",
+            "filter": (
+                f"(APPOINT_PUBLISH_DATE>='{local_day.isoformat()}')"
+                f"(APPOINT_PUBLISH_DATE<='{month_end.isoformat()}')"
+            ),
+            "pageNumber": 1,
+            "pageSize": 200,
+            "sortColumns": "APPOINT_PUBLISH_DATE,SECURITY_CODE",
+            "sortTypes": "1,1",
+        }
+    )
+    try:
+        domestic = json.loads(
+            request(f"https://datacenter-web.eastmoney.com/api/data/v1/get?{domestic_params}").decode("utf-8")
+        )
+        domestic_rows = (domestic.get("result") or {}).get("data") or []
+        rows = [
+            {
+                "symbol": str(item.get("SECUCODE") or item.get("SECURITY_CODE") or ""),
+                "name": str(item.get("SECURITY_NAME_ABBR") or ""),
+                "release_date": str(item.get("APPOINT_PUBLISH_DATE") or "")[:10],
+                "report_period": str(item.get("REPORT_TYPE_NAME") or ""),
+                "actual_release_date": str(item.get("ACTUAL_PUBLISH_DATE") or "")[:10] or None,
+            }
+            for item in domestic_rows
+            if item.get("SECURITY_NAME_ABBR") and item.get("APPOINT_PUBLISH_DATE")
+        ][:12]
+        if rows:
+            return {
+                "date": local_day.isoformat(),
+                "month": month_start.strftime("%Y-%m"),
+                "observed_at": observed.isoformat(),
+                "rows": rows,
+                "source": "东方财富 A股财报预约表",
+                "scope_note": "优先展示国内公开预约表中本月尚待披露的前 12 家 A股公司；预约日可能由公司调整，实际披露状态以交易所公告为准。",
+            }
+    except Exception:
+        pass
+
+    payload = scan(
+        "china",
+        {
+            "filter": [
+                {"left": "type", "operation": "equal", "right": "stock"},
+                {"left": "market_cap_basic", "operation": "greater", "right": 10_000_000_000},
+                {"left": "earnings_release_next_date", "operation": "nempty"},
+            ],
+            "columns": ["name", "description", "earnings_release_next_date", "market_cap_basic", "currency"],
+            "sort": {"sortBy": "market_cap_basic", "sortOrder": "desc"},
+            "range": [0, 199],
+        },
+    )
+    rows = []
+    seen: set[tuple[str, str]] = set()
+    for item in payload.get("data") or []:
+        values = item.get("d") or []
+        timestamp = _number(values[2]) if len(values) > 2 else None
+        if timestamp is None:
+            continue
+        release = datetime.fromtimestamp(timestamp, timezone.utc).astimezone(SHANGHAI).date()
+        symbol = str(item.get("s") or values[0])
+        key = (symbol, release.isoformat())
+        if not local_day <= release <= month_end or key in seen:
+            continue
+        seen.add(key)
+        rows.append(
+            {
+                "symbol": symbol,
+                "name": str(values[1] or values[0]),
+                "release_date": release.isoformat(),
+                "market_cap": _number(values[3]) if len(values) > 3 else None,
+            }
+        )
+        if len(rows) >= 12:
+            break
+    return {
+        "date": local_day.isoformat(),
+        "month": month_start.strftime("%Y-%m"),
+        "observed_at": observed.isoformat(),
+        "rows": rows,
+        "source": "TradingView 免登录财报日历（国内预约表不可用时备用）",
+        "scope_note": "国内公开预约表不可用时，展示本月尚待披露且总市值不低于 100 亿元的代表性 A股；日期可能随后由公司调整。",
+    }
+
+
+def fetch_global_earnings_calendar(
+    *,
+    scan: Callable[[str, dict[str, object]], dict[str, object]] = _tradingview_scan,
+    now_provider: Callable[[], datetime] | None = None,
+) -> dict[str, object]:
+    """Return the remaining current-month earnings dates for four markets."""
+
+    observed = (now_provider or (lambda: datetime.now(timezone.utc)))()
+    local_day = observed.astimezone(SHANGHAI).date()
+    month_start = date(local_day.year, local_day.month, 1)
+    month_end = date(local_day.year + (local_day.month == 12), local_day.month % 12 + 1, 1) - timedelta(days=1)
+    markets: list[dict[str, object]] = []
+    gaps: list[str] = []
+    for region, (scanner, minimum_cap, label) in TRADINGVIEW_MARKETS.items():
+        try:
+            payload = scan(
+                scanner,
+                {
+                    "filter": [
+                        {"left": "type", "operation": "equal", "right": "stock"},
+                        {"left": "market_cap_basic", "operation": "greater", "right": minimum_cap},
+                        {"left": "earnings_release_next_date", "operation": "nempty"},
+                    ],
+                    "columns": ["name", "description", "earnings_release_next_date", "market_cap_basic", "currency"],
+                    "sort": {"sortBy": "market_cap_basic", "sortOrder": "desc"},
+                    "range": [0, 149],
+                },
+            )
+            rows = []
+            seen: set[tuple[str, str]] = set()
+            for item in payload.get("data") or []:
+                values = item.get("d") or []
+                timestamp = _number(values[2]) if len(values) > 2 else None
+                if timestamp is None:
+                    continue
+                release = datetime.fromtimestamp(timestamp, timezone.utc).date()
+                symbol = str(item.get("s") or values[0])
+                key = (symbol.split(":")[-1], release.isoformat())
+                if not month_start <= release <= month_end or key in seen:
+                    continue
+                seen.add(key)
+                rows.append(
+                    {
+                        "symbol": symbol,
+                        "name": str(values[1] or values[0]),
+                        "release_date": release.isoformat(),
+                        "market_cap": _number(values[3]) if len(values) > 3 else None,
+                        "currency": str(values[4] or "") if len(values) > 4 else "",
+                    }
+                )
+                if len(rows) >= 4:
+                    break
+            markets.append({"region": region, "label": label, "rows": rows})
+            if not rows:
+                gaps.append(f"{label}本月暂无满足口径的待披露日期")
+        except Exception as error:
+            gaps.append(f"{label}财报日历：{error}")
+            markets.append({"region": region, "label": label, "rows": []})
+    return {
+        "date": observed.astimezone(SHANGHAI).date().isoformat(),
+        "month": month_start.strftime("%Y-%m"),
+        "observed_at": observed.isoformat(),
+        "markets": markets,
+        "source": "TradingView 免登录财报日历",
+        "scope_note": "展示本月尚待披露、且通过各市场大盘股市值筛选的公司；日期可能随后由公司调整。",
+        "gaps": gaps,
+    }
 
 
 def _fetch_eastmoney_market_breadth(
@@ -1588,7 +2188,7 @@ def fetch_global_index_price_volume(
     *,
     limit: int = 80,
 ) -> dict[str, dict[str, object]]:
-    """Fetch bounded OHLCV statistics for every index shown in Market Overview."""
+    """Fetch bounded OHLCV statistics for the configured representative indices."""
 
     results: dict[str, dict[str, object]] = {}
     us_symbols = {"usINX": ".INX", "usIXIC": ".IXIC", "usDJI": ".DJI"}
@@ -1713,6 +2313,7 @@ def fetch_global_index_price_volume(
             "name": name,
             "market": market,
             **summarize_price_volume_history(rows),
+            "rows": rows,
             "source": source,
             "source_ref": source_ref,
         }
@@ -1791,15 +2392,12 @@ def market_session_metadata(
     return {"session": session, "label": label}
 
 
-def fetch_global_index_overview(
-    request: Callable[[str], bytes] = _request,
-    *,
-    now_provider: Callable[[], datetime] | None = None,
-) -> dict[str, object]:
-    """Fetch each market's latest quote and identify its live trading session."""
-
-    observed = (now_provider or (lambda: datetime.now(timezone.utc)))()
-    codes = ",".join(item[0] for item in GLOBAL_INDEX_CODES)
+def _fetch_tencent_index_rows(
+    index_codes: tuple[tuple[str, str, str, str], ...],
+    request: Callable[[str], bytes],
+    observed: datetime,
+) -> list[dict[str, object]]:
+    codes = ",".join(item[0] for item in index_codes)
     payload = request(f"https://qt.gtimg.cn/q={codes}").decode("gbk", errors="ignore")
     raw: dict[str, list[str]] = {}
     for line in payload.splitlines():
@@ -1807,7 +2405,7 @@ def fetch_global_index_overview(
         if match:
             raw[match.group(1)] = match.group(2).split("~")
     rows: list[dict[str, object]] = []
-    for code, name, market, currency in GLOBAL_INDEX_CODES:
+    for code, name, market, currency in index_codes:
         fields = raw.get(code) or []
         if len(fields) < 38:
             continue
@@ -1818,7 +2416,8 @@ def fetch_global_index_overview(
             continue
         if close is None or close <= 0 or change is None or change_percent is None:
             continue
-        volume = _number(fields[6]) if market in {"CN", "US"} else None
+        parsed_volume = _number(fields[6]) if market in {"CN", "US"} else None
+        volume = parsed_volume if parsed_volume is not None and parsed_volume > 0 else None
         amount = None
         if market == "CN":
             raw_amount = _number(fields[37])
@@ -1840,12 +2439,26 @@ def fetch_global_index_overview(
                 "volume": volume,
                 "amount": amount,
                 "session": session,
+                "session_label": session,
+                "source": "腾讯财经公开行情",
             }
         )
-    if len(rows) != len(GLOBAL_INDEX_CODES):
+    if len(rows) != len(index_codes):
         present_names = {str(row["name"]) for row in rows}
-        missing = [name for _, name, _, _ in GLOBAL_INDEX_CODES if name not in present_names]
+        missing = [name for _, name, _, _ in index_codes if name not in present_names]
         raise ValueError(f"指数行情不完整：{'、'.join(missing)}")
+    return rows
+
+
+def fetch_global_index_overview(
+    request: Callable[[str], bytes] = _request,
+    *,
+    now_provider: Callable[[], datetime] | None = None,
+) -> dict[str, object]:
+    """Fetch the legacy 13-index batch for compatibility and evidence history."""
+
+    observed = (now_provider or (lambda: datetime.now(timezone.utc)))()
+    rows = _fetch_tencent_index_rows(GLOBAL_INDEX_CODES, request, observed)
     cn_row = next((row for row in rows if row["market"] == "CN"), rows[0])
     cn_session = str(cn_row["session"])
     session_meta = market_session_metadata("CN", str(cn_row["trade_date"]), observed)
@@ -1857,6 +2470,270 @@ def fetch_global_index_overview(
         "rows": rows,
         "source": "腾讯财经公开行情",
         "activity_note": "A股、港股优先展示成交额；美股指数展示成交量。各市场保留各自交易日。",
+    }
+
+
+def fetch_a_share_index_overview(
+    request: Callable[[str], bytes] = _request,
+    *,
+    now_provider: Callable[[], datetime] | None = None,
+) -> dict[str, object]:
+    """Fetch the seven A-share benchmarks without coupling them to overseas sources."""
+
+    observed = (now_provider or (lambda: datetime.now(timezone.utc)))()
+    rows = _fetch_tencent_index_rows(A_SHARE_INDEX_CODES, request, observed)
+    session_meta = market_session_metadata("CN", str(rows[0]["trade_date"]), observed)
+    return {
+        "date": max(str(row["trade_date"]) for row in rows),
+        "session": session_meta["session"],
+        "session_label": session_meta["label"],
+        "observed_at": observed.isoformat(),
+        "rows": rows,
+        "source": "腾讯财经公开行情",
+        "activity_note": "七个 A 股基准统一展示成交额，并保留各自交易日期。",
+    }
+
+
+def _history_index_row(
+    *,
+    code: str,
+    name: str,
+    market: str,
+    currency: str,
+    rows: list[dict[str, object]],
+    observed: datetime,
+    source: str,
+) -> dict[str, object]:
+    valid = [row for row in rows if _number(row.get("close")) not in (None, 0)]
+    if not valid:
+        raise ValueError(f"{name}没有有效日线")
+    latest = valid[-1]
+    previous = valid[-2] if len(valid) > 1 else None
+    close = float(latest["close"])
+    previous_close = float(previous["close"]) if previous else None
+    change = close - previous_close if previous_close else None
+    change_percent = change / previous_close * 100 if change is not None and previous_close else None
+    trade_date = _canonical_date(str(latest["date"]))
+    zone = ZoneInfo("Asia/Tokyo" if market == "JP" else "Asia/Seoul")
+    local = observed.astimezone(zone)
+    session_label = detect_market_session(local.replace(tzinfo=None), market.lower()).label
+    session = "盘中" if session_label in {"盘中", "午间"} else "盘前" if session_label == "盘前" else "盘后"
+    return {
+        "code": code,
+        "name": name,
+        "market": market,
+        "currency": currency,
+        "trade_date": trade_date,
+        "close": close,
+        "change": change,
+        "change_percent": change_percent,
+        "volume": _number(latest.get("volume")),
+        "amount": None,
+        "session": session,
+        "session_label": session_label,
+        "source": source,
+    }
+
+
+def _fetch_yahoo_index_row(
+    encoded_symbol: str,
+    name: str,
+    code: str,
+    observed: datetime,
+    request: Callable[[str], bytes],
+) -> dict[str, object]:
+    params = urllib.parse.urlencode({"range": "10d", "interval": "1d", "events": "history"})
+    payload = json.loads(request(f"https://query1.finance.yahoo.com/v8/finance/chart/{encoded_symbol}?{params}"))
+    result = (((payload.get("chart") or {}).get("result") or [None])[0])
+    if not result:
+        raise ValueError(f"{name}的 Yahoo 日线不可用")
+    quote = (((result.get("indicators") or {}).get("quote") or [{}])[0])
+    rows = []
+    for index, timestamp in enumerate(result.get("timestamp") or []):
+        closes = quote.get("close") or []
+        volumes = quote.get("volume") or []
+        if index >= len(closes) or closes[index] in (None, 0):
+            continue
+        rows.append(
+            {
+                "date": datetime.fromtimestamp(timestamp, ZoneInfo("Asia/Tokyo")).strftime("%Y%m%d"),
+                "close": closes[index],
+                "volume": volumes[index] if index < len(volumes) else None,
+            }
+        )
+    return _history_index_row(
+        code=code,
+        name=name,
+        market="JP",
+        currency="JPY",
+        rows=rows,
+        observed=observed,
+        source="Yahoo Finance 免登录日线",
+    )
+
+
+def _fetch_sina_nikkei_row(
+    observed: datetime,
+    request: Callable[[str], bytes],
+) -> dict[str, object]:
+    payload = request("https://hq.sinajs.cn/list=int_nikkei").decode("gbk", errors="ignore")
+    match = re.search(r'="([^"]+)"', payload)
+    fields = match.group(1).split(",") if match else []
+    if len(fields) < 4:
+        raise ValueError("日经225的新浪备用行情不可用")
+    close, change, change_percent = (_number(fields[index]) for index in (1, 2, 3))
+    if close in (None, 0) or change is None or change_percent is None:
+        raise ValueError("日经225的新浪备用行情不完整")
+    tokyo = observed.astimezone(ZoneInfo("Asia/Tokyo"))
+    trade_day = previous_or_same_session(tokyo.date(), "jp")
+    session_label = detect_market_session(tokyo.replace(tzinfo=None), "jp").label
+    session = "盘中" if session_label in {"盘中", "午间"} else "盘前" if session_label == "盘前" else "盘后"
+    return {
+        "code": "N225",
+        "name": "日经225",
+        "market": "JP",
+        "currency": "JPY",
+        "trade_date": trade_day.isoformat(),
+        "close": close,
+        "change": change,
+        "change_percent": change_percent,
+        "volume": None,
+        "amount": None,
+        "session": session,
+        "session_label": session_label,
+        "source": "新浪财经公开行情（Yahoo 备用失败后采用）",
+    }
+
+
+def _fetch_tradingview_index_rows(
+    observed: datetime,
+    scan: Callable[[str, dict[str, object]], dict[str, object]] = _tradingview_scan,
+) -> list[dict[str, object]]:
+    payload = scan(
+        "global",
+        {
+            "symbols": {"tickers": ["TVC:NI225", "SP:SPX", "NASDAQ:IXIC"], "query": {"types": []}},
+            "columns": ["name", "description", "close", "change", "currency"],
+        },
+    )
+    specs = {
+        "TVC:NI225": ("N225", "日经225", "JP", "JPY", "jp", ZoneInfo("Asia/Tokyo")),
+        "SP:SPX": ("INX", "标普500", "US", "USD", "us", ZoneInfo("America/New_York")),
+        "NASDAQ:IXIC": ("IXIC", "纳斯达克", "US", "USD", "us", ZoneInfo("America/New_York")),
+    }
+    rows = []
+    for item in payload.get("data") or []:
+        spec = specs.get(str(item.get("s") or ""))
+        values = item.get("d") or []
+        close = _number(values[2]) if len(values) > 2 else None
+        change_percent = _number(values[3]) if len(values) > 3 else None
+        if spec is None or close in (None, 0) or change_percent is None:
+            continue
+        code, name, market, currency, calendar_market, zone = spec
+        previous_close = close / (1 + change_percent / 100) if change_percent != -100 else None
+        local = observed.astimezone(zone)
+        if calendar_market in {"jp", "kr"}:
+            trade_day = previous_or_same_session(local.date(), calendar_market)
+        else:
+            trade_day = local.date()
+            while trade_day.weekday() >= 5:
+                trade_day -= timedelta(days=1)
+        session_label = detect_market_session(local.replace(tzinfo=None), calendar_market).label
+        session = "盘中" if session_label in {"盘中", "午间"} else "盘前" if session_label == "盘前" else "盘后"
+        rows.append(
+            {
+                "code": code,
+                "name": name,
+                "market": market,
+                "currency": currency,
+                "trade_date": trade_day.isoformat(),
+                "close": close,
+                "change": close - previous_close if previous_close else None,
+                "change_percent": change_percent,
+                "volume": None,
+                "amount": None,
+                "session": session,
+                "session_label": session_label,
+                "source": "TradingView 免登录指数行情",
+            }
+        )
+    return rows
+
+
+def _fetch_naver_index_row(
+    symbol: str,
+    name: str,
+    observed: datetime,
+    request: Callable[[str], bytes],
+) -> dict[str, object]:
+    seoul_day = previous_or_same_session(observed.astimezone(ZoneInfo("Asia/Seoul")).date(), "kr")
+    params = urllib.parse.urlencode(
+        {
+            "symbol": symbol,
+            "requestType": 1,
+            "startTime": (seoul_day - timedelta(days=14)).strftime("%Y%m%d"),
+            "endTime": seoul_day.strftime("%Y%m%d"),
+            "timeframe": "day",
+        }
+    )
+    payload = request(f"https://api.finance.naver.com/siseJson.naver?{params}").decode("utf-8", errors="ignore")
+    rows = [
+        {"date": day, "close": float(close), "volume": float(volume)}
+        for day, close, volume in re.findall(
+            r'\[\s*"(\d{8})"\s*,\s*[\d.]+\s*,\s*[\d.]+\s*,\s*[\d.]+\s*,\s*([\d.]+)\s*,\s*([\d.]+)',
+            payload,
+        )
+    ]
+    return _history_index_row(
+        code=symbol,
+        name=name,
+        market="KR",
+        currency="KRW",
+        rows=rows,
+        observed=observed,
+        source="Naver Finance 免登录日线",
+    )
+
+
+def fetch_cross_market_index_overview(
+    request: Callable[[str], bytes] = _request,
+    *,
+    now_provider: Callable[[], datetime] | None = None,
+    scan: Callable[[str, dict[str, object]], dict[str, object]] = _tradingview_scan,
+) -> dict[str, object]:
+    """Fetch a balanced HK/JP/KR/US overview while retaining per-source gaps."""
+
+    observed = (now_provider or (lambda: datetime.now(timezone.utc)))()
+    rows: list[dict[str, object]] = []
+    gaps: list[str] = []
+    try:
+        rows.extend(_fetch_tencent_index_rows(GLOBAL_TENCENT_INDEX_CODES, request, observed))
+    except Exception as error:
+        gaps.append(f"港股/美股：{error}")
+    try:
+        verified_rows = _fetch_tradingview_index_rows(observed, scan)
+        verified_keys = {(str(row["market"]), str(row["code"])) for row in verified_rows}
+        rows = [row for row in rows if (str(row["market"]), str(row["code"])) not in verified_keys]
+        rows.extend(verified_rows)
+        if not any(row["market"] == "JP" for row in verified_rows):
+            raise ValueError("TradingView 未返回有效日经225")
+    except Exception as error:
+        gaps.append(f"日经225：{error}")
+    for symbol, name in KR_NAVER_INDEX_CODES:
+        try:
+            rows.append(_fetch_naver_index_row(symbol, name, observed, request))
+        except Exception as error:
+            gaps.append(f"{name}：{error}")
+    present = {str(row["market"]) for row in rows}
+    if not rows or not present.intersection({"HK", "JP", "KR", "US"}):
+        raise ValueError("全球指数行情暂不可用")
+    return {
+        "date": max(str(row["trade_date"]) for row in rows),
+        "observed_at": observed.isoformat(),
+        "rows": rows,
+        "source": "腾讯财经 + TradingView + Naver Finance",
+        "gaps": gaps,
+        "activity_note": "仅展示来源可核验且大于零的成交额/成交量；指数来源未披露时保持为空。不同币种活跃度不直接横向比较。",
     }
 
 
@@ -2097,8 +2974,8 @@ def fetch_market_pulse(
             "session": session,
             "kind": "holding_news",
             "news": news[:12],
-            "source": "stock-analysis 4.14.0 · 持仓公开资讯雷达",
-            "skill_version": "4.14.0",
+            "source": "stock-analysis 4.15.0 · 持仓公开资讯雷达",
+            "skill_version": "4.15.0",
         }
 
     pools = pools_loader(trade_date)
@@ -2166,8 +3043,8 @@ def fetch_market_pulse(
             else None,
             "rows": risk_rows,
         },
-        "source": "stock-analysis 4.14.0 · 东方财富涨跌停池",
-        "skill_version": "4.14.0",
+        "source": "stock-analysis 4.15.0 · 东方财富涨跌停池",
+        "skill_version": "4.15.0",
     }
 
 

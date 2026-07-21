@@ -35,7 +35,14 @@ from .providers import (
     target_trade_date,
 )
 
-MARKET_OVERVIEW_SECURITY_ID = "MARKET:GLOBAL:OVERVIEW"
+A_SHARE_MARKET_OVERVIEW_SECURITY_ID = "MARKET:CN:OVERVIEW"
+GLOBAL_MARKET_OVERVIEW_SECURITY_ID = "MARKET:GLOBAL:OVERVIEW"
+MARKET_OVERVIEW_SECURITY_IDS = {
+    A_SHARE_MARKET_OVERVIEW_SECURITY_ID,
+    GLOBAL_MARKET_OVERVIEW_SECURITY_ID,
+}
+# Compatibility alias for existing imports and archived notes.
+MARKET_OVERVIEW_SECURITY_ID = GLOBAL_MARKET_OVERVIEW_SECURITY_ID
 
 
 class ResearchSkillLayer(Protocol):
@@ -333,6 +340,17 @@ def _correlation(left: dict[str, float], right: dict[str, float]) -> tuple[float
     numerator = sum((x - x_mean) * (y - y_mean) for x, y in zip(xs, ys))
     denominator = math.sqrt(sum((x - x_mean) ** 2 for x in xs) * sum((y - y_mean) ** 2 for y in ys))
     return (round(numerator / denominator, 4) if denominator else None), len(dates)
+
+
+def _beta(asset: dict[str, float], benchmark: dict[str, float]) -> tuple[float | None, int]:
+    dates = sorted(set(asset) & set(benchmark))
+    if len(dates) < 60:
+        return None, len(dates)
+    xs, ys = [asset[item] for item in dates], [benchmark[item] for item in dates]
+    x_mean, y_mean = sum(xs) / len(xs), sum(ys) / len(ys)
+    covariance = sum((x - x_mean) * (y - y_mean) for x, y in zip(xs, ys))
+    benchmark_variance = sum((y - y_mean) ** 2 for y in ys)
+    return (round(covariance / benchmark_variance, 4) if benchmark_variance else None), len(dates)
 
 
 def _portfolio_drawdown_proxy(
@@ -656,6 +674,17 @@ def _compact_upstream_pack(pack: dict[str, object]) -> dict[str, object]:
         "symbol": pack.get("symbol") or pack.get("code"),
         "name": pack.get("name"),
         "trade_date": pack.get("trade_date"),
+        "market": pack.get("market"),
+        "quote": pack.get("quote"),
+        "financial_facts": pack.get("financial_facts") or [],
+        "financial_history": pack.get("financial_history") or [],
+        "price_volume": pack.get("price_volume"),
+        "estimate": pack.get("estimate"),
+        "profile": pack.get("profile"),
+        "holdings": pack.get("holdings"),
+        "index_snapshot": pack.get("index_snapshot"),
+        "index_comparison": pack.get("index_comparison"),
+        "premium_discount": pack.get("premium_discount"),
         "coverage": meta.get("coverage"),
         "source_events": meta.get("source_events") or [],
         "modules": {
@@ -909,12 +938,10 @@ class AppResearchSkillLayer:
         current_order_books: list[dict[str, object]] = []
         execution_models: list[dict[str, object]] = []
 
-        if security_id == MARKET_OVERVIEW_SECURITY_ID:
+        if security_id in MARKET_OVERVIEW_SECURITY_IDS:
             security_ids = [
                 str(item["security_id"])
                 for item in self.vault.holding_summaries()
-                if str(item["security_id"]).startswith("CN:")
-                and str(item["security_id"]).endswith(":STOCK")
             ]
         elif security_id.startswith("CN:") and security_id.endswith(":STOCK"):
             security_ids = [security_id]
@@ -924,7 +951,11 @@ class AppResearchSkillLayer:
         for held_security_id in security_ids:
             symbol = held_security_id.split(":")[2]
             try:
-                pack = self._company_pack(symbol, target)
+                if held_security_id.endswith(":FUND"):
+                    pack = self._fund_pack(symbol, target)
+                else:
+                    upstream_symbol = f"{symbol}.HK" if held_security_id.startswith("HK:") else symbol
+                    pack = self._company_pack(upstream_symbol, target)
             except Exception as error:
                 gaps.append(f"{symbol}当前盘口与交易成本代理暂不可得：{error}")
                 continue
@@ -990,7 +1021,16 @@ class AppResearchSkillLayer:
     ) -> dict[str, object]:
         companies = []
         for payload in payloads:
-            periods = list(payload.get("periods") or [])
+            periods = [
+                {
+                    **row,
+                    "period": row.get("period") or row.get("report_date"),
+                    "parent_net_profit": row.get("parent_net_profit", row.get("parent_netprofit")),
+                    "roe": row.get("roe", row.get("roe_weighted")),
+                    "free_cash_flow": row.get("free_cash_flow", row.get("free_cash_flow_lite")),
+                }
+                for row in list(payload.get("periods") or [])
+            ]
             latest = periods[0] if periods else {}
             missing_fields = [
                 label
@@ -1003,8 +1043,8 @@ class AppResearchSkillLayer:
             ]
             if missing_fields:
                 gaps.append(f"{payload.get('name') or payload.get('symbol') or '公司'}最新报告期缺少：{'、'.join(missing_fields)}")
-            upstream_pack = None
-            if inherit_stock_analysis:
+            upstream_pack = payload.get("stock_analysis_evidence_pack")
+            if inherit_stock_analysis and upstream_pack is None:
                 try:
                     upstream_pack = _compact_upstream_pack(self._company_pack(
                         str(payload.get("symbol") or ""), as_of
@@ -1014,6 +1054,7 @@ class AppResearchSkillLayer:
             company = {
                     **({"stock_analysis_evidence_pack": upstream_pack} if upstream_pack else {}),
                     **payload,
+                    "periods": periods,
                     "single_quarters": _quarterly_decomposition(periods),
                     "cashflow_year_bridge": _cashflow_year_bridge(periods),
                     "working_capital_bridge": _working_capital_bridge(periods),
@@ -1040,15 +1081,23 @@ class AppResearchSkillLayer:
                     gaps.append(f"{symbol}：{error}")
                 continue
             upstream_symbol = f"{symbol}.HK" if security_id.startswith("HK:") else symbol
-            payload = {
-                "security_id": security_id,
-                "symbol": upstream_symbol,
-                "name": symbol,
-                "source": "stock-analysis公司证据包",
-                "periods": [],
-            }
-            payloads.append(payload)
-            gaps.append(f"{symbol}：stock-analysis当前未提供港股标准化三表，已保留C1-C8公开证据及明确缺口")
+            try:
+                pack = self._company_pack(upstream_symbol, as_of.isoformat())
+            except Exception as error:
+                payloads.append({
+                    "security_id": security_id, "symbol": upstream_symbol, "name": symbol,
+                    "source": "stock-analysis公司证据包", "periods": [],
+                })
+                gaps.append(f"{symbol}：stock-analysis公司证据包暂不可得：{error}")
+            else:
+                payloads.append({
+                    "security_id": security_id,
+                    "symbol": upstream_symbol,
+                    "name": pack.get("name") or symbol,
+                    "source": "stock-analysis公司证据包",
+                    "periods": pack.get("financial_history") or [],
+                    "stock_analysis_evidence_pack": _compact_upstream_pack(pack),
+                })
         return self._financial_result(
             payloads, gaps, as_of.isoformat(), inherit_stock_analysis=inherit_stock_analysis
         )
@@ -1133,10 +1182,10 @@ class AppResearchSkillLayer:
 
     def _portfolio_risk(self, security_id: str) -> dict[str, object]:
         entries = self.vault.holding_entries()
-        position_quantities: dict[str, str] = {}
+        position_quantities: dict[str, float] = defaultdict(float)
         for account in self.vault.connection.execute("SELECT account_id FROM accounts"):
             for position in self.vault.project_positions(str(account["account_id"])):
-                position_quantities[position.security_id] = position.quantity
+                position_quantities[position.security_id] += float(position.quantity)
         totals: dict[str, float] = defaultdict(float)
         for item in entries:
             totals[str(item["security_id"])] += float(item["invested_amount_cny"])
@@ -1221,7 +1270,9 @@ class AppResearchSkillLayer:
                 if purchase_row and (purchase_row.get("unit_nav") or purchase_row.get("close"))
                 else None
             )
-            currency = "HKD" if str(item["asset_type"]) == "hk_stock" else "CNY"
+            currency = {"hk_stock": "HKD", "us_stock": "USD"}.get(
+                str(item["asset_type"]), "CNY"
+            )
             purchase_fx = None
             if purchase_price not in (None, 0):
                 try:
@@ -1286,7 +1337,9 @@ class AppResearchSkillLayer:
                 "pe_ttm": live_quote.get("pe_ttm"),
                 "pb": live_quote.get("pb"),
                 "market_cap_100m": live_quote.get("market_cap_100m"),
-                "currency": live_quote.get("currency") or ("HKD" if asset_types.get(held_security_id) == "hk_stock" else "CNY"),
+                "currency": live_quote.get("currency") or {
+                    "hk_stock": "HKD", "us_stock": "USD",
+                }.get(asset_types.get(held_security_id), "CNY"),
                 "trade_date": live_quote.get("trade_date") or (rows[-1].get("date") if rows else None),
                 "source": live_quote.get("source") or ("公开历史收盘/NAV" if rows else None),
             }
@@ -1321,22 +1374,47 @@ class AppResearchSkillLayer:
                 "fx_cny_per_unit": round(fx_rate, 8),
                 "fx_as_of": current_fx.get("as_of"),
             }
-        selected_returns = return_series.get(security_id, {})
-        for other_id in totals:
-            if other_id == security_id or not selected_returns:
-                continue
-            other_returns = return_series.get(other_id)
-            if not other_returns:
-                continue
-            correlation, samples = _correlation(selected_returns, other_returns)
-            correlations.append({
-                **holding_identities[other_id],
-                "security_id": other_id,
-                "correlation": correlation,
+        holding_ids = list(totals)
+        for index, left_id in enumerate(holding_ids):
+            for right_id in holding_ids[index + 1:]:
+                correlation, samples = _correlation(
+                    return_series.get(left_id, {}), return_series.get(right_id, {})
+                )
+                correlations.append({
+                    "left": holding_identities[left_id],
+                    "right": holding_identities[right_id],
+                    "correlation": correlation,
+                    "overlap_samples": samples,
+                })
+                if correlation is None:
+                    gaps.append(f"{left_id}与{right_id}重合收益样本不足60个")
+        betas: list[dict[str, object]] = []
+        try:
+            benchmark_payload = fetch_global_index_price_volume(limit=history_limit)
+        except Exception as error:
+            benchmark_payload = {}
+            gaps.append(f"组合基准历史暂不可得：{error}")
+        benchmark_by_asset = {
+            "a_share": "sh000300", "fund": "sh000300",
+            "hk_stock": "hkHSI", "us_stock": "usINX",
+        }
+        for held_security_id in holding_ids:
+            benchmark_id = benchmark_by_asset.get(asset_types.get(held_security_id, ""))
+            benchmark_rows = (
+                list((benchmark_payload.get(benchmark_id) or {}).get("rows") or [])
+                if benchmark_id else []
+            )
+            beta, samples = _beta(
+                return_series.get(held_security_id, {}), _returns_by_date(benchmark_rows)
+            )
+            betas.append({
+                **holding_identities[held_security_id],
+                "benchmark": benchmark_id,
+                "beta": beta,
                 "overlap_samples": samples,
             })
-            if correlation is None:
-                gaps.append(f"{other_id}与当前标的重合收益样本不足60个")
+            if beta is None:
+                gaps.append(f"{held_security_id}与基准重合收益样本不足60个，beta暂不可得")
         analysis_start = max((str(item["bought_on"]) for item in entries), default="")
         market_value_total = sum(market_values.values())
         market_value_complete = bool(entries) and len(market_values) == len(totals)
@@ -1394,6 +1472,7 @@ class AppResearchSkillLayer:
             },
             "hhi": round(sum(value * value for value in weights.values()), 6),
             "correlations": correlations,
+            "betas": betas,
             "correlation_note": "相关性基于公开日收盘/NAV收益率，至少60个重合样本；它描述历史共同波动，不保证未来关系。",
             "market_value_status": (
                 "available_derived_quantity_estimate" if market_value_complete
@@ -1510,9 +1589,19 @@ class AppResearchSkillLayer:
     def _market_context(self, security_id: str, question: str = "") -> dict[str, object]:
         target = target_trade_date()
         gaps: list[str] = []
-        if security_id == MARKET_OVERVIEW_SECURITY_ID:
+        if security_id in MARKET_OVERVIEW_SECURITY_IDS:
+            is_a_share_only = security_id == A_SHARE_MARKET_OVERVIEW_SECURITY_ID
             sections: dict[str, dict[str, object]] = {}
-            for section in ("indices", "lhb", "industry_flow", "pulse", "market_news"):
+            section_names = (
+                ("indices", "lhb", "industry_flow", "pulse", "a_market_news", "a_share_themes", "a_share_earnings_calendar")
+                if is_a_share_only
+                else (
+                    "indices", "lhb", "industry_flow", "pulse", "a_market_news", "a_share_themes",
+                    "a_share_earnings_calendar", "global_indices", "global_market_news",
+                    "global_market_movers", "global_earnings_calendar", "global_themes",
+                )
+            )
+            for section in section_names:
                 row = self.vault.connection.execute(
                     "SELECT trade_date, source, payload_json, observed_at FROM market_snapshots "
                     "WHERE section = ? ORDER BY observed_at DESC LIMIT 1",
@@ -1521,43 +1610,79 @@ class AppResearchSkillLayer:
                 if row:
                     sections[section] = json.loads(str(row["payload_json"]))
                 else:
-                    gaps.append(f"市场概览缺少{section}最新快照")
+                    gaps.append(f"大盘概览缺少{section}最新快照")
             indices = sections.get("indices", {})
             lhb = sections.get("lhb", {})
             flow = sections.get("industry_flow", {})
             pulse = sections.get("pulse", {})
-            market_news = sections.get("market_news", {})
+            a_market_news = sections.get("a_market_news", {})
+            global_market_news = sections.get("global_market_news", {})
             requested_session = next((item for item in ("盘前", "盘中", "盘后") if item in question), None)
-            actual_session = indices.get("session")
+            global_indices = sections.get("global_indices", {})
+            actual_session = indices.get("session") or global_indices.get("session")
+            market_breadth: dict[str, object] = {"available": False, "trade_date": target.isoformat()}
+            continuous_price_volume: dict[str, object] = {}
             try:
                 market_breadth = fetch_a_share_market_breadth(target)
             except Exception as error:
-                market_breadth = {"available": False, "trade_date": target.isoformat()}
                 gaps.append(f"A股全市场涨跌家数暂不可得：{error}")
             try:
                 continuous_price_volume = fetch_global_index_price_volume()
             except Exception as error:
-                continuous_price_volume = {}
                 gaps.append(f"主要指数连续量价暂不可得：{error}")
             if not continuous_price_volume:
                 gaps.append("主要指数连续量价没有形成有效样本")
-            if not market_news.get("items") and not market_news.get("news") and not market_news.get("rows"):
+            market_news = list(a_market_news.get("items") or []) + list(global_market_news.get("items") or [])
+            if not market_news:
                 gaps.append("隔夜至当前时点没有取得可核验的大盘新增资讯")
-            session_label = str(indices.get("session_label") or "")
+            session_label = str(indices.get("session_label") or global_indices.get("session_label") or "")
             if actual_session == "盘前" or "盘前" in session_label:
                 gaps.append("盘前集合竞价仅在交易所实时窗口可验证；当前证据未形成完整竞价快照")
             if not market_breadth.get("available"):
                 gaps.append("当前时点实时涨跌家数未形成完整全市场分页样本")
             if not flow.get("date") or str(flow.get("date")) != str(indices.get("date")):
                 gaps.append("当前时点实时行业资金流未与指数日期形成同日完整样本")
+            freshness_audit = {
+                "a_share_index_date": indices.get("date"),
+                "breadth_date": market_breadth.get("trade_date"),
+                "industry_flow_date": flow.get("date"),
+                "pulse_date": pulse.get("date"),
+                "a_market_news_date": a_market_news.get("date"),
+                "a_share_themes_date": (sections.get("a_share_themes") or {}).get("date"),
+                "a_share_earnings_month": (sections.get("a_share_earnings_calendar") or {}).get("month"),
+                "auction_snapshot_available": False,
+                "current_order_book_scope": "由盘口与系统性流动性证据按A股持仓逐只提供当前快照",
+            }
+            if not is_a_share_only:
+                freshness_audit.update({
+                    "global_index_date": global_indices.get("date"),
+                    "global_market_news_date": global_market_news.get("date"),
+                    "global_movers_date": (sections.get("global_market_movers") or {}).get("date"),
+                    "global_earnings_month": (sections.get("global_earnings_calendar") or {}).get("month"),
+                    "global_themes_date": (sections.get("global_themes") or {}).get("date"),
+                })
+            liquidity_boundaries = {
+                "financing_conditions": "当前证据包没有统一、可核验的融资余额与融资利率期限序列",
+                "order_book_depth": "单只A股可取得当前五档盘口；历史全市场盘口深度不可回溯",
+                "credit_spreads": "尚未建立与持仓风险口径一致的信用利差曲线",
+                "fund_net_flows": "基金规模变化不能替代真实净申购赎回",
+            }
+            if not is_a_share_only:
+                liquidity_boundaries.update({
+                    "cross_currency": "各市场成交额和市值使用各自本币，跨币种比较前必须统一口径",
+                    "leaderboard_scope": "领涨榜经过市值与成交筛选，不代表无门槛全市场排序",
+                    "theme_method": "主题为透明代表证券等权代理，不冒充交易所主题指数",
+                })
             value = {
                 "scene": "market_overview",
-                "market_date": indices.get("date"),
+                "market_scope": "a_share" if is_a_share_only else "all_available_markets",
+                "market_date": indices.get("date") or global_indices.get("date"),
                 "session": actual_session,
                 "session_label": session_label or None,
                 "requested_session": requested_session,
                 "session_mismatch": bool(requested_session and actual_session != requested_session),
                 "major_indices": indices.get("rows") or [],
+                "global_indices": [] if is_a_share_only else global_indices.get("rows") or [],
                 "market_breadth": market_breadth,
                 "continuous_price_volume": continuous_price_volume,
                 "dragon_tiger": lhb.get("rows") or [],
@@ -1568,34 +1693,27 @@ class AppResearchSkillLayer:
                 },
                 "limit_up_down_diffusion": pulse if pulse.get("kind") == "limit_pools" else None,
                 "premarket_holding_news": pulse.get("news") if pulse.get("kind") == "holding_news" else None,
-                "overnight_market_news": (
-                    market_news.get("items") or market_news.get("news") or market_news.get("rows") or []
-                ),
-                "freshness_audit": {
-                    "index_date": indices.get("date"),
-                    "breadth_date": market_breadth.get("trade_date"),
-                    "industry_flow_date": flow.get("date"),
-                    "pulse_date": pulse.get("date"),
-                    "market_news_date": market_news.get("date"),
-                    "auction_snapshot_available": False,
-                    "current_order_book_scope": "由盘口与系统性流动性证据按A股持仓逐只提供当前快照",
-                },
-                "liquidity_boundaries": {
-                    "financing_conditions": "当前证据包没有统一、可核验的融资余额与融资利率期限序列",
-                    "order_book_depth": "单只A股可取得当前五档盘口；历史全市场盘口深度不可回溯",
-                    "credit_spreads": "尚未建立与持仓风险口径一致的信用利差曲线",
-                    "fund_net_flows": "基金规模变化不能替代真实净申购赎回",
-                },
+                "a_share_market_news": a_market_news.get("items") or [],
+                "a_share_themes": sections.get("a_share_themes"),
+                "a_share_earnings_calendar": sections.get("a_share_earnings_calendar"),
+                "global_market_news": [] if is_a_share_only else global_market_news.get("items") or [],
+                "global_market_movers": None if is_a_share_only else sections.get("global_market_movers"),
+                "global_earnings_calendar": None if is_a_share_only else sections.get("global_earnings_calendar"),
+                "global_themes": None if is_a_share_only else sections.get("global_themes"),
+                "overnight_market_news": market_news,
+                "freshness_audit": freshness_audit,
+                "liquidity_boundaries": liquidity_boundaries,
                 "report_boundary": (
-                    "仅生成大盘行情报告；必须先披露证据的实际日期和时段。若用户选择时段与最新证据不一致，"
-                    "明确说明无法用较晚数据重建较早时段，不得改写时段标签。持仓建议必须基于本地账本并使用条件化表达。"
+                    "历史A股概览线程仅保留A股证据兼容。"
+                    if is_a_share_only
+                    else "使用当前全部可用市场、公开资料、可审计计算与本地持仓证据；页面栏目不是证据上限。"
                 ),
             }
             return self._result(
                 "market-context-evidence",
                 value,
                 gaps,
-                str(indices.get("date") or target.isoformat()),
+                str(indices.get("date") or global_indices.get("date") or target.isoformat()),
             )
         try:
             history = fetch_security_trading_history(security_id, limit=260)
@@ -1765,7 +1883,7 @@ class AppResearchSkillLayer:
 
     def run(self, *, security_id: str, question: str, role_id: str = "general") -> list[dict[str, object]]:
         normalized = question.lower()
-        is_market_overview = security_id == MARKET_OVERVIEW_SECURITY_ID
+        is_market_overview = security_id in MARKET_OVERVIEW_SECURITY_IDS
         is_fund = security_id.endswith(":FUND")
         results: list[dict[str, object]] = []
         requested = set(FRAMEWORK_SKILLS.get(role_id, FRAMEWORK_SKILLS["general"]))
@@ -1825,6 +1943,49 @@ class AppResearchSkillLayer:
                 as_of=target_trade_date(), inherit_stock_analysis=True
             ))
             requested.discard("company-financial-quality")
+        if is_market_overview and "security-valuation-evidence" in requested:
+            valuations: list[object] = []
+            valuation_gaps: list[str] = []
+            for holding in self.vault.holding_summaries():
+                held_security_id = str(holding["security_id"])
+                try:
+                    held_fund_payload = self._ensure_fund(held_security_id) if held_security_id.endswith(":FUND") else None
+                    result = self._valuation(held_security_id, held_fund_payload)
+                    valuations.extend(
+                        [item.get("value") for item in result.get("evidence") or [] if item.get("value")]
+                    )
+                    valuation_gaps.extend(str(item) for item in result.get("gaps") or [])
+                except Exception as error:
+                    valuation_gaps.append(f"{held_security_id}：{error}")
+            results.append(self._result(
+                "security-valuation-evidence",
+                valuations,
+                valuation_gaps or ([] if valuations else ["本地持仓未形成可核验估值证据"]),
+                target_trade_date().isoformat(),
+            ))
+            requested.discard("security-valuation-evidence")
+        if is_market_overview and "supplemental-company-evidence" in requested:
+            supplements: list[object] = []
+            supplemental_gaps: list[str] = []
+            for holding in self.vault.holding_summaries():
+                held_security_id = str(holding["security_id"])
+                if not held_security_id.endswith(":STOCK"):
+                    continue
+                try:
+                    result = self._supplemental_company(held_security_id)
+                    supplements.extend(
+                        [item.get("value") for item in result.get("evidence") or [] if item.get("value")]
+                    )
+                    supplemental_gaps.extend(str(item) for item in result.get("gaps") or [])
+                except Exception as error:
+                    supplemental_gaps.append(f"{held_security_id}：{error}")
+            results.append(self._result(
+                "supplemental-company-evidence",
+                supplements,
+                supplemental_gaps or ([] if supplements else ["本地股票持仓未形成公开定性补充证据"]),
+                target_trade_date().isoformat(),
+            ))
+            requested.discard("supplemental-company-evidence")
         if is_fund and fund_payload:
             if "fund-portfolio-evidence" in requested:
                 results.append(self._fund_portfolio(
@@ -1873,7 +2034,23 @@ class AppResearchSkillLayer:
                         result["status"] = "partial"
                     results.append(result)
             else:
-                results.append(self._financial_result([], ["港股结构化三表尚未建立稳定标准化适配；请核对关联的港交所官方财报原文"], cutoff.isoformat()))
+                upstream_symbol = f"{symbol}.HK" if security_id.startswith("HK:") else symbol
+                try:
+                    pack = self._company_pack(upstream_symbol, cutoff.isoformat())
+                except Exception as error:
+                    results.append(self._financial_result([], [str(error)], cutoff.isoformat()))
+                else:
+                    results.append(self._financial_result(
+                        [{
+                            "security_id": security_id,
+                            "symbol": upstream_symbol,
+                            "name": pack.get("name") or symbol,
+                            "source": "stock-analysis公司证据包",
+                            "periods": pack.get("financial_history") or [],
+                            "stock_analysis_evidence_pack": _compact_upstream_pack(pack),
+                        }],
+                        [], cutoff.isoformat(), inherit_stock_analysis=True,
+                    ))
         if not is_market_overview and not is_fund and "security-valuation-evidence" in requested:
             try:
                 results.append(self._valuation(security_id, None))

@@ -30,9 +30,9 @@ def test_upstream_version_check_is_advisory_and_does_not_replace_runtime() -> No
         "html_url": "https://github.com/AdvancingTitans/stock-analysis/releases/tag/v4.15.0",
     }))
 
-    assert status.bundled_version == "4.14.0"
+    assert status.bundled_version == "4.15.0"
     assert status.latest_version == "4.15.0"
-    assert status.update_available is True
+    assert status.update_available is False
     assert status.update_policy == "app_release"
 
 

@@ -123,19 +123,19 @@ type Workspace = {
     total_count: number;
   };
 };
-type Market = {
-  report_stage?: MarketReportStage;
-  indices?: {
+type MarketIndexOverview = {
     date: string;
-    session: "盘前" | "盘中" | "盘后";
-    session_label: string;
+    session?: "盘前" | "盘中" | "盘后";
+    session_label?: string;
     observed_at: string;
     source: string;
+    gaps?: string[];
+    activity_note?: string;
     rows: Array<{
       code: string;
       name: string;
-      market: "CN" | "HK" | "US";
-      currency: "CNY" | "HKD" | "USD";
+      market: "CN" | "HK" | "JP" | "KR" | "US";
+      currency: "CNY" | "HKD" | "JPY" | "KRW" | "USD";
       trade_date: string;
       close: number;
       change: number | null;
@@ -143,8 +143,28 @@ type Market = {
       volume: number | null;
       amount: number | null;
       session: "盘前" | "盘中" | "盘后";
+      session_label?: string;
+      source?: string;
     }>;
-  };
+};
+type MarketNews = {
+    date: string;
+    observed_at: string;
+    window_hours: number | null;
+    total_count: number;
+    source: string;
+    items: Array<{
+      region: "A股" | "港股" | "日股" | "韩股" | "美股";
+      title: string;
+      published_at: string;
+      url: string;
+      source: string;
+    }>;
+};
+type Market = {
+  report_stage?: MarketReportStage;
+  indices?: MarketIndexOverview;
+  global_indices?: MarketIndexOverview;
   lhb?: {
     date: string;
     source: string;
@@ -180,19 +200,42 @@ type Market = {
       net_ratio: number | null;
     }>;
   };
-  market_news?: {
+  market_news?: MarketNews;
+  a_market_news?: MarketNews;
+  a_share_themes?: {
     date: string;
-    observed_at: string;
-    window_hours: number;
-    total_count: number;
     source: string;
-    items: Array<{
-      region: "A股" | "港股" | "美股";
-      title: string;
-      published_at: string;
-      url: string;
-      source: string;
-    }>;
+    scope_note: string;
+    rows: Array<{ code: string; name: string; change_percent: number | null; close: number | null; available?: boolean }>;
+  };
+  a_share_earnings_calendar?: {
+    date: string;
+    month: string;
+    source: string;
+    scope_note: string;
+    rows: Array<{ symbol: string; name: string; release_date: string; report_period?: string; actual_release_date?: string | null }>;
+  };
+  global_market_news?: MarketNews;
+  global_market_movers?: {
+    date: string;
+    source: string;
+    scope_note: string;
+    gaps?: string[];
+    markets: Array<{ region: "HK" | "JP" | "KR" | "US"; label: string; rows: Array<{ symbol: string; name: string; close: number; change_percent: number; volume: number | null; currency: string }> }>;
+  };
+  global_earnings_calendar?: {
+    date: string;
+    month: string;
+    source: string;
+    scope_note: string;
+    gaps?: string[];
+    markets: Array<{ region: "HK" | "JP" | "KR" | "US"; label: string; rows: Array<{ symbol: string; name: string; release_date: string; currency: string }> }>;
+  };
+  global_themes?: {
+    date: string;
+    source: string;
+    method_note: string;
+    rows: Array<{ name: string; available_markets: Array<"HK" | "JP" | "KR" | "US">; markets: Array<{ region: "HK" | "JP" | "KR" | "US"; change_percent: number; sample_count: number; constituents: Array<{ symbol: string; name: string; change_percent: number }> }> }>;
   };
   pulse?: {
     date: string;
@@ -361,7 +404,7 @@ type ChatEvent = {
 };
 type ChatRun = {
   run_id: string;
-  status: "running" | "completed" | "failed";
+  status: "running" | "completed" | "failed" | "cancelled";
   current_stage: string;
   started_at: string;
   completed_at?: string | null;
@@ -373,7 +416,9 @@ type ChatDetail = ChatThread & {
 
 const navItems = [
   { key: "today", label: "今日复盘" },
-  { key: "market", label: "市场概览" },
+  { key: "market-council", label: "大盘议事厅" },
+  { key: "market", label: "A股概览" },
+  { key: "global-market", label: "全球概览" },
   { key: "portfolio", label: "持仓账本" },
   { key: "security", label: "证券资料" },
   { key: "research", label: "投资笔记" },
@@ -615,20 +660,55 @@ const EXPERT_AVATAR_BY_IDENTITY: Record<string, string> = {
   冯柳: "feng_liu",
 };
 
+const FUNCTIONAL_AVATAR_BY_IDENTITY: Record<string, string> = {
+  coordinator: "coordinator",
+  协调员: "coordinator",
+  evidence_collector: "evidence_researcher",
+  evidence_researcher: "evidence_researcher",
+  证据研究员: "evidence_researcher",
+  report_editor: "report_editor",
+  报告编辑器: "report_editor",
+  投资经理: "report_editor",
+  投研委员会报告: "report_editor",
+  risk_manager: "risk_manager",
+  风险与组合经理: "risk_manager",
+  "market-roundtable": "market-roundtable",
+  "market-committee": "market-roundtable",
+  "research-committee": "committee-roundtable",
+  committee: "committee-roundtable",
+  投研委员会: "committee-roundtable",
+  general: "general",
+  通用模式: "general",
+  投研大师: "general",
+  大盘主持人: "general",
+};
+
 function RoleAvatar({ name, identity = name }: { name: string; identity?: string }) {
   const compact = name.replace(/[\s·]/g, "");
   const initials = compact.length > 2 ? compact.slice(0, 2) : compact || "研";
   const avatarTone = [...identity].reduce((sum, character) => sum + character.charCodeAt(0), 0) % 6;
-  const avatarId = EXPERT_AVATAR_BY_IDENTITY[identity] ?? EXPERT_AVATAR_BY_IDENTITY[name];
+  const explicitExpertAvatarId = EXPERT_AVATAR_BY_IDENTITY[identity];
+  const explicitFunctionalAvatarId = FUNCTIONAL_AVATAR_BY_IDENTITY[identity];
+  const expertAvatarId = explicitExpertAvatarId ?? EXPERT_AVATAR_BY_IDENTITY[name];
+  const functionalAvatarId = explicitFunctionalAvatarId ?? FUNCTIONAL_AVATAR_BY_IDENTITY[name];
+  const avatarSrc = explicitExpertAvatarId
+    ? `/expert-avatars/${expertAvatarId}.webp`
+    : explicitFunctionalAvatarId
+      ? `/functional-avatars/${functionalAvatarId}.webp`
+      : expertAvatarId
+        ? `/expert-avatars/${expertAvatarId}.webp`
+        : functionalAvatarId
+          ? `/functional-avatars/${functionalAvatarId}.webp`
+      : null;
   return (
     <span
       className={`role-avatar role-avatar-${avatarTone}`}
-      role={avatarId ? "img" : undefined}
-      aria-label={avatarId ? `${name}头像` : undefined}
-      aria-hidden={avatarId ? undefined : true}
+      role={avatarSrc ? "img" : undefined}
+      aria-label={avatarSrc ? `${name}头像` : undefined}
+      aria-hidden={avatarSrc ? undefined : true}
     >
-      {avatarId
-        ? <img src={`/expert-avatars/${avatarId}.webp`} alt="" />
+      {avatarSrc
+        ? <img src={avatarSrc} alt="" />
         : initials}
     </span>
   );
@@ -637,7 +717,7 @@ function RoleAvatar({ name, identity = name }: { name: string; identity?: string
 function workflowSpeaker(event: ChatEvent): string {
   if (event.payload.role_name) return event.payload.role_name;
   if (event.event_type.startsWith("evidence") || event.event_type.startsWith("tool.")) return "证据研究员";
-  if (event.event_type.startsWith("reporting")) return "报告编辑器";
+  if (event.event_type.startsWith("reporting")) return "投资经理";
   return "协调员";
 }
 
@@ -1363,7 +1443,7 @@ function ArchiveBanner({ data }: { data: Bootstrap }) {
 }
 function EmptyVault({ addHoldings }: { addHoldings: () => void }) {
   return (
-    <>
+    <div className="empty-vault-layout">
       <div className="card">
         <div className="card-body">
           <div className="empty-state">
@@ -1376,18 +1456,12 @@ function EmptyVault({ addHoldings }: { addHoldings: () => void }) {
           </div>
         </div>
       </div>
-      <div
-        style={{
-          display: "grid",
-          gridTemplateColumns: "repeat(3, 1fr)",
-          gap: "20px",
-        }}
-      >
+      <div className="empty-vault-features">
         {[
           {
             icon: "◉",
-            title: "市场概览",
-            desc: "收盘后手动刷新全球指数、龙虎榜与行业资金流。",
+            title: "A股与全球概览",
+            desc: "分别刷新 A 股内部结构与港、日、韩、美代表市场。",
           },
           {
             icon: "◐",
@@ -1400,36 +1474,15 @@ function EmptyVault({ addHoldings }: { addHoldings: () => void }) {
             desc: "记录事实、判断与待验证问题，支持从资料摘录。",
           },
         ].map((item) => (
-          <div className="card" key={item.title}>
-            <div className="card-body">
-              <div style={{ textAlign: "center", padding: "24px 16px" }}>
-                <div
-                  style={{
-                    width: "44px",
-                    height: "44px",
-                    borderRadius: "12px",
-                    background: "var(--canvas)",
-                    display: "grid",
-                    placeItems: "center",
-                    margin: "0 auto 14px",
-                    color: "var(--subtle)",
-                    fontSize: "20px",
-                  }}
-                >
+          <section className="empty-vault-feature" key={item.title}>
+                <div className="empty-vault-feature-icon" aria-hidden="true">
                   {item.icon}
                 </div>
-                <h4 style={{ margin: "0 0 6px", fontSize: "14px" }}>
-                  {item.title}
-                </h4>
-                <p style={{ margin: 0, fontSize: "12.5px", color: "var(--muted)" }}>
-                  {item.desc}
-                </p>
-              </div>
-            </div>
-          </div>
+                <div><h4>{item.title}</h4><p>{item.desc}</p></div>
+          </section>
         ))}
       </div>
-    </>
+    </div>
   );
 }
 
@@ -1641,7 +1694,7 @@ function Today({
                   <div className="note-card" key={item.note_id}>
                     <div className="note-header">
                       {(holding?.name || item.security_id === marketOverviewSubject.security_id) && (
-                        <strong>{holding?.name ?? "市场概览"}</strong>
+                        <strong>{holding?.name ?? "大盘概览"}</strong>
                       )}
                       <time>
                         {new Date(
@@ -1836,35 +1889,36 @@ function Portfolio({
 
 const marketOverviewSubject = {
   security_id: "MARKET:GLOBAL:OVERVIEW",
-  name: "市场概览",
-  symbol: "GLOBAL",
+  name: "大盘议事厅",
+  symbol: "ALL",
 };
 
-function MarketPage({
+function AShareMarketPage({
   market,
   reload,
-  saveMarketNote,
 }: {
   market: Market;
-  reload: (market: Market) => void;
-  saveMarketNote: (body: string, title?: string, marketSession?: "盘前" | "盘中" | "盘后") => Promise<void>;
+  reload: (market: Market, sections: string[]) => void;
 }) {
   const indices = market.indices;
   const lhb = market.lhb;
   const flow = market.industry_flow;
-  const marketNews = market.market_news;
+  const marketNews = market.a_market_news ?? market.market_news;
+  const themes = market.a_share_themes;
+  const earnings = market.a_share_earnings_calendar;
   const pulse = market.pulse;
-  const [refreshing, setRefreshing] = useState<string | null>(null);
+  const [refreshing, setRefreshing] = useState<Set<string>>(() => new Set());
+  const isRefreshing = (section: string) => refreshing.has(section) || refreshing.has("all");
   const [refreshNotice, setRefreshNotice] = useState("");
-  const refreshMarket = async (section: "all" | "indices" | "lhb" | "industry_flow" | "pulse" | "market_news") => {
-    setRefreshing(section);
+  const refreshMarket = async (section: "all" | "indices" | "lhb" | "industry_flow" | "pulse" | "a_market_news" | "a_share_themes" | "a_share_earnings_calendar") => {
+    setRefreshing((current) => new Set(current).add(section));
     setRefreshNotice("");
     try {
       const result = await api<{ completed: string[]; failed: Record<string, string>; retained: string[]; report_stage: MarketReportStage; market: Market }>(
         "/api/market/refresh",
-        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ section }) },
+        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ section: section === "all" ? "a_share" : section }) },
       );
-      reload(result.market);
+      reload(result.market, result.completed);
       const failures = Object.values(result.failed);
       setRefreshNotice(
         failures.length
@@ -1875,7 +1929,11 @@ function MarketPage({
     } catch (error) {
       setRefreshNotice(`刷新失败：${error instanceof Error ? error.message : String(error)}`);
     } finally {
-      setRefreshing(null);
+      setRefreshing((current) => {
+        const next = new Set(current);
+        next.delete(section);
+        return next;
+      });
     }
     return market.report_stage;
   };
@@ -1886,8 +1944,6 @@ function MarketPage({
       return `成交量 ${(row.volume / 100_000_000).toLocaleString("zh-CN", { maximumFractionDigits: 2 })} 亿`;
     return "—";
   };
-  const regionName = (region: string) =>
-    region === "CN" ? "A股" : region === "HK" ? "港股" : "美股";
   const indexDistribution = (indices?.rows ?? []).reduce(
     (counts, row) => {
       if (row.change_percent === null) counts.unavailable += 1;
@@ -1908,14 +1964,14 @@ function MarketPage({
   return (
     <>
       <PageHeader
-        eyebrow="市场概览"
-        title="全球主要市场"
+        eyebrow="A股概览"
+        title="A股市场全景"
         description={indices?.session_label
-          ? `当前展示 ${indices.session_label}；各市场按自身交易时段保留实时行情或最近收盘。`
-          : "进入应用会自动刷新市场数据；交易时段展示实时行情，非交易日展示最近收盘。"}
+          ? `当前展示 ${indices.session_label}；本页仅呈现 A股指数、龙虎榜、行业资金与市场情绪。`
+          : "仅在应用启动时自动刷新；页面切换保留当前归档，之后由你按模块手动更新。"}
         action={
-          <button title="刷新全部" disabled={refreshing !== null} onClick={() => void refreshMarket("all")}>
-            {refreshing === "all" ? "正在刷新…" : "刷新全部"}
+          <button title="刷新全部" disabled={refreshing.size > 0} onClick={() => void refreshMarket("all")}>
+            {refreshing.has("all") ? "正在刷新…" : "刷新全部"}
           </button>
         }
       />
@@ -1923,12 +1979,12 @@ function MarketPage({
       <div className="surface-grid market-data-grid">
         <Card
           className="market-index-card"
-          title={`大盘指数概览${indices?.session_label ? ` · ${indices.session_label}` : ""}`}
+          title={`A股大盘指数${indices?.session_label ? ` · ${indices.session_label}` : ""}`}
           action={
             <div className="card-action-group">
               {indices && <span className="meta">{indices.date} · {indices.source}</span>}
-              <button className="text-button" disabled={refreshing !== null} onClick={() => void refreshMarket("indices")}>
-                {refreshing === "indices" ? "刷新中…" : "刷新"}
+              <button className="text-button" disabled={isRefreshing("indices")} onClick={() => void refreshMarket("indices")}>
+                {isRefreshing("indices") ? "刷新中…" : "刷新"}
               </button>
             </div>
           }
@@ -1946,14 +2002,11 @@ function MarketPage({
                 <small>仅统计当前表内日期有效的指数，不代表全市场个股广度</small>
               </div>
             </div>
-            <div className="market-region-grid">
-              {(["CN", "HK", "US"] as const).map((region) => (
-                <section className="market-region" key={region}>
-                  <h3>
-                    {regionName(region)}
-                  </h3>
+            <div className="market-region-grid market-region-grid-a-share">
+                <section className="market-region">
+                  <h3>A股基准</h3>
                   <div className="market-index-grid">
-                    {indices.rows.filter((row) => row.market === region).map((row) => (
+                    {indices.rows.map((row) => (
                       <div className="metric-card" key={`${row.market}-${row.code}`}>
                         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "4px" }}>
                           <span style={{ fontWeight: 650 }}>{row.name}</span>
@@ -1971,12 +2024,31 @@ function MarketPage({
                     ))}
                   </div>
                 </section>
-              ))}
             </div>
             </>
           ) : (
             <p className="empty">正在获取最新市场行情；失败时可使用右上角刷新重试。</p>
           )}
+        </Card>
+        <Card
+          className="a-share-theme-card"
+          title="A股热门主题"
+          action={<div className="card-action-group">{themes && <span className="meta">{themes.date} · {themes.source}</span>}<button className="text-button" disabled={isRefreshing("a_share_themes")} onClick={() => void refreshMarket("a_share_themes")}>{isRefreshing("a_share_themes") ? "刷新中…" : "刷新"}</button></div>}
+        >
+          {themes?.rows.length ? <div className="a-share-theme-list">{themes.rows.slice(0, 6).map((row, index) => <div className="a-share-theme-row" key={row.code}>
+            <b className="mono">{String(index + 1).padStart(2, "0")}</b>
+            <div><strong>{row.name}</strong><small>固定投资主题 · {row.close == null ? "点位未披露" : `指数 ${row.close.toLocaleString("zh-CN")}`}</small></div>
+            <strong className={`mono ${tone(row.change_percent)}`}>{row.available === false ? "待更新" : percent(row.change_percent)}</strong>
+          </div>)}</div> : <p className="empty">本轮暂无可核验的 A 股概念板块排行。</p>}
+          {themes?.scope_note && <p className="card-method-note">{themes.scope_note}</p>}
+        </Card>
+        <Card
+          className="a-share-earnings-card"
+          title="A股本月财报日历"
+          action={<div className="card-action-group">{earnings && <span className="meta">{earnings.month} · {earnings.source}</span>}<button className="text-button" disabled={isRefreshing("a_share_earnings_calendar")} onClick={() => void refreshMarket("a_share_earnings_calendar")}>{isRefreshing("a_share_earnings_calendar") ? "刷新中…" : "刷新"}</button></div>}
+        >
+          {earnings?.rows.length ? <div className="a-share-earnings-list">{earnings.rows.map((row) => <div key={`${row.symbol}-${row.release_date}`}><time className="mono">{row.release_date.slice(5)}</time><span><strong>{row.name}</strong>{row.report_period && <small>{row.report_period}</small>}</span><small className="mono">{row.symbol.includes(":") ? row.symbol.split(":").at(-1) : row.symbol.split(".")[0]}</small></div>)}</div> : <p className="empty">本月暂无国内公开预约表可核验的待披露 A股公司。</p>}
+          {earnings?.scope_note && <p className="card-method-note">{earnings.scope_note}</p>}
         </Card>
         <div className="market-secondary-grid">
         <Card
@@ -1984,8 +2056,8 @@ function MarketPage({
           action={
             <div className="card-action-group">
               {lhb && <span className="meta">{lhb.date} · {lhb.source}{lhb.fallback_used ? " · 最近可用交易日" : ""}</span>}
-              <button className="text-button" disabled={refreshing !== null} onClick={() => void refreshMarket("lhb")}>
-                {refreshing === "lhb" ? "刷新中…" : "刷新"}
+              <button className="text-button" disabled={isRefreshing("lhb")} onClick={() => void refreshMarket("lhb")}>
+                {isRefreshing("lhb") ? "刷新中…" : "刷新"}
               </button>
             </div>
           }
@@ -2034,8 +2106,8 @@ function MarketPage({
           action={
             <div className="card-action-group">
               {flow && <span className="meta">{flow.date} · {flow.source}{flow.fallback_used ? " · 最近可用交易日" : ""}</span>}
-              <button className="text-button" disabled={refreshing !== null} onClick={() => void refreshMarket("industry_flow")}>
-                {refreshing === "industry_flow" ? "刷新中…" : "刷新"}
+              <button className="text-button" disabled={isRefreshing("industry_flow")} onClick={() => void refreshMarket("industry_flow")}>
+                {isRefreshing("industry_flow") ? "刷新中…" : "刷新"}
               </button>
             </div>
           }
@@ -2071,7 +2143,7 @@ function MarketPage({
         </Card>
         <Card
           className="market-news-card"
-          title="24小时大盘新闻"
+          title="A股大盘新闻"
           action={
             <div className="card-action-group">
               {marketNews && (
@@ -2079,8 +2151,8 @@ function MarketPage({
                   显示 {Math.min(marketNews.items.length, 6)}/{marketNews.total_count} · {marketNews.source}
                 </span>
               )}
-              <button className="text-button" disabled={refreshing !== null} onClick={() => void refreshMarket("market_news")}>
-                {refreshing === "market_news" ? "刷新中…" : "刷新"}
+              <button className="text-button" disabled={isRefreshing("a_market_news")} onClick={() => void refreshMarket("a_market_news")}>
+                {isRefreshing("a_market_news") ? "刷新中…" : "刷新"}
               </button>
             </div>
           }
@@ -2097,7 +2169,7 @@ function MarketPage({
                   onClick={(event) => followSource(event, item.url)}
                 >
                   <time className="mono">
-                    {new Date(item.published_at).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}
+                    {new Date(item.published_at).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false })}
                   </time>
                   <Tag>{item.region}</Tag>
                   <span>{item.title}</span>
@@ -2105,7 +2177,7 @@ function MarketPage({
               ))}
             </div>
           ) : (
-            <p className="empty">最近24小时暂无符合大盘范围和发布时间校验的公开新闻。</p>
+            <p className="empty">暂无符合 A股大盘范围且带可核验发布时间的公开新闻。</p>
           )}
         </Card>
         </div>
@@ -2114,7 +2186,7 @@ function MarketPage({
           <>
             <Card
               title="赚钱效应与上涨主线"
-              action={<button className="text-button" disabled={refreshing !== null} onClick={() => void refreshMarket("pulse")}>{refreshing === "pulse" ? "刷新中…" : "刷新"}</button>}
+              action={<div className="card-action-group"><span className="meta">数据日期 {pulse.date}</span><button className="text-button" disabled={isRefreshing("pulse")} onClick={() => void refreshMarket("pulse")}>{isRefreshing("pulse") ? "刷新中…" : "刷新"}</button></div>}
             >
               {pulse.m3?.available ? (
                 <>
@@ -2131,7 +2203,7 @@ function MarketPage({
             </Card>
             <Card
               title="下跌风险"
-              action={<button className="text-button" disabled={refreshing !== null} onClick={() => void refreshMarket("pulse")}>{refreshing === "pulse" ? "刷新中…" : "刷新"}</button>}
+              action={<div className="card-action-group"><span className="meta">数据日期 {pulse.date}</span><button className="text-button" disabled={isRefreshing("pulse")} onClick={() => void refreshMarket("pulse")}>{isRefreshing("pulse") ? "刷新中…" : "刷新"}</button></div>}
             >
               {pulse.m4?.available ? (
                 <>
@@ -2153,8 +2225,8 @@ function MarketPage({
             className="market-holding-news-card"
             title="持仓股票 24 小时资讯"
             action={
-              <button className="text-button" disabled={refreshing !== null} onClick={() => void refreshMarket("pulse")}>
-                {refreshing === "pulse" ? "刷新中…" : "刷新"}
+              <button className="text-button" disabled={isRefreshing("pulse")} onClick={() => void refreshMarket("pulse")}>
+                {isRefreshing("pulse") ? "刷新中…" : "刷新"}
               </button>
             }
           >
@@ -2168,17 +2240,180 @@ function MarketPage({
           </Card>
         )}
       </div>
-      <section className="market-assistant-panel" aria-label="大盘议事厅">
-        <ResearchAssistant
-          selected={marketOverviewSubject}
-          scene="market"
-          saveNote={saveMarketNote}
-          initialMarketStage={market.report_stage}
-          beforeMarketReport={() => refreshMarket("all")}
-        />
-      </section>
     </>
   );
+}
+
+function GlobalMarketPage({
+  market,
+  reload,
+}: {
+  market: Market;
+  reload: (market: Market, sections: string[]) => void;
+}) {
+  const indices = market.global_indices;
+  const marketNews = market.global_market_news;
+  const movers = market.global_market_movers;
+  const earnings = market.global_earnings_calendar;
+  const themes = market.global_themes;
+  const [refreshing, setRefreshing] = useState<Set<string>>(() => new Set());
+  const isRefreshing = (section: string) => refreshing.has(section) || refreshing.has("all");
+  const [refreshNotice, setRefreshNotice] = useState("");
+  const refreshGlobal = async (section: "all" | "global_indices" | "global_market_news" | "global_market_movers" | "global_earnings_calendar" | "global_themes") => {
+    setRefreshing((current) => new Set(current).add(section));
+    setRefreshNotice("");
+    try {
+      const result = await api<{ completed: string[]; failed: Record<string, string>; retained: string[]; report_stage: MarketReportStage; market: Market }>(
+        "/api/market/refresh",
+        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ section: section === "all" ? "global" : section }) },
+      );
+      reload(result.market, result.completed);
+      const failures = Object.values(result.failed);
+      setRefreshNotice(failures.length
+        ? `已更新 ${result.completed.length} 项；${failures.join("；")}${result.retained.length ? "；失败模块继续展示最近归档数据" : ""}`
+        : "全球市场数据已刷新");
+      return result.report_stage;
+    } catch (error) {
+      setRefreshNotice(`刷新失败：${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setRefreshing((current) => {
+        const next = new Set(current);
+        next.delete(section);
+        return next;
+      });
+    }
+    return market.report_stage;
+  };
+  const marketNames: Record<"HK" | "JP" | "KR" | "US", string> = {
+    HK: "港股",
+    JP: "日股",
+    KR: "韩股",
+    US: "美股",
+  };
+  const regions = (["HK", "JP", "KR", "US"] as const).map((region) => {
+    const rows = (indices?.rows ?? []).filter((row) => row.market === region);
+    const moves = rows.map((row) => row.change_percent).filter((value): value is number => value !== null).sort((a, b) => a - b);
+    return {
+      region,
+      rows,
+      median: moves.length ? moves[Math.floor(moves.length / 2)] : null,
+      up: moves.filter((value) => value > 0).length,
+      down: moves.filter((value) => value < 0).length,
+    };
+  });
+  const activity = (row: MarketIndexOverview["rows"][number]) => {
+    if (row.amount != null) return `成交额 ${(row.amount / 100_000_000).toLocaleString("zh-CN", { maximumFractionDigits: 2 })} 亿 ${row.currency}`;
+    if (row.volume != null) return `成交量 ${row.volume.toLocaleString("zh-CN", { maximumFractionDigits: 0 })}`;
+    return "成交活跃度未披露";
+  };
+  return <>
+    <PageHeader
+      eyebrow="全球概览"
+      title="港 · 日 · 韩 · 美市场"
+      description="四市场保留各自交易日与本币口径；仅在应用启动时自动刷新，页面切换保留归档，之后按模块手动更新。"
+      action={<button title="刷新全球概览" disabled={refreshing.size > 0} onClick={() => void refreshGlobal("all")}>{refreshing.has("all") ? "正在刷新…" : "刷新全部"}</button>}
+    />
+    {refreshNotice && <p className="market-refresh-notice" role="status">{refreshNotice}</p>}
+    <div className="surface-grid global-market-data-grid">
+      <Card
+        className="global-market-index-card"
+        title="全球代表指数与区域强弱"
+        action={<div className="card-action-group">{indices && <span className="meta">{indices.date} · {indices.source}</span>}<button className="text-button" disabled={isRefreshing("global_indices")} onClick={() => void refreshGlobal("global_indices")}>{isRefreshing("global_indices") ? "刷新中…" : "刷新"}</button></div>}
+      >
+        <div className="global-region-grid">
+          {regions.map(({ region, rows, median, up, down }) => <section className="global-region" key={region}>
+            <header>
+              <div><span>{marketNames[region]}</span><strong className={`mono ${tone(median)}`}>{percent(median)}</strong></div>
+              <small>上涨 {up} · 下跌 {down} · 中位涨跌</small>
+            </header>
+            <div className="global-index-list">
+              {rows.map((row) => <div className="global-index-row" key={`${region}-${row.code}`}>
+                <div><strong>{row.name}</strong><span className="mono">{row.trade_date} · {row.session_label ?? row.session}</span></div>
+                <div className="global-index-value"><b className="mono">{row.close.toLocaleString("zh-CN")}</b><span className={`tag tag-${tone(row.change_percent)}`}>{percent(row.change_percent)}</span></div>
+                <small>{activity(row)} · {row.source ?? indices?.source}</small>
+              </div>)}
+              {!rows.length && <p className="empty compact-empty">该市场本轮来源不可用，保留明确缺口。</p>}
+            </div>
+          </section>)}
+        </div>
+        {!!indices?.gaps?.length && <details className="global-source-gaps"><summary>本轮数据缺口 {indices.gaps.length} 项</summary><ul>{indices.gaps.map((gap) => <li key={gap}>{gap}</li>)}</ul></details>}
+      </Card>
+      <Card
+        className="global-movers-card"
+        title="四市场领涨榜"
+        action={<div className="card-action-group">{movers && <span className="meta">{movers.date} · {movers.source}</span>}<button className="text-button" disabled={isRefreshing("global_market_movers")} onClick={() => void refreshGlobal("global_market_movers")}>{isRefreshing("global_market_movers") ? "刷新中…" : "刷新"}</button></div>}
+      >
+        <div className="global-compact-region-grid">
+          {(movers?.markets ?? []).map((item) => <section className="global-compact-region" key={item.region}>
+            <header><strong>{item.label}</strong><span>大盘股样本 Top {item.rows.length}</span></header>
+            {item.rows.map((row, index) => <div className="global-ranked-row" key={row.symbol}>
+              <b className="mono">{String(index + 1).padStart(2, "0")}</b><span title={row.name}>{row.name}</span><strong className={`mono ${tone(row.change_percent)}`}>{percent(row.change_percent)}</strong>
+            </div>)}
+            {!item.rows.length && <p className="empty compact-empty">本轮暂无有效样本。</p>}
+          </section>)}
+        </div>
+        {movers?.scope_note && <p className="card-method-note">{movers.scope_note}</p>}
+      </Card>
+      <Card
+        className="global-theme-card"
+        title="跨市场投资主题"
+        action={<div className="card-action-group">{themes && <span className="meta">{themes.date} · {themes.source}</span>}<button className="text-button" disabled={isRefreshing("global_themes")} onClick={() => void refreshGlobal("global_themes")}>{isRefreshing("global_themes") ? "刷新中…" : "刷新"}</button></div>}
+      >
+        <div className="global-theme-list">
+          {(themes?.rows ?? []).map((theme) => <section key={theme.name}>
+            <header><strong>{theme.name}</strong><span>可用市场 {theme.available_markets.map((region) => marketNames[region]).join(" · ") || "暂无"}</span></header>
+            <div>{(["HK", "JP", "KR", "US"] as const).map((region) => {
+              const sample = theme.markets.find((item) => item.region === region);
+              return <span className={!sample ? "unavailable" : ""} key={region}><small>{marketNames[region]}</small><b className={`mono ${tone(sample?.change_percent ?? null)}`}>{sample ? percent(sample.change_percent) : "—"}</b></span>;
+            })}</div>
+          </section>)}
+        </div>
+        {themes?.method_note && <p className="card-method-note">{themes.method_note}</p>}
+      </Card>
+      <Card
+        className="global-earnings-card"
+        title="本月财报日历"
+        action={<div className="card-action-group">{earnings && <span className="meta">{earnings.month} · {earnings.source}</span>}<button className="text-button" disabled={isRefreshing("global_earnings_calendar")} onClick={() => void refreshGlobal("global_earnings_calendar")}>{isRefreshing("global_earnings_calendar") ? "刷新中…" : "刷新"}</button></div>}
+      >
+        <div className="global-earnings-list">
+          {(earnings?.markets ?? []).map((item) => <section key={item.region}><header><strong>{item.label}</strong><span>{item.rows.length} 家</span></header><div>{item.rows.map((row) => <div className="global-earnings-row" key={`${row.symbol}-${row.release_date}`}><time className="mono">{row.release_date.slice(5)}</time><span><strong>{row.name}</strong><small className="mono">{row.symbol.split(":").at(-1)}</small></span><small>{row.currency || "—"}</small></div>)}{!item.rows.length && <p className="empty compact-empty">本月暂无待披露大盘股样本。</p>}</div></section>)}
+        </div>
+        {earnings?.scope_note && <p className="card-method-note">{earnings.scope_note}</p>}
+      </Card>
+      <Card
+        className="global-news-card"
+        title="24小时全球大盘新闻"
+        action={<div className="card-action-group">{marketNews && <span className="meta">显示 {Math.min(marketNews.items.length, 8)}/{marketNews.total_count} · {marketNews.source}</span>}<button className="text-button" disabled={isRefreshing("global_market_news")} onClick={() => void refreshGlobal("global_market_news")}>{isRefreshing("global_market_news") ? "刷新中…" : "刷新"}</button></div>}
+      >
+        {marketNews?.items.length ? <div className="market-news-list global-news-list">{marketNews.items.slice(0, 8).map((item) => <a className="market-news-row" key={`${item.published_at}-${item.url}`} href={item.url} target="_blank" rel="noreferrer" onClick={(event) => followSource(event, item.url)}><time className="mono">{new Date(item.published_at).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}</time><Tag>{item.region}</Tag><span>{item.title}</span></a>)}</div>
+          : <p className="empty">最近24小时暂无通过发布时间与市场范围校验的港、日、韩、美大盘新闻。</p>}
+      </Card>
+    </div>
+  </>;
+}
+
+function MarketCouncilPage({
+  market,
+  saveMarketNote,
+}: {
+  market: Market;
+  saveMarketNote: (body: string, title?: string, marketSession?: "盘前" | "盘中" | "盘后") => Promise<void>;
+}) {
+  return <>
+    <PageHeader
+      eyebrow="大盘议事厅"
+      title="全市场研究工作台"
+      description="独立汇集 A股、港股、日股、韩股、美股、公开资讯、可审计计算与本地持仓证据，按当前交易时段生成报告。"
+    />
+    <section className="market-assistant-panel market-council-workbench" aria-label="大盘议事厅">
+      <ResearchAssistant
+        selected={marketOverviewSubject}
+        scene="market"
+        saveNote={saveMarketNote}
+        initialMarketStage={market.report_stage}
+      />
+    </section>
+  </>;
 }
 
 function MaterialList({
@@ -3319,7 +3554,7 @@ function Research({
                 {item.name}
               </button>
             ))}
-            <div className="note-scope-heading">按市场概览</div>
+            <div className="note-scope-heading">按大盘概览</div>
             <div className="market-note-stage-tabs" role="tablist" aria-label="按行情阶段筛选市场笔记">
               {(["盘前", "盘中", "盘后"] as const).map((session) => (
                 <button
@@ -3347,7 +3582,7 @@ function Research({
             subjectLabel={(item) =>
               data.holdings.find(
                 (holding) => holding.security_id === item.security_id,
-              )?.name ?? "市场概览"
+              )?.name ?? "大盘概览"
             }
           />
         </Card>
@@ -3431,7 +3666,6 @@ function ResearchAssistant({
   selected,
   saveNote,
   scene = "security",
-  beforeMarketReport,
   initialMarketStage,
 }: {
   selected?: Pick<Holding, "security_id" | "name" | "symbol">;
@@ -3441,16 +3675,20 @@ function ResearchAssistant({
     marketSession?: "盘前" | "盘中" | "盘后",
   ) => Promise<void>;
   scene?: "security" | "market";
-  beforeMarketReport?: () => Promise<MarketReportStage | undefined>;
   initialMarketStage?: MarketReportStage;
 }) {
   const timelineRef = useRef<HTMLDivElement>(null);
   const requestToken = useRef(0);
+  const requestController = useRef<AbortController | null>(null);
   const [roles, setRoles] = useState<AIRole[]>([]);
   const [roleId, setRoleId] = useState("general");
   const [mode, setMode] = useState<ChatMode>("assistant");
   const [marketStage, setMarketStage] = useState<MarketReportStage | undefined>(initialMarketStage);
-  const [marketStyle, setMarketStyle] = useState("dalio");
+  const [marketStyle, setMarketStyle] = useState(() =>
+    scene === "market"
+      ? localStorage.getItem("market-council-style") || "dalio"
+      : "dalio",
+  );
   const [threads, setThreads] = useState<ChatThread[]>([]);
   const [thread, setThread] = useState<ChatDetail | null>(null);
   const [text, setText] = useState("");
@@ -3479,6 +3717,10 @@ function ResearchAssistant({
   useEffect(() => {
     if (scene === "market" && initialMarketStage) setMarketStage(initialMarketStage);
   }, [scene, initialMarketStage?.label]);
+  useEffect(() => {
+    if (scene === "market")
+      localStorage.setItem("market-council-style", marketStyle);
+  }, [marketStyle, scene]);
   useEffect(() => {
     setThread(null);
     setSavedEvent("");
@@ -3521,6 +3763,8 @@ function ResearchAssistant({
     setBusy(true);
     setNotice("");
     const token = ++requestToken.current;
+    const controller = new AbortController();
+    requestController.current = controller;
     try {
       if (forceNew && thread) {
         await api(`/api/ai/chats/${thread.thread_id}/archive`, { method: "POST" });
@@ -3536,6 +3780,7 @@ function ResearchAssistant({
             mode: activeMode,
             title: content.slice(0, 40),
           }),
+          signal: controller.signal,
         });
         active = { ...created, events: [] };
         setThread(active);
@@ -3549,6 +3794,7 @@ function ResearchAssistant({
             content,
             role_id: activeMode === "committee" ? "general" : activeRoleId,
           }),
+          signal: controller.signal,
         },
       );
       if (scene !== "market") setText("");
@@ -3570,28 +3816,52 @@ function ResearchAssistant({
       }
       await loadThreads();
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : String(error));
+      if (!(error instanceof DOMException && error.name === "AbortError"))
+        setNotice(error instanceof Error ? error.message : String(error));
     } finally {
+      if (requestController.current === controller) requestController.current = null;
       setBusy(false);
     }
   };
+  const stopGeneration = async () => {
+    requestToken.current += 1;
+    requestController.current?.abort();
+    requestController.current = null;
+    setBusy(false);
+    if (!thread) return;
+    try {
+      await api(`/api/ai/chats/${thread.thread_id}/cancel`, { method: "POST" });
+      setThread(await api<ChatDetail>(`/api/ai/chats/${thread.thread_id}`));
+      setNotice("已停止本轮报告生成；已完成的取证过程仍保留在当前记录中。");
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : String(error));
+    }
+  };
   const generateMarketReport = async () => {
-    const refreshedStage = beforeMarketReport ? await beforeMarketReport() : undefined;
-    const stage = refreshedStage ?? marketStage;
+    const stage = marketStage;
     if (stage) setMarketStage(stage);
+    const reportDate = stage?.report_date ?? new Date().toISOString().slice(0, 10);
+    const [, month, day] = reportDate.split("-").map(Number);
+    const fixedPrompt = `结合当前所有可用且完整的证据，生成${month}月${day}日${stage?.session ?? "盘后"}报告，并结合我的本地持仓给出条件化观察建议。`;
     await send(
-      `生成${stage?.label ?? "当前阶段大盘行情报告"}，结合我的本地持仓给出条件化观察建议。`,
+      fixedPrompt,
       marketStyle === "committee" ? "committee" : "assistant",
       marketStyle === "committee" ? "general" : marketStyle,
       true,
     );
   };
   if (!selected) return <p className="empty">添加持仓后可开始研究对话。</p>;
+  const generating = busy || thread?.active_run?.status === "running";
   const role = roles.find((item) => item.role_id === roleId);
   const marketRole = roles.find((item) => item.role_id === marketStyle);
   const roomPersona = scene === "market"
-    ? marketStyle === "committee" ? { name: "投研委员会", id: "market-committee" } : { name: marketRole?.name ?? "大盘主持人", id: marketStyle }
+    ? { name: marketStyle === "committee" ? "投研委员会" : marketRole?.name ?? "大盘主持人", id: marketStyle === "committee" ? "coordinator" : marketStyle }
     : mode === "committee" ? { name: "投研委员会", id: "research-committee" } : { name: role?.name ?? "投研大师", id: roleId };
+  const titleAvatarIdentity = scene === "market"
+    ? "market-roundtable"
+    : mode === "committee"
+      ? "research-committee"
+      : roleId;
   const marketNoteTitle = (event: ChatEvent) => {
     if (scene !== "market" || !marketStage) return undefined;
     const [year, month, dayOfMonth] = marketStage.report_date.split("-").map(Number);
@@ -3627,7 +3897,7 @@ function ResearchAssistant({
     <section className="chat-main">
       <div className="assistant-titlebar">
         <div className="assistant-identity">
-          <RoleAvatar name={roomPersona.name} identity={roomPersona.id} />
+          <RoleAvatar name={roomPersona.name} identity={titleAvatarIdentity} />
           <div>
             <strong>
               {scene === "market"
@@ -3638,7 +3908,7 @@ function ResearchAssistant({
             </strong>
             <span>
               {scene === "market"
-                ? `${marketStage?.label ?? "刷新后自动识别时段"} · 让不同研究视角围绕指数、资金与持仓同桌发言`
+                ? `${marketStage?.label ?? "刷新后自动识别时段"} · 汇集全部市场、公开资料、计算证据与本地持仓`
                 : mode === "committee"
                 ? "六位互补委员先核证、再交锋，最后留下共识、分歧和复核条件"
                 : `${roomPersona.name}已就席 · 每个问题都从当前标的证据重新出发`}
@@ -3694,19 +3964,25 @@ function ResearchAssistant({
         <div className="market-report-controls">
           <div className="report-control-copy">
             <strong>召集本时段议题</strong>
-            <span>系统先刷新全部市场资料，再由主持席自动生成报告，无需输入问题。</span>
+            <span>使用当前已归档市场证据生成报告；刷新数据与议事进程互不影响。</span>
           </div>
           <label>
             <span>主持席</span>
-            <select value={marketStyle} onChange={(event) => setMarketStyle(event.target.value)}>
-              <option value="committee">投研委员会 · 六席会审</option>
-              {roles.filter((item) => item.role_id !== "general").map((item) => (
-                <option key={item.role_id} value={item.role_id}>{item.name}</option>
-              ))}
-            </select>
+            <span className="market-style-select">
+              <RoleAvatar
+                name={marketStyle === "committee" ? "投研委员会" : marketRole?.name ?? "投研大师"}
+                identity={marketStyle === "committee" ? "market-roundtable" : marketStyle}
+              />
+              <select value={marketStyle} onChange={(event) => setMarketStyle(event.target.value)}>
+                <option value="committee">投研委员会 · 六席会审</option>
+                {roles.filter((item) => item.role_id !== "general").map((item) => (
+                  <option key={item.role_id} value={item.role_id}>{item.name}</option>
+                ))}
+              </select>
+            </span>
           </label>
-          <button className="room-primary-action" disabled={busy} onClick={() => void generateMarketReport()}>
-            {busy ? "议事厅正在整理观点…" : "开始本时段议事"}
+          <button className={generating ? "room-primary-action stop" : "room-primary-action"} onClick={() => generating ? void stopGeneration() : void generateMarketReport()}>
+            {generating ? "停止生成" : "开始本时段议事"}
           </button>
         </div>
       ) : (
@@ -3734,6 +4010,7 @@ function ResearchAssistant({
           {scene === "security" && mode === "assistant" && role && <p>{role.focus}</p>}
         </div>
       )}
+      {notice && <p className="ai-warning" role="status">{notice}</p>}
       <div className="chat-timeline" ref={timelineRef} aria-live="polite">
         {!thread?.events.length && (
           scene === "market" ? (
@@ -3819,7 +4096,9 @@ function ResearchAssistant({
                       : event.event_type === "expert.started"
                         ? `${event.payload.role_name || "研究员"}正在分析`
                         : event.event_type === "reporting.started"
-                          ? "报告编辑器正在生成深度报告"
+                          ? "投资经理正在生成深度报告"
+                          : event.event_type === "workflow.cancelled"
+                            ? "本轮报告生成已停止"
                           : event.event_type === "workflow.failed"
                             ? "本轮投研委员会未完成"
                             : event.event_type === "routing.completed"
@@ -3949,6 +4228,7 @@ function ResearchAssistant({
                 : "输入投资问题"}
           </span>
           <textarea
+            aria-label={mode === "committee" ? "投研委员会问题" : "投研大师问题"}
             value={text}
             onChange={(event) => setText(event.target.value)}
             placeholder={
@@ -3957,20 +4237,23 @@ function ResearchAssistant({
                 : "例如：现金流变化是否削弱原投资逻辑？"
             }
             onKeyDown={(event) => {
-              if ((event.metaKey || event.ctrlKey) && event.key === "Enter")
+              if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+                event.preventDefault();
                 void send();
+              }
             }}
           />
         </label>
-        <button disabled={busy || !text.trim()} onClick={() => void send()}>
-          {busy
+        <button title={generating ? "停止当前生成" : "发送（Enter）"} disabled={!generating && (!text.trim() || busy)} onClick={() => generating ? void stopGeneration() : void send()}>
+          {generating
+            ? "停止生成"
+            : busy
             ? mode === "committee"
               ? "委员会研讨中…"
               : "正在分析…"
             : "发送"}
         </button>
       </div>}
-      {notice && <p className="ai-warning">{notice}</p>}
     </section>
   );
 }
@@ -4293,7 +4576,7 @@ function SettingsPage() {
           </span>
         </div>
         <dl className="source-list">
-          <div><dt>内置版本</dt><dd>{engineVersion?.bundled_version || "4.14.0"}</dd></div>
+          <div><dt>内置版本</dt><dd>{engineVersion?.bundled_version || "4.15.0"}</dd></div>
           <div><dt>上游正式版</dt><dd>{engineVersion?.latest_version || "—"}</dd></div>
           <div><dt>更新方式</dt><dd>随 Invest Vault 新版本审核、测试并更新</dd></div>
         </dl>
@@ -4358,7 +4641,7 @@ function DataPage({
       <PageHeader
         eyebrow="数据与备份"
         title="本地数据管理"
-        description="进入应用和重新回到前台时刷新最新行情；完整交易日数据继续独立归档。"
+        description="仅在应用启动时自动刷新一次；页面切换与重新回到前台不会发起请求，之后完全由你手动刷新。"
       />
       <ArchiveBanner data={data} />
       <div className="data-management-grid">
@@ -4366,11 +4649,11 @@ function DataPage({
           <dl className="source-list">
             <div>
               <dt>盘前与盘中</dt>
-              <dd>自动获取最新公开行情，并明确标注盘前或盘中实时数据</dd>
+              <dd>应用启动时自动获取一次公开行情，并明确标注盘前或盘中实时数据</dd>
             </div>
             <div>
               <dt>盘后与非交易日</dt>
-              <dd>显示最近完整交易日收盘数据；市场概览仍可手动重试</dd>
+              <dd>显示最近完整交易日收盘数据；A股与全球概览仍可分别手动重试</dd>
             </div>
             <div>
               <dt>失败处理</dt>
@@ -4378,7 +4661,7 @@ function DataPage({
             </div>
             <div>
               <dt>联网范围</dt>
-              <dd>持仓证券、基金资料及市场概览栏目</dd>
+              <dd>持仓证券、基金资料及 A股/全球概览栏目</dd>
             </div>
           </dl>
         </Card>
@@ -4459,7 +4742,6 @@ function ConfirmDelete({
 
 export function App() {
   const [active, setActive] = useState("today");
-  const previousPage = useRef("today");
   const [data, setData] = useState<Bootstrap | null>(null);
   const [workspaces, setWorkspaces] = useState<Record<string, Workspace>>({});
   const [selectedId, setSelectedId] = useState("");
@@ -4470,7 +4752,7 @@ export function App() {
   const [deleteRequest, setDeleteRequest] = useState<DeleteRequest | null>(
     null,
   );
-  const load = async (refresh = true) => {
+  const load = async (refresh = false) => {
     const next = await api<Bootstrap>(`/api/bootstrap?refresh=${refresh}`);
     setData(next);
     setSelectedId((current) =>
@@ -4515,53 +4797,60 @@ export function App() {
     );
   };
   useEffect(() => {
-    load().catch((error) => setMessage(`本地服务不可用：${error.message}`));
-    let lastCheck = Date.now();
-    const automaticCheck = () => {
-      if (
-        document.visibilityState !== "visible" ||
-        Date.now() - lastCheck < 60_000
-      )
-        return;
-      lastCheck = Date.now();
-      load().catch((error) =>
-        setMessage(`自动行情刷新未完成：${error.message}`),
-      );
+    let cancelled = false;
+    const mergeMarket = (next: Market, sections: string[]) => {
+      if (cancelled) return;
+      setData((current) => {
+        if (!current) return current;
+        const changed = Object.fromEntries(
+          sections
+            .filter((section) => section in next)
+            .map((section) => [section, next[section as keyof Market]]),
+        );
+        return {
+          ...current,
+          market: { ...current.market, ...changed, report_stage: next.report_stage },
+        };
+      });
     };
-    window.addEventListener("focus", automaticCheck);
-    document.addEventListener("visibilitychange", automaticCheck);
-    const now = new Date();
-    const next = new Date(now);
-    next.setHours(17, 31, 0, 0);
-    if (next <= now) next.setDate(next.getDate() + 1);
-    let dailyTimer: number | undefined;
-    const firstTimer = window.setTimeout(() => {
-      load().catch((error) =>
-        setMessage(`自动行情刷新未完成：${error.message}`),
-      );
-      dailyTimer = window.setInterval(
-        () =>
-          load().catch((error) =>
-            setMessage(`自动行情刷新未完成：${error.message}`),
-          ),
-        24 * 60 * 60 * 1000,
-      );
-    }, next.getTime() - now.getTime());
-    return () => {
-      window.removeEventListener("focus", automaticCheck);
-      document.removeEventListener("visibilitychange", automaticCheck);
-      window.clearTimeout(firstTimer);
-      if (dailyTimer) window.clearInterval(dailyTimer);
+    const startupRefresh = async () => {
+      await load(false);
+      if (cancelled) return;
+      setMessage("已读取本地归档，正在执行本次启动的自动刷新…");
+      try {
+        await api("/api/holdings/refresh", { method: "POST" });
+        await load(false);
+      } catch (error) {
+        if (!cancelled)
+          setMessage(`启动持仓刷新未完成：${error instanceof Error ? error.message : String(error)}`);
+      }
+      const refreshScope = async (section: "a_share" | "global") => {
+        const result = await api<{ completed: string[]; market: Market }>("/api/market/refresh", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ section }),
+        });
+        mergeMarket(result.market, result.completed);
+      };
+      const results = await Promise.allSettled([
+        refreshScope("a_share"),
+        refreshScope("global"),
+      ]);
+      if (!cancelled) {
+        const failed = results.filter((result) => result.status === "rejected").length;
+        setMessage(
+          failed
+            ? `启动自动刷新部分未完成（${failed}/2）；失败模块保留最近归档`
+            : "本次启动自动刷新已完成；后续请按模块手动刷新",
+        );
+      }
     };
+    void startupRefresh().catch((error) => {
+      if (!cancelled)
+        setMessage(`本地服务不可用：${error instanceof Error ? error.message : String(error)}`);
+    });
+    return () => { cancelled = true; };
   }, []);
-  useEffect(() => {
-    if (previousPage.current === active) return;
-    previousPage.current = active;
-    setMessage("正在刷新当前页面的行情、资料与本地记录…");
-    load(true).catch((error) =>
-      setMessage(`页面自动刷新未完成：${error instanceof Error ? error.message : String(error)}`),
-    );
-  }, [active]);
   const run = async (
     task: () => Promise<void>,
     pending: string,
@@ -4816,12 +5105,37 @@ export function App() {
       );
     else if (active === "market")
       content = (
-        <MarketPage
+        <AShareMarketPage
           market={data.market}
-          reload={(market) => setData((current) => current ? { ...current, market } : current)}
+          reload={(market, sections) => setData((current) => {
+            if (!current) return current;
+            const changed = Object.fromEntries(
+              sections.filter((section) => section in market).map((section) => [section, market[section as keyof Market]]),
+            );
+            return { ...current, market: { ...current.market, ...changed, report_stage: market.report_stage } };
+          })}
+        />
+      );
+    else if (active === "market-council")
+      content = (
+        <MarketCouncilPage
+          market={data.market}
           saveMarketNote={(body, title, marketSession) =>
             saveNote(body, marketOverviewSubject.security_id, title, marketSession)
           }
+        />
+      );
+    else if (active === "global-market")
+      content = (
+        <GlobalMarketPage
+          market={data.market}
+          reload={(market, sections) => setData((current) => {
+            if (!current) return current;
+            const changed = Object.fromEntries(
+              sections.filter((section) => section in market).map((section) => [section, market[section as keyof Market]]),
+            );
+            return { ...current, market: { ...current.market, ...changed, report_stage: market.report_stage } };
+          })}
         />
       );
     else if (active === "portfolio")
@@ -4878,8 +5192,12 @@ export function App() {
   const topbar =
     active === "today"
       ? ["今日复盘", "持仓行情与投资记录"]
+      : active === "market-council"
+        ? ["大盘议事厅", "全市场证据与条件化观察"]
       : active === "market"
-        ? ["市场概览", "全球主要市场"]
+        ? ["A股概览", "指数、资金与情绪"]
+        : active === "global-market"
+          ? ["全球概览", "港 · 日 · 韩 · 美"]
         : active === "portfolio"
           ? ["持仓账本", "我的持仓"]
           : active === "security"
@@ -4922,7 +5240,7 @@ export function App() {
       .flatMap((ws) => ws.notes)
       .map((note) => {
         const holding = holdingBySecurity.get(note.security_id);
-        const subjectName = holding?.name ?? "市场概览";
+        const subjectName = holding?.name ?? "大盘概览";
         const previewText = plainMarkdown(note.body);
         return {
           kind: "note" as const,
@@ -4952,7 +5270,7 @@ export function App() {
         };
       });
     const actions = [
-      { kind: "action" as const, id: "refresh", title: "刷新全部市场数据", searchText: "刷新全部市场数据 行情", securityIdentifiers: [], shortcut: "⌘R", action: () => { if (active === "market") { /* market refreshes itself */ } else { setActive("market"); } } },
+      { kind: "action" as const, id: "refresh", title: "前往 A股概览手动刷新", searchText: "A股概览 手动刷新 行情", securityIdentifiers: [], action: () => setActive("market") },
       { kind: "action" as const, id: "add", title: "添加新持仓", searchText: "添加新持仓 证券 基金", securityIdentifiers: [], shortcut: "⌘N", action: () => addHoldings() },
     ];
     const query = paletteQuery.trim();
@@ -4981,7 +5299,7 @@ export function App() {
         : "本地资料库为空，可添加持仓开始使用",
     );
   };
-  const navShortcuts = ["⌘1", "⌘2", "⌘3", "⌘4", "⌘5", "⌘6", "⌘7"];
+  const navShortcuts = ["⌘1", "⌘2", "⌘3", "⌘4", "⌘5", "⌘6", "⌘7", "⌘8", "⌘9"];
   return (
     <div className={`app-shell ${active === "security" ? "security-layout" : ""}`}>
       <a className="skip-link" href="#content">
@@ -5007,7 +5325,7 @@ export function App() {
         </nav>
         <div className="side-foot">
           <span className="local-dot">● 本地优先 · 数据私有</span>
-        <span>v0.3.31</span>
+        <span>v0.3.34</span>
         </div>
       </aside>
       <main id="content">
@@ -5028,8 +5346,8 @@ export function App() {
               <kbd>⌘K</kbd>
             </button>
             {active === "today" && (
-              <button className="btn-sm" onClick={() => void load()}>
-                刷新数据
+              <button className="btn-sm" disabled={busy} onClick={() => void refreshData()}>
+                {busy ? "刷新中…" : "刷新数据"}
               </button>
             )}
           </div>

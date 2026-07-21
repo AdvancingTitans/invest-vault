@@ -29,16 +29,20 @@ def main() -> None:
     port = int(os.environ.get("INVEST_VAULT_PORT", "8765"))
     lock = VaultLock(directory)
     lock.acquire()
+    server = uvicorn.Server(uvicorn.Config(create_app(directory), host="127.0.0.1", port=port))
     parent_pid = os.environ.get("INVEST_VAULT_PARENT_PID")
     if parent_pid:
         threading.Thread(
             target=watch_parent,
             args=(int(parent_pid),),
-            kwargs={"before_exit": lock.release},
+            kwargs={
+                "before_exit": lock.release,
+                "exit_process": lambda _code: setattr(server, "should_exit", True),
+            },
             daemon=True,
         ).start()
     try:
-        uvicorn.run(create_app(directory), host="127.0.0.1", port=port)
+        server.run()
     finally:
         lock.release()
 

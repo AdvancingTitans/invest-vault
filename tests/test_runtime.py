@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from invest_vault.__main__ import default_vault_directory
-from invest_vault.runtime import VaultLock, create_sample_vault, diagnostics, watch_parent
+from invest_vault.runtime import VaultLock, create_sample_vault, diagnostics, process_is_alive, watch_parent
 
 
 def test_lock_and_sample_vault_are_local_and_recoverable(tmp_path: Path) -> None:
@@ -41,6 +41,12 @@ def test_stale_lock_is_recovered(tmp_path: Path) -> None:
     lock = VaultLock(directory)
     lock.acquire()
     lock.release()
+
+
+def test_current_process_is_alive() -> None:
+    import os
+
+    assert process_is_alive(os.getpid()) is True
 
 
 def test_parent_watchdog_exits_when_desktop_parent_disappears() -> None:

@@ -282,6 +282,9 @@ def test_upstream_pack_compaction_keeps_every_evidence_item_and_audit_metadata()
     compact = _compact_upstream_pack({
         "schema_version": "1.1",
         "symbol": "600519",
+        "financial_history": [{"report_date": "2025-12-31", "revenue": 100}],
+        "profile": {"latest_nav": 1.23},
+        "premium_discount": {"latest": {"premium_discount_pct": -0.2}},
         "modules": {"C5": {"available": True, "gaps": [], "evidence": evidence}},
         "_meta": {"coverage": 100.0, "source_events": [{"source": "fixture", "status": "ok"}]},
     })
@@ -292,6 +295,9 @@ def test_upstream_pack_compaction_keeps_every_evidence_item_and_audit_metadata()
     assert module["evidence"][-1]["metric"] == "metric_17"
     assert "unused_payload" not in module["evidence"][0]
     assert compact["source_events"] == [{"source": "fixture", "status": "ok"}]
+    assert compact["financial_history"][0]["revenue"] == 100
+    assert compact["profile"]["latest_nav"] == 1.23
+    assert compact["premium_discount"]["latest"]["premium_discount_pct"] == -0.2
 
 
 def test_general_deep_stock_review_inherits_complete_c1_to_c8_pack(
@@ -422,6 +428,11 @@ def test_market_overview_scene_uses_all_market_sections_and_local_holdings(tmp_p
             "indices": {"date": "2026-07-17", "session": "盘后", "session_label": "7月17日盘后收盘数据", "rows": [{"name": "上证指数", "change_percent": 1.2}]},
             "lhb": {"date": "2026-07-17", "rows": [{"name": "甲公司", "net_amount": 3}]},
             "industry_flow": {"date": "2026-07-17", "inbound": [{"name": "医药", "net_amount": 5}], "outbound": []},
+            "global_indices": {"date": "2026-07-17", "rows": [{"name": "恒生指数", "change_percent": 0.8}]},
+            "global_market_news": {"date": "2026-07-17", "items": [{"title": "全球市场新闻"}]},
+            "global_market_movers": {"date": "2026-07-17", "markets": []},
+            "global_earnings_calendar": {"month": "2026-07", "markets": []},
+            "global_themes": {"date": "2026-07-17", "rows": []},
         }.items():
             vault.connection.execute(
                 "INSERT INTO market_snapshots VALUES (?, ?, ?, ?, ?)",
@@ -442,6 +453,8 @@ def test_market_overview_scene_uses_all_market_sections_and_local_holdings(tmp_p
     assert market["requested_session"] == "盘前"
     assert market["session_mismatch"] is True
     assert market["major_indices"][0]["name"] == "上证指数"
+    assert market["global_indices"][0]["name"] == "恒生指数"
+    assert market["market_scope"] == "all_available_markets"
     assert market["dragon_tiger"][0]["name"] == "甲公司"
     assert market["industry_flow"]["inbound"][0]["name"] == "医药"
     assert market["market_breadth"]["up"] == 3200

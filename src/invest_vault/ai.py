@@ -20,19 +20,34 @@ from uuid import uuid4
 
 from .ai_providers import PROVIDER_CATALOG, DirectAPIClient, EncryptedCredentialStore
 from .ai_roles import committee_plan, get_role, is_deep_research_request
-from .ai_skills import MARKET_OVERVIEW_SECURITY_ID, AppResearchSkillLayer, ResearchSkillLayer
+from .ai_skills import MARKET_OVERVIEW_SECURITY_IDS, AppResearchSkillLayer, ResearchSkillLayer
 from .ledger import Vault
 from .research import ResearchStore
 
 CHAT_RESPONSE_SCHEMA: dict[str, object] = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["content", "cited_evidence_ids", "assumptions", "unknowns"],
+    "required": ["content", "cited_evidence_ids", "assumptions", "unknowns", "reached_sources"],
     "properties": {
         "content": {"type": "string"},
         "cited_evidence_ids": {"type": "array", "items": {"type": "string"}},
         "assumptions": {"type": "array", "items": {"type": "string"}},
         "unknowns": {"type": "array", "items": {"type": "string"}},
+        "reached_sources": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["title", "url", "published_at", "accessed_at", "source_type"],
+                "properties": {
+                    "title": {"type": "string"},
+                    "url": {"type": "string"},
+                    "published_at": {"type": "string"},
+                    "accessed_at": {"type": "string"},
+                    "source_type": {"type": "string", "enum": ["issuer", "exchange", "regulator", "official_fund", "official_index"]},
+                },
+            },
+        },
     },
 }
 
@@ -133,9 +148,9 @@ MARKET_REPORT_ROLE: dict[str, object] = {
     "role_id": "market_report",
     "report_kind": "market",
     "name": "市场行情助手",
-    "focus": "仅生成当前盘前、盘中或盘后大盘行情报告，并结合用户本地持仓给出条件化观察建议",
-    "questions": "主要指数和成交发生了什么、行业资金如何变化、用户持仓暴露下一步应核对什么",
-    "risk_focus": "数据时段错配、把成本权重冒充实时市值权重、无条件买卖建议",
+    "focus": "结合当前所有可用且完整的证据生成当前交易时段报告，并结合用户本地持仓给出条件化观察建议",
+    "questions": "当前完整证据共同说明了什么、用户持仓暴露在什么条件下需要继续观察",
+    "risk_focus": "证据缺失、数据时段错配、计算模型不准确或把推导值冒充原始事实",
 }
 
 
@@ -146,9 +161,9 @@ def market_report_role(role: dict[str, object]) -> dict[str, object]:
         "role_id": role["role_id"],
         "report_kind": "market",
         "name": role["name"],
-        "focus": f"仅生成盘前、盘中或盘后大盘行情报告；全篇采用{role['name']}的证据优先级与判断顺序。{role['focus']}",
-        "questions": f"{role['questions']}；同时说明主要指数、行业资金、龙虎榜和本地持仓暴露。",
-        "risk_focus": f"{role['risk_focus']}；不得回答单股问题、不得把推导数量冒充真实成交数量。",
+        "focus": f"结合当前所有可用且完整的证据生成当前交易时段报告，并采用{role['name']}的分析框架；结合用户本地持仓给出条件化观察建议。",
+        "questions": f"{role['questions']}；当前完整证据与本地持仓暴露共同说明了什么。",
+        "risk_focus": f"{role['risk_focus']}；证据缺失、数据时段错配、计算模型不准确或把推导值冒充原始事实。",
     }
 
 
@@ -219,6 +234,7 @@ class CodexAppServerProvider:
         chat_timeout: float = 300.0,
         market_skill_directory: Path | None = None,
         reach_skill_directory: Path | None = None,
+        primary_evidence_skill_directory: Path | None = None,
     ) -> None:
         self.runtime_directory = Path(runtime_directory)
         self.executable = executable or self._find_executable()
@@ -227,6 +243,9 @@ class CodexAppServerProvider:
         self.chat_timeout = chat_timeout
         self.market_skill_directory = market_skill_directory or self._bundled_market_skill_directory()
         self.reach_skill_directory = reach_skill_directory or self._bundled_reach_skill_directory()
+        self.primary_evidence_skill_directory = (
+            primary_evidence_skill_directory or self._bundled_primary_evidence_skill_directory()
+        )
         self._process: subprocess.Popen[str] | None = None
         self._reader: threading.Thread | None = None
         self._stderr_reader: threading.Thread | None = None
@@ -240,7 +259,30 @@ class CodexAppServerProvider:
         self._fatal_error: str | None = None
         self._runtime_market_skill: dict[str, str] | None | bool = False
         self._runtime_reach_skill: dict[str, str] | None | bool = False
+        self._runtime_primary_evidence_skill: dict[str, str] | None | bool = False
         self._model_settings: dict[str, dict[str, str | None]] = {}
+        self._operation_local = threading.local()
+        self._active_turns: dict[str, set[tuple[str, str]]] = {}
+
+    def begin_operation(self, operation_id: str) -> None:
+        self._operation_local.operation_id = operation_id
+
+    def end_operation(self, operation_id: str) -> None:
+        if getattr(self._operation_local, "operation_id", None) == operation_id:
+            self._operation_local.operation_id = None
+
+    def cancel_operation(self, operation_id: str) -> None:
+        with self._condition:
+            turns = list(self._active_turns.get(operation_id, set()))
+        for thread_id, turn_id in turns:
+            try:
+                self._request(
+                    "turn/interrupt",
+                    {"threadId": thread_id, "turnId": turn_id},
+                    timeout=10,
+                )
+            except AIUnavailableError:
+                continue
 
     @staticmethod
     def _bundled_market_skill_directory() -> Path:
@@ -255,6 +297,13 @@ class CodexAppServerProvider:
         if frozen_root:
             return Path(frozen_root) / "skills" / "agent-reach"
         return Path(__file__).parents[2] / "skills" / "agent-reach"
+
+    @staticmethod
+    def _bundled_primary_evidence_skill_directory() -> Path:
+        frozen_root = getattr(sys, "_MEIPASS", None)
+        if frozen_root:
+            return Path(frozen_root) / "skills" / "primary-evidence-reach"
+        return Path(__file__).parents[2] / "skills" / "primary-evidence-reach"
 
     @staticmethod
     def _find_executable() -> str | None:
@@ -339,7 +388,7 @@ class CodexAppServerProvider:
             self._stderr_reader.start()
             self._request(
                 "initialize",
-                {"clientInfo": {"name": "invest_vault", "title": "Invest Vault", "version": "0.3.31"}},
+                {"clientInfo": {"name": "invest_vault", "title": "Invest Vault", "version": "0.3.34"}},
                 ensure_started=False,
             )
             self._send({"method": "initialized", "params": {}})
@@ -644,6 +693,22 @@ class CodexAppServerProvider:
             self._runtime_reach_skill = None
         return self._runtime_reach_skill or None
 
+    def _find_runtime_primary_evidence_skill(self) -> dict[str, str] | None:
+        """Resolve the pinned issuer/exchange/regulator evidence workflow."""
+
+        if self._runtime_primary_evidence_skill is not False:
+            return self._runtime_primary_evidence_skill or None
+        bundled = self.primary_evidence_skill_directory.resolve()
+        if (bundled / "SKILL.md").is_file():
+            self._runtime_primary_evidence_skill = {
+                "type": "skill",
+                "name": "primary-evidence-reach",
+                "path": str(bundled),
+            }
+            return self._runtime_primary_evidence_skill
+        self._runtime_primary_evidence_skill = None
+        return None
+
     def chat(
         self,
         *,
@@ -657,21 +722,14 @@ class CodexAppServerProvider:
             raise AIUnavailableError("请先使用 ChatGPT 登录 Codex")
         role_name = str(role["name"])
         report_rules = (
-            "你只能生成当前盘前、盘中或盘后市场复盘。投研委员会报告固定顺序为：执行摘要；"
-            "大盘指数概览；持仓分析；六模块深度复盘（M1指数与市场广度、M2板块资金、"
-            "M3赚钱效应与上涨主线、M4下跌与流动性风险、M5风格分组、M6抗跌方向）；"
-            "综合持仓建议与风险提示。指数和持仓必须使用Markdown表格。每个模块使用加粗的关键判断，"
-            "并写判断、证据、风险或确认条件。综合建议必须包含现状总结、基准跑赢/跑输、"
-            "条件化仓位动作、下一交易日观察清单、风险提示。单专家报告仍按该专家证据优先级组织，"
-            "但不得省略数据日期、指数表、持仓边界、观察清单和风险提示。"
-            "持仓必须引用本地账本，区分记录数量、推导数量、成本权重和实时市值估算。"
-            "持仓表必须使用证据中的display_name，统一写成证券名称（代码），不得只显示代码。"
-            "若所选时段与证据实际时段不一致，先披露错配，不得重标。正文不得出现接口、fallback、"
-            "Evidence或Skill等工程表述。结尾原样写：以上内容仅供参考，不构成任何投资建议。"
-            "股市有风险，投资需谨慎。"
+            "结合当前所有可用且完整的证据生成当前交易时段报告，并结合本地持仓给出条件化观察建议。"
+            "所有市场证据都可以进入分析；页面栏目不是证据上限。每位就席专家必须读取自己的证据覆盖检查，"
+            "完整采用应用与上游已取得的相关证据。缺失时先按 stock-analysis 的数据路由和计算口径补强，"
+            "再按 agent-reach 只读检索公开原始来源；只有业界通行、输入充分且口径准确的二次计算才可作为"
+            "明确标注的计算证据，不能用代理值冒充原指标。"
             if role.get("report_kind") == "market"
             else (
-                "你是投研委员会报告编辑器，必须执行 stock-analysis 4.14.0 Research 机构报告骨架："
+                "你是投研委员会投资经理，必须执行 stock-analysis 4.15.0 Research 机构报告骨架："
                 "执行摘要；核心矛盾或基金产品契约；财务或底层持仓；资本配置或业绩风险；"
                 "估值与交易实现；六人投研委员会审议；风险与催化剂；条件化动作。"
                 "报告综合已验证的质量、增长、估值和风险事实；覆盖率、内部缺口 ID、快照 ID 与"
@@ -682,9 +740,13 @@ class CodexAppServerProvider:
         )
         skill_input = self._find_runtime_market_skill() if use_runtime_market_skill else None
         reach_skill_input = self._find_runtime_reach_skill() if use_runtime_market_skill else None
+        primary_evidence_skill_input = (
+            self._find_runtime_primary_evidence_skill() if use_runtime_market_skill else None
+        )
         skill_rules = (
-            "本轮以已内置的 stock-analysis 4.14.0 skill 作为证据路由、六人投研委员会和报告纪律的"
-            "主契约；只引用应用提供的结构化事实，不读取其他文件或改写本地账本。"
+            "本轮以已内置的 stock-analysis 4.15.0 skill 作为证据路由、六人投研委员会和报告纪律的"
+            "主契约；A/HK/US/JP/KR 的一手证据缺口按 primary-evidence-reach 定向回填；"
+            "其余公开证据缺口按 agent-reach 只读检索补强；不读取无关文件或改写本地账本。"
             if skill_input
             else "不读取文件。"
         )
@@ -695,12 +757,20 @@ class CodexAppServerProvider:
                 "优先使用应用提供的结构化上下文和用户消息。只有结构化证据仍明确缺失时，"
                 "才可按 agent-reach 的只读 search/web 路由联网补证；保留标题、URL、发布时间与访问时间，"
                 "搜索摘要只能作为线索，未读到原文不得升级为原文事实。",
+                "若实际使用 primary-evidence-reach 或 agent-reach 读到原文，必须把发行人、交易所、监管机构、"
+                "基金公司或指数公司的一手页面写入 reached_sources；搜索结果页、摘要和二手转载不得进入该字段。"
+                "不得在未实际执行补证前直接照抄应用适配器的缺口清单作为最终结论。",
                 skill_rules,
                 report_rules,
                 "用户可见正文和过程说明只描述协调员、研究引擎、证据与报告方法，不主动展示"
                 "stock-analysis 名称、版本号或问题匹配规则。",
                 "应用会按 AVAILABLE_SKILLS 调用受控只读工具，SKILL_RUN 和对应 EVIDENCE-SKILL 结果可作为证据；",
                 "结构化来源和 agent-reach 均未补齐时必须保留缺口，不得自行补全。",
+                "HOLDINGS_AUTHORITY 视为用户本轮提供的完整持仓输入；持仓唯一权威来源是该字段与"
+                "portfolio-risk-evidence.ledger_entries。"
+                "禁止读取或采用 ~/.stock_analysis/profile.json、STOCK_ANALYSIS_PROFILE、旧对话记忆或任何外部投资记忆；"
+                "禁止把未出现在 ledger_entries 的证券写成用户持仓。每条持仓观察必须复述账本中的名称、代码、类型、"
+                "买入日期和买入金额；数量仅可采用账本记录值，或按买入日可核验价格与汇率明确标注为推导值。",
                 "回答前先读取专家证据覆盖检查：只把 available 当作完整证据，conditional 必须说明口径边界，",
                 "missing 必须具体说明缺少哪项；不要用笼统的‘现有证据不足’替代逐项结果。",
                 "事实结论必须在结构化 cited_evidence_ids 字段引用证据 ID，但正文绝不显示任何 EVIDENCE、",
@@ -728,6 +798,8 @@ class CodexAppServerProvider:
             inputs.append(skill_input)
         if reach_skill_input:
             inputs.append(reach_skill_input)
+        if primary_evidence_skill_input:
+            inputs.append(primary_evidence_skill_input)
         inputs.append({"type": "text", "text": f"应用上下文：\n{context}\n\n对话：\n{transcript}"})
         turn = self._request(
             "turn/start",
@@ -746,6 +818,10 @@ class CodexAppServerProvider:
         turn_id = str((turn.get("turn") or {}).get("id") or "")
         if not turn_id:
             raise AIUnavailableError("Codex 未返回 turn id")
+        operation_id = getattr(self._operation_local, "operation_id", None)
+        if operation_id:
+            with self._condition:
+                self._active_turns.setdefault(str(operation_id), set()).add((thread_id, turn_id))
         try:
             result = json.loads(
                 self._wait_for_turn(
@@ -757,6 +833,14 @@ class CodexAppServerProvider:
             )
         except json.JSONDecodeError as error:
             raise AIUnavailableError("Codex 返回的研究回复格式无效") from error
+        finally:
+            if operation_id:
+                with self._condition:
+                    active = self._active_turns.get(str(operation_id))
+                    if active is not None:
+                        active.discard((thread_id, turn_id))
+                        if not active:
+                            self._active_turns.pop(str(operation_id), None)
         if not isinstance(result, dict):
             raise AIUnavailableError("Codex 返回的研究回复格式无效")
         return result
@@ -797,6 +881,21 @@ class MultiProviderAIProvider:
     def configure_models(self, settings: dict[str, dict[str, str | None]]) -> None:
         self._settings = settings
         self.codex.configure_models(settings)
+
+    def begin_operation(self, operation_id: str) -> None:
+        begin = getattr(self.codex, "begin_operation", None)
+        if callable(begin):
+            begin(operation_id)
+
+    def end_operation(self, operation_id: str) -> None:
+        end = getattr(self.codex, "end_operation", None)
+        if callable(end):
+            end(operation_id)
+
+    def cancel_operation(self, operation_id: str) -> None:
+        cancel = getattr(self.codex, "cancel_operation", None)
+        if callable(cancel):
+            cancel(operation_id)
 
     def _route(self, task: str) -> tuple[str, str | None]:
         setting = self._settings.get(task) or {}
@@ -864,6 +963,8 @@ class MultiProviderAIProvider:
                 f"你是 Invest Vault 的{role['name']}，使用分析框架而非模仿真人。",
                 f"关注：{role['focus']}。核心问题：{role['questions']}。风险重点：{role['risk_focus']}。",
                 "只使用应用提供的有界证据和用户消息，不自行联网、不调用外部工具。",
+                "持仓唯一权威来源是 HOLDINGS_AUTHORITY 与 portfolio-risk-evidence.ledger_entries；"
+                "禁止采用外部 profile、旧记忆或把账本外证券写成用户持仓。",
                 "事实结论在 cited_evidence_ids 引用上下文中的证据 ID；缺失数据写入 unknowns，",
                 "推断写入 assumptions；正文不得显示内部工程标识，不虚构数字、来源或专家原话，",
                 "不给确定性买卖指令。用中文直接回答。",
@@ -1029,6 +1130,76 @@ class ResearchChatStore:
         self._background_lock = threading.Lock()
         self._background_threads: set[threading.Thread] = set()
 
+    def _is_cancelled(self, run_id: str) -> bool:
+        with self.vault.lock:
+            row = self.vault.connection.execute(
+                "SELECT status FROM research_runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+        return bool(row and row["status"] == "cancelled")
+
+    def _assert_ledger_holding_claims(self, result: dict[str, object]) -> None:
+        allowed = {str(item["security_id"]).split(":")[2].upper() for item in self.vault.holding_entries()}
+        ignored = {
+            "A", "AI", "A股", "ETF", "PE", "PB", "ROE", "ROIC", "FCF", "HK", "US",
+            "CNY", "HKD", "USD", "NAV", "IPO", "M1", "M2", "M3", "M4", "M5", "M6",
+        }
+        for sentence in re.split(r"[。！？\n]", str(result.get("content") or "")):
+            if not any(term in sentence for term in ("我的持仓", "用户持仓", "本地持仓", "账本持仓", "买入持仓")):
+                continue
+            candidates = set(re.findall(r"(?<![A-Za-z0-9])(?:[A-Z]{2,5}|\d{6})(?![A-Za-z0-9])", sentence.upper()))
+            unauthorized = sorted(candidates - allowed - ignored)
+            if unauthorized:
+                raise AIUnavailableError(
+                    "生成内容引用了不在 Invest Vault 本地持仓账本中的证券：" + "、".join(unauthorized)
+                )
+
+    def _provider_chat(self, run_id: str, **kwargs: object) -> dict[str, object]:
+        if self._is_cancelled(run_id):
+            raise AIUnavailableError("本轮研究已由用户停止")
+        begin = getattr(self.provider, "begin_operation", None)
+        end = getattr(self.provider, "end_operation", None)
+        if callable(begin):
+            begin(run_id)
+        try:
+            result = self.provider.chat(**kwargs)  # type: ignore[arg-type]
+            if self._is_cancelled(run_id):
+                raise AIUnavailableError("本轮研究已由用户停止")
+            self._assert_ledger_holding_claims(result)
+            return result
+        finally:
+            if callable(end):
+                end(run_id)
+
+    def cancel(self, thread_id: str) -> dict[str, object]:
+        with self.vault.lock:
+            run = self.vault.connection.execute(
+                "SELECT run_id, status FROM research_runs WHERE thread_id = ? ORDER BY started_at DESC LIMIT 1",
+                (thread_id,),
+            ).fetchone()
+            if run is None:
+                raise ValueError("当前会话没有可停止的生成任务")
+            run_id = str(run["run_id"])
+            if run["status"] != "running":
+                return {"run_id": run_id, "status": str(run["status"])}
+            completed_at = datetime.now(timezone.utc).isoformat()
+            self.vault.connection.execute(
+                "UPDATE research_runs SET status = 'cancelled', current_stage = 'cancelled', completed_at = ?, failure_json = ? WHERE run_id = ?",
+                (completed_at, json.dumps({"message": "用户已停止生成"}, ensure_ascii=False), run_id),
+            )
+            self._append_event(
+                thread_id,
+                run_id,
+                "system",
+                "coordinator",
+                {"content": "用户已停止本轮报告生成。", "role_name": "协调员"},
+                event_type="workflow.cancelled",
+            )
+            self.vault.connection.commit()
+        cancel = getattr(self.provider, "cancel_operation", None)
+        if callable(cancel):
+            cancel(run_id)
+        return {"run_id": run_id, "status": "cancelled"}
+
     def create(
         self, *, security_id: str, role_id: str, title: str, mode: str = "assistant"
     ) -> dict[str, object]:
@@ -1141,15 +1312,36 @@ class ResearchChatStore:
         )
 
     def _context(self, security_id: str, skill_results: list[dict[str, object]] | None = None) -> str:
-        lines = [
-            f"SECURITY: {security_id}",
-            "AVAILABLE_SKILLS: " + json.dumps(self.skill_layer.catalog(), ensure_ascii=False),
-            "EVIDENCE:",
-        ]
         ordered_results = sorted(
             skill_results or [],
             key=lambda item: 0 if item.get("skill_id") == "framework-readiness" else 1,
         )
+        portfolio_result = next(
+            (item for item in ordered_results if item.get("skill_id") == "portfolio-risk-evidence"),
+            None,
+        )
+        portfolio_value = next(
+            (
+                evidence.get("value")
+                for evidence in (portfolio_result or {}).get("evidence") or []
+                if isinstance(evidence, dict) and isinstance(evidence.get("value"), dict)
+            ),
+            {},
+        )
+        lines = [
+            f"SECURITY: {security_id}",
+            "HOLDINGS_AUTHORITY: " + json.dumps(
+                {
+                    "source": "Invest Vault本地持仓账本（唯一权威）",
+                    "allowed_security_ids": list((portfolio_value.get("holding_identities") or {}).keys()),
+                    "ledger_entries": portfolio_value.get("ledger_entries") or [],
+                    "external_profiles_forbidden": True,
+                },
+                ensure_ascii=False,
+            ),
+            "AVAILABLE_SKILLS: " + json.dumps(self.skill_layer.catalog(), ensure_ascii=False),
+            "EVIDENCE:",
+        ]
         for result in ordered_results:
             lines.append(
                 "SKILL_RUN: "
@@ -1165,12 +1357,12 @@ class ResearchChatStore:
             )
             for evidence in result.get("evidence") or []:
                 rendered = json.dumps(evidence, ensure_ascii=False)
-                lines.append(f"{evidence['evidence_id']}: " + rendered[:20_000])
+                lines.append(f"{evidence['evidence_id']}: " + rendered)
         rows = self.vault.connection.execute(
             """SELECT e.snapshot_id, e.item_index, e.kind, e.value_json, e.unit, e.period_end,
                       e.provider, e.source_ref, s.effective_as_of
                FROM evidence_items e JOIN evidence_snapshots s ON s.snapshot_id = e.snapshot_id
-               WHERE s.security_id = ? ORDER BY s.observed_at DESC, e.item_index LIMIT 40""",
+               WHERE s.security_id = ? ORDER BY s.observed_at DESC, e.item_index""",
             (security_id,),
         ).fetchall()
         for index, row in enumerate(rows, 1):
@@ -1190,21 +1382,21 @@ class ResearchChatStore:
             if snapshot:
                 lines.append(
                     f"EVIDENCE-{prefix}-{snapshot['snapshot_id']}: {prefix}_SNAPSHOT "
-                    + str(dict(snapshot))[:20_000]
+                    + json.dumps(dict(snapshot), ensure_ascii=False)
                 )
         lines.append("USER_NOTES:")
         for row in self.vault.connection.execute(
-            "SELECT body, created_at FROM notes WHERE security_id = ? ORDER BY created_at DESC LIMIT 10",
+            "SELECT body, created_at FROM notes WHERE security_id = ? ORDER BY created_at DESC",
             (security_id,),
         ):
             lines.append(f"USER_NOTE: {row['created_at']} {row['body']}")
         lines.append("PUBLIC_MATERIALS:")
         for row in self.vault.connection.execute(
-            "SELECT title, published_at, source_name, source_url, excerpt FROM research_materials WHERE security_id = ? ORDER BY published_at DESC LIMIT 10",
+            "SELECT title, published_at, source_name, source_url, excerpt FROM research_materials WHERE security_id = ? ORDER BY published_at DESC",
             (security_id,),
         ):
             lines.append(f"MATERIAL: {dict(row)}")
-        return "\n".join(lines)[:60_000]
+        return "\n".join(lines)
 
     def _context_event(self, security_id: str, context: str) -> dict[str, object]:
         materials = [
@@ -1230,7 +1422,7 @@ class ResearchChatStore:
         rows = self.vault.connection.execute(
             """SELECT e.provider, e.source_ref, e.period_end, s.effective_as_of
                FROM evidence_items e JOIN evidence_snapshots s ON s.snapshot_id = e.snapshot_id
-               WHERE s.security_id = ? ORDER BY s.observed_at DESC, e.item_index LIMIT 40""",
+               WHERE s.security_id = ? ORDER BY s.observed_at DESC, e.item_index""",
             (security_id,),
         ).fetchall()
         for index, row in enumerate(rows, 1):
@@ -1266,7 +1458,7 @@ class ResearchChatStore:
                 value = evidence.get("value")
                 if result.get("skill_id") == "public-topic-evidence" and isinstance(value, dict):
                     for search in value.get("searches") or []:
-                        for item in (search.get("items") or [])[:4]:
+                        for item in search.get("items") or []:
                             if item.get("url"):
                                 details.append(
                                     {
@@ -1319,7 +1511,7 @@ class ResearchChatStore:
                                         "as_of": str(history.get("as_of") or value.get("market_date") or ""),
                                     }
                                 )
-                sources[str(evidence["evidence_id"])] = details[:13]
+                sources[str(evidence["evidence_id"])] = details
         return sources
 
     def _send_assistant(self, *, thread_id: str, content: str, role: dict[str, object]) -> dict[str, object]:
@@ -1333,7 +1525,7 @@ class ResearchChatStore:
             self._append_event(thread_id, run_id, "user", "user", {"content": content})
             self.vault.connection.commit()
         try:
-            market_scene = str(thread["security_id"]) == MARKET_OVERVIEW_SECURITY_ID
+            market_scene = str(thread["security_id"]) in MARKET_OVERVIEW_SECURITY_IDS
             accepted_question = is_investment_question(content) and (
                 not market_scene or is_market_report_question(content)
             )
@@ -1411,7 +1603,7 @@ class ResearchChatStore:
         try:
             if market_scene and not is_market_report_question(content):
                 reply = {
-                    "content": "市场概览助手仅生成盘前、盘中或盘后大盘行情报告，并可结合本地持仓给出下一步观察建议。个股、基金或其他投资问题请移步证券资料助手。",
+                    "content": "大盘议事厅仅生成盘前、盘中或盘后行情报告；A股概览与全球概览使用各自的市场证据范围。个股、基金或其他投资问题请移步证券资料助手。",
                     "cited_evidence_ids": [],
                     "assumptions": [],
                     "unknowns": [],
@@ -1426,10 +1618,11 @@ class ResearchChatStore:
                     "refused": True,
                 }
             else:
-                reply = self.provider.chat(
+                reply = self._provider_chat(
+                    run_id,
                     role=market_report_role(role) if market_scene else role,
                     messages=history,
-                    context=context[:45_000] if is_deep_research_request(content) else context,
+                    context=context,
                     use_runtime_market_skill=True,
                 )
             valid_evidence_ids = {
@@ -1446,6 +1639,14 @@ class ResearchChatStore:
                 for evidence_id in reply["cited_evidence_ids"]
                 if evidence_id in source_index
                 for source in source_index[evidence_id]
+            ] + [
+                {
+                    "name": str(item.get("title") or "一手公开资料"),
+                    "url": str(item.get("url") or ""),
+                    "as_of": str(item.get("published_at") or item.get("accessed_at") or "")[:10],
+                }
+                for item in reply.get("reached_sources", [])
+                if isinstance(item, dict) and str(item.get("url") or "").startswith(("https://", "http://"))
             ]
             reply["content"] = re.sub(
                 r"[（(]?EVIDENCE(?:-(?:SKILL|FINANCIAL|FUND))?-[A-Za-z0-9_-]+[）)]?",
@@ -1469,6 +1670,8 @@ class ResearchChatStore:
             return reply
         except BaseException as error:
             with self.vault.lock:
+                if self._is_cancelled(run_id):
+                    return {"run_id": run_id, "status": "cancelled"}
                 self.vault.connection.execute(
                     "UPDATE research_runs SET status = 'failed', failure_json = ? WHERE run_id = ?",
                     (json.dumps({"message": str(error)}, ensure_ascii=False), run_id),
@@ -1507,7 +1710,7 @@ class ResearchChatStore:
             thread = self.get(thread_id)
             deep_request = str(
                 thread["security_id"]
-            ) == MARKET_OVERVIEW_SECURITY_ID or is_deep_research_request(content)
+            ) in MARKET_OVERVIEW_SECURITY_IDS or is_deep_research_request(content)
             running = self.vault.connection.execute(
                 "SELECT 1 FROM research_runs WHERE thread_id = ? AND status = 'running' LIMIT 1",
                 (thread_id,),
@@ -1516,7 +1719,7 @@ class ResearchChatStore:
                 raise ValueError("当前投研委员会仍在研究中，请等待本轮完成")
             plan = committee_plan(str(thread["security_id"]), content)
             self.vault.connection.execute(
-                "INSERT INTO research_runs VALUES (?, ?, 'stock-analysis-4.14.0-committee-v1', 'running', 'planning', ?, ?, ?, NULL, NULL)",
+                "INSERT INTO research_runs VALUES (?, ?, 'stock-analysis-4.15.0-committee-v1', 'running', 'planning', ?, ?, ?, NULL, NULL)",
                 (
                     run_id,
                     thread_id,
@@ -1610,6 +1813,8 @@ class ResearchChatStore:
             )
         except BaseException as error:
             with self.vault.lock:
+                if self._is_cancelled(run_id):
+                    return
                 failed_at = datetime.now(timezone.utc).isoformat()
                 self.vault.connection.execute(
                     "UPDATE research_runs SET status = 'failed', completed_at = ?, failure_json = ? WHERE run_id = ?",
@@ -1741,7 +1946,8 @@ class ResearchChatStore:
             role = get_role(role_id)
             for attempt in (1, 2):
                 try:
-                    opinion = self.provider.chat(
+                    opinion = self._provider_chat(
+                        run_id,
                         role={**role, "_provider_task": "committee"},
                         messages=[
                             {
@@ -1749,7 +1955,7 @@ class ResearchChatStore:
                                 "content": f"作为投研委员会研究员，围绕以下深度问题提交独立意见：{content}",
                             }
                         ],
-                        context=context[:45_000],
+                        context=context,
                         use_runtime_market_skill=True,
                     )
                     opinion = self._clean_reply(opinion)
@@ -1823,18 +2029,18 @@ class ResearchChatStore:
                     )
                     self.vault.connection.commit()
 
-        opinion_text = json.dumps(opinions, ensure_ascii=False)[:24_000]
+        opinion_text = json.dumps(opinions, ensure_ascii=False)
         report_role = {
             "role_id": "report_editor",
-            "name": "投研委员会报告编辑器",
+            "name": "投研委员会投资经理",
             "focus": "证据边界、专家共识、关键分歧、组合风险和可复核条件",
             "questions": "哪些逻辑仍成立、哪些已削弱、哪些缺口会改变判断？",
             "risk_focus": "证据错配、虚假共识、数据缺口和无条件行动建议",
-            "report_contract": "stock-analysis 4.14.0；市场使用执行摘要、指数、持仓、M1-M6、建议风险骨架；公司或基金使用 Research 机构报告骨架",
+            "report_contract": "stock-analysis 4.15.0；市场使用执行摘要、指数、持仓、M1-M6、建议风险骨架；公司或基金使用 Research 机构报告骨架",
         }
-        if str(thread["security_id"]) == MARKET_OVERVIEW_SECURITY_ID:
+        if str(thread["security_id"]) in MARKET_OVERVIEW_SECURITY_IDS:
             report_role["report_kind"] = "market"
-        report_context = (context[:28_000] + "\nEXPERT_OPINIONS:\n" + opinion_text)[:52_000]
+        report_context = context + "\nEXPERT_OPINIONS:\n" + opinion_text
         try:
             with self.vault.lock:
                 self.vault.connection.execute(
@@ -1845,11 +2051,12 @@ class ResearchChatStore:
                     run_id,
                     "system",
                     "report_editor",
-                    {"content": "专家意见已汇总，正在生成最终深度报告。", "role_name": "报告编辑器"},
+                    {"content": "专家意见已汇总，正在生成最终深度报告。", "role_name": "投资经理"},
                     event_type="reporting.started",
                 )
                 self.vault.connection.commit()
-            report = self.provider.chat(
+            report = self._provider_chat(
+                run_id,
                 role={**report_role, "_provider_task": "committee"},
                 messages=[
                     {"role": "user", "content": f"根据协调员计划和专家意见形成最终深度报告：{content}"}
@@ -1865,6 +2072,14 @@ class ResearchChatStore:
                 source
                 for evidence_id in report["cited_evidence_ids"]
                 for source in source_index.get(evidence_id, [])
+            ] + [
+                {
+                    "name": str(item.get("title") or "一手公开资料"),
+                    "url": str(item.get("url") or ""),
+                    "as_of": str(item.get("published_at") or item.get("accessed_at") or "")[:10],
+                }
+                for item in report.get("reached_sources", [])
+                if isinstance(item, dict) and str(item.get("url") or "").startswith(("https://", "http://"))
             ]
             report.update({"role_id": "report_editor", "role_name": "投研委员会报告", "report": True})
             unresolved = list(

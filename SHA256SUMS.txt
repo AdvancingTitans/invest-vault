@@ -23,3 +23,4 @@ a436c867f5a377b840a6bbaf394c7193a581a5b0463795097d4e17ef27cbdbb5  Invest-Vault_0
 27405ba8fbcc50f24ada0794a3c2ee61f6517938d18b994a0d50c4f7b90a2899  Invest-Vault_0.3.29-local-aarch64.dmg
 a4431d056a1cdfa7d3f1f37076d1262c5fd6e510c7c9a7f4262be9027fbb5a1a  Invest-Vault_0.3.30-local-aarch64.dmg
 e1b21afebd196c0cf796aca7b8461832d93c23d3aa7412cb80b955fbb1f9f3ac  Invest-Vault_0.3.31-local-aarch64.dmg
+886dccb977a36dab6e4df0e1be824d0a3868f0e92980bdc4db5bd14884552977  Invest-Vault_0.3.34-local-aarch64.dmg

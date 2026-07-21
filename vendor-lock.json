@@ -3,19 +3,19 @@
   "hash_algorithm": "sha256(relative_path + NUL + sha256(file_bytes) + LF)",
   "upstream": {
     "repository": "https://github.com/AdvancingTitans/stock-analysis",
-    "commit": "d76770c0cb9ae0bf4427230cb76a0dc671ac0cc1",
-    "version": "4.14.0"
+    "commit": "f5b3a79d149a36b93ca20db113e3468a06e1eb23",
+    "version": "4.15.0"
   },
   "trees": {
     "runtime": {
       "path": "src/stock_analysis",
-      "files": 47,
-      "sha256": "6b96489105d7cfbd1c1b4678a9f5d95389c40d23547997cffa9a7016161383c0"
+      "files": 51,
+      "sha256": "0db41d3284be6fdd6125f51a36fe7e4adbb00ec6ff5a0d87419813218fa798e1"
     },
     "portable_app_skill": {
       "path": "skills/stock-analysis",
       "files": 39,
-      "sha256": "da85481bfe2a467d57295bacdbfea19ccb58f2ced4bb47b1571ebd0fbe23a9cf"
+      "sha256": "695b9b89fd190f8363fe92f35bad61554fa41d1006bcfaebfce3df7d7047e439"
     }
   },
   "allowed_transformations": [
