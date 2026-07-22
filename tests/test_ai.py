@@ -1,7 +1,9 @@
 import json
+import re
 import sqlite3
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -17,7 +19,15 @@ from invest_vault.ai import (
 from invest_vault.ai_roles import committee_plan, get_role
 from invest_vault.ai_skills import SKILL_CATALOG
 from invest_vault.api import create_app
+from invest_vault.evidence_orchestration import (
+    EvidenceManifest,
+    EvidenceRecord,
+    EvidenceStore,
+    PacketEngine,
+    RoleEvidencePlanner,
+)
 from invest_vault.ledger import HoldingRecord, Vault
+from invest_vault.research import ResearchStore
 
 
 class FakeAIProvider:
@@ -103,7 +113,46 @@ class CatalogOnlyResearchSkillLayer:
         return []
 
 
+def test_local_notes_never_enter_ai_context_or_evidence_store(tmp_path: Path) -> None:
+    security_id = "CN:SSE:600519:STOCK"
+    secret_note = "PRIVATE_NOTE_MUST_NOT_REACH_ANY_MODEL"
+    with Vault(tmp_path / "vault.sqlite3") as vault:
+        ResearchStore(vault).add_note(security_id=security_id, body=secret_note)
+        chats = ResearchChatStore(vault, FakeAIProvider(), CatalogOnlyResearchSkillLayer())
+
+        legacy_context = chats._context(security_id, [])
+        store = chats._evidence_store(security_id, [])
+
+        assert secret_note not in legacy_context
+        assert "USER_NOTES" not in legacy_context
+        assert "USER_NOTE:" not in legacy_context
+        assert all(record.domain != "user-judgement" for record in store.records)
+        assert all(record.provider != "Invest Vault本地笔记" for record in store.records)
+        assert all(not record.evidence_id.startswith("EVIDENCE-NOTE-") for record in store.records)
+
+
 class MarketReportProvider(FakeAIProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.contexts: list[str] = []
+
+    def generate_structured(self, **kwargs: object) -> dict[str, object]:
+        prompt = str(kwargs["prompt"])
+        self.contexts.append(prompt)
+        evidence_ids = list(
+            dict.fromkeys(
+                item
+                for item in re.findall(r'"evidence_id":\s*"([^"]+)"', prompt)
+                if item.startswith("EVIDENCE-")
+            )
+        )
+        return {
+            "claims": [],
+            "requirements": [],
+            "open_questions": [],
+            "cited_evidence_ids": evidence_ids[:1],
+        }
+
     def chat(
         self,
         *,
@@ -114,9 +163,8 @@ class MarketReportProvider(FakeAIProvider):
     ) -> dict[str, object]:
         self.chat_calls += 1
         self.last_context = context
+        self.contexts.append(context)
         assert role["role_id"] == "market_report"
-        assert "market_overview" in context
-        assert "ledger_entries" in context
         return {
             "content": "盘后大盘行情报告：指数回升；结合本地持仓，下一步先核对行业暴露。",
             "cited_evidence_ids": [],
@@ -142,12 +190,12 @@ def test_market_report_supports_expert_style_and_committee_scene() -> None:
     assert plan["scene"] == "market"
     assert len(plan["roles"]) == 6
     assert plan["roles"] == [
+        "simons",
+        "dalio",
         "livermore",
-        "buffett",
-        "munger",
-        "duan_yongping",
-        "zhang_kun",
-        "graham",
+        "o_neil",
+        "minervini",
+        "soros",
     ]
     assert plan["skill_version"] == "4.15.0"
 
@@ -463,9 +511,21 @@ def test_roles_and_recoverable_role_chat(tmp_path: Path) -> None:
         assert reply["cited_evidence_ids"] == []  # unknown IDs from a provider are discarded
 
         restored = client.get(f"/api/ai/chats/{created['thread_id']}").json()
-        assert [event["actor_type"] for event in restored["events"]] == ["user", "system", "assistant"]
+        assert [event["actor_type"] for event in restored["events"]] == [
+            "user",
+            "system",
+            "system",
+            "assistant",
+        ]
+        assert [event["event_type"] for event in restored["events"]] == [
+            "message.completed",
+            "context.completed",
+            "blackboard.completed",
+            "message.completed",
+        ]
         assert restored["events"][1]["event_type"] == "context.completed"
-        assert restored["events"][2]["payload"]["unknowns"] == ["长期自由现金流证据不足"]
+        assert restored["events"][3]["payload"]["unknowns"] == []
+        assert restored["events"][3]["payload"]["audit_unknowns"] == ["长期自由现金流证据不足"]
 
 
 def test_chat_refuses_off_topic_without_spending_a_provider_turn(tmp_path: Path) -> None:
@@ -549,6 +609,13 @@ def test_market_overview_chat_only_generates_session_report_with_local_holdings(
     assert "仅生成盘前、盘中或盘后" in refused["content"]
     assert report["role_id"] == "market_report"
     assert provider.chat_calls == 1
+    assert any("market_overview" in context for context in provider.contexts)
+    assert any("ledger_entries" in context for context in provider.contexts)
+    with sqlite3.connect(tmp_path / "vault.sqlite3") as connection:
+        summaries = connection.execute(
+            "SELECT completion_status FROM research_performance_summaries"
+        ).fetchall()
+    assert sorted(status for (status,) in summaries) == ["completed", "partial"]
 
 
 def test_financial_scope_gate_keeps_common_short_investment_questions() -> None:
@@ -557,7 +624,7 @@ def test_financial_scope_gate_keeps_common_short_investment_questions() -> None:
     assert not is_investment_question("帮我写一首生日诗")
 
 
-def test_chat_context_includes_app_owned_financial_and_fund_snapshots(tmp_path: Path) -> None:
+def test_external_evidence_store_and_packets_include_app_owned_fund_snapshot(tmp_path: Path) -> None:
     provider = FakeAIProvider()
     security_id = "CN:SSE:512480:FUND"
     with TestClient(create_app(tmp_path, automatic_updates=False, ai_provider=provider)) as client:
@@ -583,13 +650,33 @@ def test_chat_context_includes_app_owned_financial_and_fund_snapshots(tmp_path: 
             json={"content": "护城河是否仍然成立？", "role_id": "buffett"},
         )
 
-    assert "fund-portfolio-evidence" in provider.last_context
-    assert "2026Q1" in provider.last_context
+    with sqlite3.connect(tmp_path / "vault.sqlite3") as connection:
+        stored = connection.execute(
+            "SELECT evidence_id, value_json FROM research_evidence_records "
+            "WHERE domain = 'fund-portfolio-evidence'"
+        ).fetchall()
+        packet_ids = [
+            evidence_id
+            for (payload,) in connection.execute(
+                "SELECT evidence_ids_json FROM research_evidence_packets WHERE role_id = 'buffett'"
+            ).fetchall()
+            for evidence_id in json.loads(payload)
+        ]
+
+    assert stored
+    assert any("2026Q1" in value_json for _evidence_id, value_json in stored)
+    assert any(evidence_id in packet_ids for evidence_id, _value_json in stored)
 
 
 class FakeResearchSkillLayer:
     def catalog(self) -> list[dict[str, str]]:
-        return [{"skill_id": "test-skill", "name": "测试证据", "description": "测试"}]
+        return [
+            {
+                "skill_id": "supplemental-company-evidence",
+                "name": "测试证据",
+                "description": "测试",
+            }
+        ]
 
     def run(self, *, security_id: str, question: str, role_id: str = "general") -> list[dict[str, object]]:
         assert security_id == "CN:SSE:600519:STOCK"
@@ -597,7 +684,7 @@ class FakeResearchSkillLayer:
         assert role_id == "buffett"
         return [
             {
-                "skill_id": "test-skill",
+                "skill_id": "supplemental-company-evidence",
                 "name": "测试证据",
                 "description": "测试",
                 "status": "partial",
@@ -645,6 +732,7 @@ def test_chat_skill_tool_events_and_evidence_are_persisted_in_one_timeline(tmp_p
         "tool.started",
         "tool.completed",
         "context.completed",
+        "blackboard.completed",
         "message.completed",
     ]
     assert restored["events"][2]["payload"]["gaps"] == ["管理层激励"]
@@ -717,6 +805,204 @@ def test_each_turn_excludes_old_chat_and_clearing_permanently_deletes_the_thread
         )
 
 
+def test_investor_visible_reply_rewrites_internal_research_terms() -> None:
+    reply = ResearchChatStore._clean_reply(
+        {
+            "content": (
+                "统一编辑 Claim Board；未提供 portfolio-risk-evidence.ledger_entries；"
+                "全部专家未形成 Expert State；请检查 Shared Blackboard 和 Domain Packet；"
+                "'utf-8' codec can't decode byte 0x8b in position 1: invalid start byte"
+            ),
+            "unknowns": ["empty_order_book", "execution-liquidity-evidence.order_book"],
+        }
+    )
+    assert reply["unknowns"] == ["当前公开行情未返回有效买卖盘", "相关研究证据"]
+
+    assert reply["content"] == (
+        "统一编辑 已核验研究结论；未提供 本地持仓账本明细；"
+        "全部专家未形成 专家研究结论；请检查 共享事实清单 和 分主题证据材料；"
+        "公开资料暂未成功解析"
+    )
+    for internal_term in (
+        "Claim Board",
+        "portfolio-risk-evidence",
+        "ledger_entries",
+        "Expert State",
+        "Blackboard",
+        "Domain Packet",
+        "codec can't decode",
+    ):
+        assert internal_term not in reply["content"]
+
+
+def test_historical_assistant_events_are_sanitized_when_loaded(tmp_path: Path) -> None:
+    with Vault(tmp_path / "vault.sqlite3") as vault:
+        service = ResearchChatStore(vault, FakeAIProvider())
+        thread = service.create(
+            security_id="CN:SSE:600519:STOCK",
+            role_id="buffett",
+            title="历史报告",
+            mode="committee",
+        )
+        service._append_event(
+            str(thread["thread_id"]),
+            None,  # type: ignore[arg-type]
+            "assistant",
+            "report_editor",
+            {
+                "content": "仅统一 Claim Board；未提供 portfolio-risk-evidence.ledger_entries。",
+                "coverage_gaps": ["empty_order_book"],
+                "report": "检查 Shared Blackboard。",
+            },
+            event_type="report.completed",
+        )
+        service._append_event(
+            str(thread["thread_id"]),
+            None,  # type: ignore[arg-type]
+            "system",
+            "evidence_collector",
+            {
+                "content": "仍待核实：'utf-8' codec can't decode byte 0x8b in position 1: invalid start byte",
+                "gaps": [
+                    "已生成行业候选可比公司及同日估值；业务可比性仍需用户确认",
+                    "600519交易成本代理未形成",
+                ],
+            },
+            event_type="tool.completed",
+        )
+        vault.connection.commit()
+
+        events = service.get(str(thread["thread_id"]))["events"]
+        payload = events[0]["payload"]
+
+    assert payload["content"] == "仅统一 已核验研究结论；未提供 本地持仓账本明细。"
+    assert payload["coverage_gaps"] == ["当前公开行情未返回有效买卖盘"]
+    assert payload["report"] == "检查 共享事实清单。"
+    assert events[1]["payload"]["content"] == "仍待核实：公开资料暂未成功解析"
+    assert events[1]["payload"]["gaps"] == [
+        "该历史轮次仅生成候选可比公司；新分析会按行业与经营特征自动评估业务相似度",
+        "该历史轮次未形成贵州茅台交易成本估算；新分析会重新计算",
+    ]
+
+
+def test_completed_evidence_removes_stale_expert_gap_claims() -> None:
+    reply = ResearchChatStore._clean_reply(
+        {
+            "content": (
+                "- 缺少腾讯控股本轮完整财务质量证据。\n"
+                "- 腾讯仍缺港股实时盘口、标准化财务质量、分部现金流与资本配置原文。\n"
+                "- 真实申赎压力仍不可验证。"
+            ),
+            "unknowns": [
+                "尚缺A股全市场7月22日宽度、涨跌停和板块资金数据。",
+                "腾讯控股是否能补齐港股实时盘口、最新财务质量与分部现金流？",
+                "基金真实申赎压力仍不可验证。",
+            ],
+            "assumptions": [
+                "腾讯港股汇率、真实数量和当前市值未在本轮包中形成完整统一口径。",
+                "本轮未补齐腾讯财务质量，不能把量价弱势归因为基本面。",
+                "估值为披露EPS与市场报价的代理口径，缺少历史估值分位与同行完整比较。",
+            ],
+            "gaps": [
+                "缺少A股全市场7月22日涨跌家数、涨停/跌停、连板梯队和成交额龙头，无法判断短线主线扩散。",
+                "缺少各持仓真实成交数量、券商成本、实时汇率和完整市值口径，无法计算精确仓位权重与盈亏。",
+                "腾讯控股仍缺本轮可验证的与分部现金流证据。",
+                "腾讯控股缺少本轮完整标准化三表、分业务利润率、现金流与资本配置证据。",
+                "本地持仓缺少券商确认数量、统一汇率和完整实时市值，组合权重只能按账本投入金额条件化处理。",
+                "腾讯控股缺少本轮标准化三表、现金流、分部利润和资本配置证据，无法按欧奈尔基本面质量闭环评价。",
+                "本地持仓缺少券商真实成交数量、实时市值、汇率和完整组合风险贡献，现金比例与权重判断仍以账本金额为主。",
+                "缺少A股涨跌家数、连板梯队、涨停/跌停扩散、行业相对强度排名和个股RS排名，欧奈尔市场确认信号仍不完整。",
+                "缺少券商确认的真实持仓数量、成交价、港股买入汇率和统一实时市值，组合风险只能条件化。",
+                "需补齐公司盈利质量证据。",
+                "腾讯控股与交银优择回报C是否需要补齐最新财务/基金穿透证据，以确认科技暴露是否重复集中？",
+                "腾讯控股与其他非茅台个股是否有同等完整的财务质量、现金流和估值证据包？",
+                "腾讯控股、贵州茅台等核心持仓的本轮财务质量、现金流、估值分位和反方资料未在本专家证据包中闭环。",
+                "本轮未提供腾讯完整财务质量、分业务现金流和管理层资本配置证据。",
+                "A股主要宽基指数的同口径7月22日连续趋势、市场宽度、涨跌停扩散未在当前包中完整呈现。",
+                "各持仓真实成交数量、成本、港股汇率、基金份额与统一实时市值仍需券商或本地账本进一步补齐。",
+                "需补齐真实成交数量、港股汇率、基金份额和实时市值后才能计算精确组合风险权重",
+                "在统一现金、港股汇率、持仓数量和实时市值后，用户组合中贵州茅台真实权重与风险预算是多少？",
+                "用户完整组合的实时市值权重、现金比例、港股汇率口径和压力期流动性仍不可获得。",
+                "需要统一港股汇率、基金和现金口径",
+                "需要真实成交数量与当前市值，而非仅投入成本",
+                "统一港股汇率、实时市值和现金后，茅台在总资产中的真实风险权重是多少？",
+                "持仓市值、港股汇率、现金比例和实时总资产口径尚未统一",
+                "完整组合实时市值、港股汇率、现金比例和压力期流动性证据是否足以评估集中度风险？",
+                "用户包含现金、港股和全部证券的统一实时组合权重与集中度是多少？",
+                "当前账本可证明投入记录和现金余额，但缺少统一实时市值、港股汇率和完整组合权重口径。",
+                "在统一现金、港股汇率、基金和全部证券市值后，茅台真实组合权重和机会成本是多少？",
+                "持仓为本地账本投入金额口径；未统一现金、港股汇率、实时市值和完整资产权重。",
+                "用户完整组合按实时市值、汇率和现金统一口径后的茅台权重和集中风险是多少？",
+                "需统一持仓数量、实时价格、汇率与现金口径后才能计算组合权重和集中度。",
+                "完整组合实时市值、现金、港股汇率统一后，贵州茅台真实风险权重是多少？",
+                "账本为唯一权威持仓来源，但未提供完整实时市值、港股汇率和现金统一口径。",
+            ],
+        },
+        {
+            "company-financial-quality",
+            "market-context-evidence",
+            "portfolio-risk-evidence",
+            "security-valuation-evidence",
+        },
+    )
+
+    assert "完整财务质量" not in reply["content"]
+    assert "标准化财务质量" not in reply["content"]
+    assert "7月22日宽度" not in "；".join(reply["unknowns"])
+    assert "港股实时盘口" in reply["content"]
+    assert "分部现金流" in reply["unknowns"][0]
+    assert reply["unknowns"][-1] == "基金真实申赎压力仍不可验证。"
+    assert reply["assumptions"] == [
+        "组合现金、港股汇率、推导数量、市值与权重已形成统一估算；"
+        "真实成交数量、费用、券商确认权重和压力期流动性仍不可得。",
+        "估值为披露EPS与市场报价的代理口径。",
+    ]
+    joined_gaps = "；".join(reply["gaps"])
+    assert "组合现金、港股汇率、推导数量、市值与权重已形成统一估算" in joined_gaps
+    assert "真实成交数量、费用、券商确认权重和压力期流动性仍不可得" in joined_gaps
+    assert "未统一现金" not in joined_gaps
+    assert "缺少统一实时市值" not in joined_gaps
+    assert "需统一持仓数量" not in joined_gaps
+    assert "业务相似度" not in joined_gaps
+    assert "发行人原文层面的分业务利润率" in joined_gaps
+
+
+def test_expert_update_drops_unknown_citations_without_dropping_the_expert() -> None:
+    cleaned = ResearchChatStore._sanitize_structured_update_evidence(
+        {
+            "claims": [
+                {
+                    "claim_id": "mixed",
+                    "claim": "有一条有效引用",
+                    "status": "supported",
+                    "supporting_evidence_ids": ["KNOWN", "MISTYPED"],
+                    "contradicting_evidence_ids": [],
+                    "confidence": "high",
+                    "conditions": [],
+                },
+                {
+                    "claim_id": "unknown-only",
+                    "claim": "只有错误引用",
+                    "status": "supported",
+                    "supporting_evidence_ids": ["MISTYPED"],
+                    "contradicting_evidence_ids": [],
+                    "confidence": "high",
+                    "conditions": [],
+                },
+            ],
+            "requirements": [
+                {"requirement": "覆盖", "evidence_ids": ["KNOWN", "MISTYPED"]}
+            ],
+        },
+        {"KNOWN"},
+    )
+
+    assert cleaned["claims"][0]["supporting_evidence_ids"] == ["KNOWN"]
+    assert cleaned["claims"][0]["status"] == "supported"
+    assert cleaned["claims"][1]["status"] == "conditional"
+    assert cleaned["requirements"][0]["evidence_ids"] == ["KNOWN"]
+
+
 class FailingResearchSkillLayer(FakeResearchSkillLayer):
     def run(self, *, security_id: str, question: str, role_id: str = "general") -> list[dict[str, object]]:
         raise RuntimeError("公开数据源暂时不可用")
@@ -774,13 +1060,19 @@ class CommitteeProvider(FakeAIProvider):
 
 
 class CommitteeSkillLayer:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+
     def catalog(self) -> list[dict[str, str]]:
-        return [{"skill_id": "committee-evidence", "name": "投委会证据", "description": "测试"}]
+        return [
+            {"skill_id": "market-context-evidence", "name": "投委会证据", "description": "测试"}
+        ]
 
     def run(self, *, security_id: str, question: str, role_id: str = "general") -> list[dict[str, object]]:
+        self.calls.append((role_id, question))
         return [
             {
-                "skill_id": "committee-evidence",
+                "skill_id": "market-context-evidence",
                 "name": "投委会证据",
                 "status": "completed",
                 "gaps": [],
@@ -851,7 +1143,8 @@ def test_fund_committee_auto_assigns_roles_and_persists_report(tmp_path: Path) -
         "buffett",
     }
     assert provider.roles_seen[-1] == "report_editor"
-    assert provider.skill_flags == [True, True, True, True, True, True, True]
+    assert provider.skill_flags
+    assert all(flag is False for flag in provider.skill_flags)
     report = next(item for item in restored["events"] if item["event_type"] == "report.completed")
     assert report["payload"]["report"] is True
     assert any(item["event_type"] == "analysis.started" for item in restored["events"])
@@ -863,7 +1156,7 @@ def test_fund_committee_auto_assigns_roles_and_persists_report(tmp_path: Path) -
         assert connection.execute("SELECT COUNT(*) FROM research_reports").fetchone()[0] == 1
 
 
-def test_every_investment_assistant_turn_loads_bundled_stock_analysis_skill(tmp_path: Path) -> None:
+def test_investment_assistant_uses_app_packets_without_expert_runtime_skill(tmp_path: Path) -> None:
     provider = CommitteeProvider()
     with TestClient(
         create_app(
@@ -891,7 +1184,7 @@ def test_every_investment_assistant_turn_loads_bundled_stock_analysis_skill(tmp_
         )
 
     assert response.status_code == 200
-    assert provider.skill_flags == [True]
+    assert provider.skill_flags == [False, False]
 
 
 def test_committee_redirects_a_simple_question_without_model_calls(tmp_path: Path) -> None:
@@ -1068,7 +1361,7 @@ def test_committee_retries_one_transient_invalid_expert_response(tmp_path: Path)
             time.sleep(0.01)
 
     assert restored["active_run"]["status"] == "completed"
-    assert provider.attempts["duan_yongping"] == 2
+    assert provider.attempts["duan_yongping"] >= 2
     assert not any(
         event["event_type"] == "expert.failed" and event["actor_id"] == "duan_yongping"
         for event in restored["events"]
@@ -1078,11 +1371,11 @@ def test_committee_retries_one_transient_invalid_expert_response(tmp_path: Path)
             connection.execute(
                 "SELECT attempt FROM research_tasks WHERE assigned_role = 'duan_yongping'"
             ).fetchone()[0]
-            == 2
+            >= 2
         )
 
 
-def test_normal_assistant_can_use_runtime_market_skill_for_deep_research(tmp_path: Path) -> None:
+def test_normal_assistant_deep_research_uses_app_owned_packet_context(tmp_path: Path) -> None:
     provider = CommitteeProvider()
     with TestClient(
         create_app(
@@ -1109,8 +1402,8 @@ def test_normal_assistant_can_use_runtime_market_skill_for_deep_research(tmp_pat
             },
         )
 
-    assert provider.roles_seen == ["buffett"]
-    assert provider.skill_flags == [True]
+    assert provider.roles_seen == ["buffett", "buffett"]
+    assert provider.skill_flags == [False, False]
 
 
 class PartialSkillLayer(CommitteeSkillLayer):
@@ -1121,14 +1414,15 @@ class PartialSkillLayer(CommitteeSkillLayer):
         return result
 
 
-def test_normal_assistant_loads_stock_analysis_when_evidence_pass_still_has_gaps(tmp_path: Path) -> None:
+def test_normal_assistant_routes_remaining_gaps_through_coordinator(tmp_path: Path) -> None:
     provider = CommitteeProvider()
+    skill_layer = PartialSkillLayer()
     with TestClient(
         create_app(
             tmp_path,
             automatic_updates=False,
             ai_provider=provider,
-            research_skill_layer=PartialSkillLayer(),
+            research_skill_layer=skill_layer,
         )
     ) as client:
         thread = client.post(
@@ -1148,10 +1442,14 @@ def test_normal_assistant_loads_stock_analysis_when_evidence_pass_still_has_gaps
             },
         )
 
-    assert provider.skill_flags == [True]
+    # The coordinator closes a duplicate supplemental result deterministically;
+    # only materially new evidence requires another reasoning call.
+    assert provider.skill_flags == [False]
+    assert len(skill_layer.calls) == 2
+    assert skill_layer.calls[-1][0] == "general"
 
 
-def test_research_context_is_lossless_and_declares_vault_ledger_as_only_holding_authority(
+def test_external_store_is_lossless_and_packets_preserve_all_projected_evidence_ids(
     tmp_path: Path,
 ) -> None:
     with Vault(tmp_path / "vault.sqlite3") as vault:
@@ -1160,7 +1458,7 @@ def test_research_context_is_lossless_and_declares_vault_ledger_as_only_holding_
         ])
         service = ResearchChatStore(vault, FakeAIProvider())
         marker = "末尾证据-不得截断"
-        context = service._context(
+        store = service._evidence_store(
             "MARKET:GLOBAL:OVERVIEW",
             [{
                 "skill_id": "portfolio-risk-evidence",
@@ -1178,10 +1476,134 @@ def test_research_context_is_lossless_and_declares_vault_ledger_as_only_holding_
             }],
         )
 
-        assert marker in context
-        assert len(context) > 70_000
-        assert '"allowed_security_ids": ["CN:SSE:600519:STOCK"]' in context
-        assert '"external_profiles_forbidden": true' in context
+        raw = next(record for record in store.records if record.evidence_id == "EVIDENCE-SKILL-long")
+        manifest = EvidenceManifest.from_store(store)
+        plan = RoleEvidencePlanner().plan(
+            role_id="general",
+            question="组合风险",
+            manifest=manifest,
+        )
+        packets = PacketEngine().build(
+            role_id="general",
+            objective="组合风险",
+            records=[store.get(evidence_id) for evidence_id in plan.evidence_ids],
+        )
+        packet_ids = [evidence_id for packet in packets for evidence_id in packet.evidence_ids]
+        holdings = next(record for record in store.records if record.subtype == "holdings_authority")
+
+        assert marker in json.dumps(raw.value, ensure_ascii=False)
+        assert len(json.dumps(raw.value, ensure_ascii=False)) > 70_000
+        assert sorted(packet_ids) == sorted(plan.evidence_ids)
+        assert len(packet_ids) == len(set(packet_ids))
+        assert holdings.value["allowed_security_ids"] == ["CN:SSE:600519:STOCK"]
+        assert holdings.value["external_profiles_forbidden"] is True
+
+
+def test_role_packets_do_not_refill_budget_with_evidence_outside_original_role_plan(
+    tmp_path: Path,
+) -> None:
+    def record(evidence_id: str, token_estimate: int, observed_at: str) -> EvidenceRecord:
+        return EvidenceRecord.create(
+            evidence_id=evidence_id,
+            security_id="MARKET:GLOBAL:OVERVIEW",
+            domain="market-context-evidence",
+            subtype="fixture",
+            entity_id="MARKET:GLOBAL:OVERVIEW",
+            as_of="2026-07-22",
+            observed_at=observed_at,
+            source_tier="verified_original",
+            provider="fixture",
+            source_ref="fixture://market",
+            quality_status="available",
+            value={"fact": evidence_id},
+            compact_text=f"[{evidence_id}] 市场事实",
+            token_estimate=token_estimate,
+        )
+
+    with Vault(tmp_path / "vault.sqlite3") as vault:
+        service = ResearchChatStore(vault, FakeAIProvider())
+        thread = service.create(
+            security_id="MARKET:GLOBAL:OVERVIEW",
+            role_id="general",
+            title="角色证据计划回归",
+            mode="committee",
+        )
+        run_id = "RUN-ROLE-PLAN"
+        vault.connection.execute(
+            "INSERT INTO research_runs VALUES (?, ?, 'test', 'running', 'evidence', '{}', NULL, ?, NULL, NULL)",
+            (run_id, thread["thread_id"], "2026-07-22T00:00:00+00:00"),
+        )
+        store = EvidenceStore().ingest(
+            [
+                record("EVIDENCE-OUTSIDE-PLAN", 90_000, "2026-07-22T10:00:00+00:00"),
+                record("EVIDENCE-ALLOWED", 100, "2026-07-21T10:00:00+00:00"),
+            ]
+        )
+
+        packets = service._role_packets(
+            run_id=run_id,
+            role_id="dalio",
+            question="盘后市场复盘",
+            store=store,
+            allowed_evidence_ids={"EVIDENCE-ALLOWED"},
+        )
+
+        assert [evidence_id for packet in packets for evidence_id in packet.evidence_ids] == [
+            "EVIDENCE-ALLOWED"
+        ]
+
+
+def test_evidence_persistence_reuses_canonical_id_for_cross_run_duplicate_content(
+    tmp_path: Path,
+) -> None:
+    with Vault(tmp_path / "vault.sqlite3") as vault:
+        service = ResearchChatStore(vault, FakeAIProvider())
+        thread = service.create(
+            security_id="MARKET:GLOBAL:OVERVIEW",
+            role_id="general",
+            title="跨运行证据去重",
+            mode="committee",
+        )
+        for run_id in ("RUN-FIRST", "RUN-SECOND"):
+            vault.connection.execute(
+                "INSERT INTO research_runs VALUES (?, ?, 'test', 'running', 'evidence', '{}', NULL, ?, NULL, NULL)",
+                (run_id, thread["thread_id"], "2026-07-22T00:00:00+00:00"),
+            )
+
+        original = EvidenceRecord.create(
+            evidence_id="EVIDENCE-ORIGINAL",
+            security_id="MARKET:GLOBAL:OVERVIEW",
+            domain="market-context-evidence",
+            subtype="fixture",
+            entity_id="MARKET:GLOBAL:OVERVIEW",
+            as_of="2026-07-22",
+            observed_at="2026-07-22T10:00:00+00:00",
+            source_tier="verified_original",
+            provider="fixture",
+            source_ref="fixture://market",
+            quality_status="available",
+            value={"index": 1},
+            compact_text="原始市场事实",
+        )
+        duplicate = replace(
+            original,
+            evidence_id="EVIDENCE-NEW-RUN-ID",
+            observed_at="2026-07-22T11:00:00+00:00",
+            compact_text="同一市场事实的刷新投影",
+        )
+
+        first = service._persist_evidence_store("RUN-FIRST", EvidenceStore((original,)))
+        second = service._persist_evidence_store("RUN-SECOND", EvidenceStore((duplicate,)))
+
+        assert first.records[0].evidence_id == "EVIDENCE-ORIGINAL"
+        assert second.records[0].evidence_id == "EVIDENCE-ORIGINAL"
+        assert vault.connection.execute(
+            "SELECT COUNT(*) FROM research_evidence_records WHERE content_hash = ?",
+            (original.content_hash,),
+        ).fetchone()[0] == 1
+        assert vault.connection.execute(
+            "SELECT evidence_id FROM research_evidence_links WHERE run_id = 'RUN-SECOND'"
+        ).fetchone()[0] == "EVIDENCE-ORIGINAL"
 
 
 def test_research_service_rejects_holding_claims_for_symbols_outside_local_ledger(
@@ -1194,6 +1616,16 @@ def test_research_service_rejects_holding_claims_for_symbols_outside_local_ledge
         service = ResearchChatStore(vault, FakeAIProvider())
         with pytest.raises(AIUnavailableError, match="TSLA"):
             service._assert_ledger_holding_claims({"content": "用户持仓 TSLA 需要继续观察。"})
+
+
+def test_research_service_does_not_treat_product_name_as_an_unauthorized_symbol(
+    tmp_path: Path,
+) -> None:
+    with Vault(tmp_path / "vault.sqlite3") as vault:
+        service = ResearchChatStore(vault, FakeAIProvider())
+        service._assert_ledger_holding_claims(
+            {"content": "Invest Vault 本地持仓账本是本轮唯一持仓权威。"}
+        )
 
 
 def test_user_can_stop_an_active_assistant_generation(tmp_path: Path) -> None:

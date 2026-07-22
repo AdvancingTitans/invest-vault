@@ -7,10 +7,70 @@ from invest_vault.ai_skills import (
     FRAMEWORK_SKILLS,
     AppResearchSkillLayer,
     _compact_upstream_pack,
+    _daily_high_low_spread_bps,
     build_historical_valuation_series,
     build_peer_basket_history,
 )
 from invest_vault.ledger import HoldingRecord, Vault
+
+
+def test_upstream_pack_dates_are_normalized_at_the_vault_boundary(tmp_path: Path, monkeypatch) -> None:
+    seen: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "invest_vault.ai_skills.build_company_evidence",
+        lambda symbol, cutoff: seen.append((symbol, cutoff)) or {},
+    )
+    monkeypatch.setattr(
+        "invest_vault.ai_skills.build_fund_evidence",
+        lambda symbol, cutoff: seen.append((symbol, cutoff)) or {},
+    )
+    with Vault(tmp_path / "vault.sqlite3") as vault:
+        layer = AppResearchSkillLayer(vault)
+        layer._company_pack("00700.HK", "2026-07-22")
+        layer._fund_pack("519771", "2026-07-22")
+
+    assert seen == [("00700.HK", "20260722"), ("519771", "20260722")]
+
+
+def test_daily_high_low_spread_proxy_requires_history_and_is_finite() -> None:
+    rows = [
+        {"high": 100 + index * 0.2, "low": 99 + index * 0.2}
+        for index in range(30)
+    ]
+
+    assert _daily_high_low_spread_bps(rows[:19]) is None
+    assert (_daily_high_low_spread_bps(rows) or 0) > 0
+
+
+def test_graham_readiness_does_not_require_liquidation_for_a_going_concern(
+    tmp_path: Path,
+) -> None:
+    results = [
+        {
+            "skill_id": "company-financial-quality",
+            "status": "completed",
+            "evidence": [{"value": {"periods": [{"revenue": 1}]}}],
+        },
+        {
+            "skill_id": "security-valuation-evidence",
+            "status": "completed",
+            "evidence": [{"value": {"pe": 20}}],
+        },
+        {
+            "skill_id": "market-context-evidence",
+            "status": "completed",
+            "evidence": [{"value": {"price": 10}}],
+        },
+    ]
+    with Vault(tmp_path / "vault.sqlite3") as vault:
+        readiness = AppResearchSkillLayer(vault)._framework_readiness(
+            security_id="CN:SSE:600519:STOCK",
+            role_id="graham",
+            results=results,
+        )
+
+    assert "权威清算价值与下行保护原文" not in readiness["gaps"]
+    assert all("权威清算价值" not in gap for gap in readiness["gaps"])
 
 
 def test_fund_skill_builds_industry_concentration_and_disclosed_rebalance(
@@ -95,6 +155,32 @@ def test_company_financial_skill_builds_single_quarters_and_year_cashflow_bridge
     assert value["cashflow_year_bridge"]["changes"]["operating_cash_flow"] == -30
     assert value["working_capital_bridge"]["estimated_cash_effect"] == -4
     assert "不足以单独证明" in value["cashflow_year_bridge"]["interpretation_boundary"]
+
+
+def test_financial_result_uses_latest_material_period_instead_of_eps_only_row(tmp_path: Path) -> None:
+    payload = {
+        "name": "腾讯控股",
+        "symbol": "0700.HK",
+        "periods": [
+            {"report_date": "2026-03-31", "basic_eps": 6.302},
+            {
+                "report_date": "2025-12-31",
+                "period_label": "2025FY",
+                "revenue": 751,
+                "parent_net_profit": 224,
+                "roe": 20,
+                "gross_margin": 56,
+                "debt_asset_ratio": 39,
+                "operating_cash_flow": 303,
+                "free_cash_flow_lite": 190,
+            },
+        ],
+    }
+    gaps: list[str] = []
+    with Vault(tmp_path / "vault.sqlite3") as vault:
+        AppResearchSkillLayer(vault)._financial_result([payload], gaps, "2026-07-22")
+
+    assert gaps == []
 
 
 def test_portfolio_skill_reports_cost_weights_and_only_valid_correlations(tmp_path: Path, monkeypatch) -> None:
@@ -558,7 +644,7 @@ def test_stock_review_automatically_collects_forecast_peer_and_qualitative_sourc
         "coverage": {"institutions": 1}, "source": "东方财富F10盈利预测", "source_ref": "https://example.test/forecast",
     })
     monkeypatch.setattr("invest_vault.ai_skills.fetch_peer_valuations", lambda *_: {
-        "status": "provisional_requires_user_confirmation", "rows": [{"symbol": "600000", "pe_ttm": 18, "pb": 1.8}],
+        "status": "system_assessed", "rows": [{"symbol": "600000", "pe_ttm": 18, "pb": 1.8}],
         "source": "东方财富行业成分", "source_ref": "https://example.test/peers",
     })
     monkeypatch.setattr("invest_vault.ai_skills.fetch_company_supplemental_evidence", lambda *_, **__: {
@@ -578,7 +664,7 @@ def test_stock_review_automatically_collects_forecast_peer_and_qualitative_sourc
     valuation = by_id["security-valuation-evidence"]["evidence"][0]["value"]
     assert valuation["historical_series"][0]["pe_annualized"] == 10.0
     assert valuation["consensus_forecast"]["coverage"]["institutions"] == 1
-    assert valuation["peer_valuations"]["status"] == "provisional_requires_user_confirmation"
+    assert valuation["peer_valuations"]["status"] == "system_assessed"
     assert by_id["supplemental-company-evidence"]["status"] == "completed"
 
 

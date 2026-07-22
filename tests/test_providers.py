@@ -1,3 +1,4 @@
+import gzip
 import json
 import re
 import urllib.parse
@@ -7,6 +8,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from invest_vault.providers import (
+    _request,
     fetch_a_share_earnings_calendar,
     fetch_a_share_hot_themes,
     fetch_a_share_index_overview,
@@ -15,11 +17,13 @@ from invest_vault.providers import (
     fetch_cross_market_index_overview,
     fetch_financial_snapshot,
     fetch_fund_nav_close,
+    fetch_fund_redemption_fee_schedule,
     fetch_global_earnings_calendar,
     fetch_global_index_overview,
     fetch_global_index_price_volume,
     fetch_global_market_movers,
     fetch_global_theme_performance,
+    fetch_hk_valuation_financial_history,
     fetch_industry_money_flow,
     fetch_market_news,
     fetch_market_pulse,
@@ -41,6 +45,102 @@ from invest_vault.providers import (
     previous_trade_date,
     target_trade_date,
 )
+
+
+def test_request_decompresses_gzip_body_without_content_encoding(monkeypatch) -> None:
+    body = json.dumps({"zygcfx": []}).encode()
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self) -> bytes:
+            return gzip.compress(body)
+
+    class Opener:
+        def open(self, _request, timeout):
+            assert timeout == 6
+            return Response()
+
+    monkeypatch.setattr("invest_vault.providers.urllib.request.build_opener", lambda *_: Opener())
+
+    assert _request("https://emweb.securities.eastmoney.com/example") == body
+
+
+def test_open_ended_fund_redemption_schedule_is_parsed_by_holding_period() -> None:
+    document = b"""
+    <h4><label>\xe8\xb5\x8e\xe5\x9b\x9e\xe8\xb4\xb9\xe7\x8e\x87</label></h4>
+    <table><tbody><tr><td>\xe5\xb0\x8f\xe4\xba\x8e7\xe5\xa4\xa9</td><td>1.50%</td></tr>
+    <tr><td>\xe5\xa4\xa7\xe4\xba\x8e\xe7\xad\x89\xe4\xba\x8e30\xe5\xa4\xa9</td><td>0.00%</td></tr></tbody></table>
+    """
+
+    result = fetch_fund_redemption_fee_schedule("519771", request=lambda _: document)
+
+    assert result["rows"] == [
+        {"holding_period": "小于7天", "redemption_fee_percent": 1.5},
+        {"holding_period": "大于等于30天", "redemption_fee_percent": 0.0},
+    ]
+
+
+def test_hk_supplemental_company_evidence_uses_public_business_and_board_profile() -> None:
+    profile = """
+    <table><tr><td>主要業務</td><td>網絡遊戲、廣告及金融科技服務。</td></tr>
+    <tr><td>主席名稱</td><td>馬化騰（主席兼行政總裁）</td></tr>
+    <tr><td>董事會成員名單</td><td>執行董事：馬化騰</td></tr></table>
+    """.encode()
+
+    result = fetch_company_supplemental_evidence(
+        "00700", name="腾讯控股", request=lambda _: profile
+    )
+
+    assert [len(section["items"]) for section in result["official_sections"]] == [1, 2]
+    assert result["source"].startswith("经济通港股公司背景")
+
+
+def test_hk_forecast_peer_and_history_are_parsed_without_user_confirmation() -> None:
+    forecast_html = """
+    <div>綜合盈利預測</div><table><tr><td>財政年度</td><td>純利</td><td>每股盈利</td><td>股息</td><td>資產</td><td>最高</td><td>最低</td></tr>
+    <tr><td>2026</td><td>237,683.5</td><td>2,626.5</td><td>509.9</td><td>--</td><td>286,900</td><td>221,466</td></tr></table>
+    <div>盈利預測概覽</div><table><tr><td>財年</td><td>純利</td><td>EPS</td><td>DPS</td><td>券商</td><td>評級</td><td>目標</td><td>日期</td></tr>
+    <tr><td>2026</td><td>238,944</td><td>2,648</td><td>530</td><td>法巴</td><td>買入</td><td>825</td><td>28/01/2026</td></tr></table>
+    """
+    profile_html = """
+    <a href="../industry_detail.php?nature=SNS&amp;subtype=all">軟件服務 (Software)</a>
+    <td>主要業務</td><td>網絡遊戲、廣告及金融科技服務。</td>
+    """
+    industry_html = """
+    代號<table><tr><td>00700</td><td>騰訊</td><td></td><td>440</td><td>-1%</td><td>10億</td><td>40,000億</td><td>HKD</td><td>1.2</td><td>15</td></tr>
+    <tr><td>09999</td><td>網易</td><td></td><td>190</td><td>-1%</td><td>2億</td><td>6,000億</td><td>HKD</td><td>2.4</td><td>16</td></tr></table>P/E Range為
+    """
+    history_html = """
+    <div>市場價值指標</div><table><tr><td></td><td>2025/12</td><td>與去年比較</td><td>2024/12</td></tr>
+    <tr><td>每股盈利 (仙)</td><td>2,474.9</td><td>18.2%</td><td>2,093.8</td></tr>
+    <tr><td>每股帳面資產淨值 ($)</td><td>126.548</td><td>--</td><td>105.535</td></tr></table>
+    """
+
+    def request(url: str) -> bytes:
+        if "quote_profit" in url:
+            return forecast_html.encode()
+        if "quote_ci_brief" in url:
+            return profile_html.encode()
+        if "industry_detail" in url:
+            return industry_html.encode()
+        return history_html.encode()
+
+    forecast = fetch_profit_forecast("00700", request=request)
+    peers = fetch_peer_valuations("00700", request=request)
+    history = fetch_hk_valuation_financial_history("00700", request=request)
+
+    assert forecast["consensus"][0]["eps_cny"] == 26.265
+    assert forecast["coverage"]["institutions"] == 1
+    assert peers["status"] == "system_assessed"
+    assert peers["rows"][0]["symbol"] == "09999"
+    assert "无需用户确认" in peers["comparison_boundary"]
+    assert [row["basic_eps"] for row in history["periods"]] == [24.749, 20.938]
+    assert [row["bps"] for row in history["periods"]] == [126.548, 105.535]
 
 
 def test_market_report_stage_is_automatic_for_trade_day_and_holiday() -> None:

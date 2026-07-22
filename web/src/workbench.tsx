@@ -4023,7 +4023,7 @@ function ResearchAssistant({
               <div>
                 <span className="committee-empty-kicker">深度研究工作流</span>
                 <strong>从证据开始，而不是从结论开始</strong>
-                <p>协调员会拆解问题、核对本地证据、选择 6 位互补委员，最后保留共识、分歧与数据缺口。</p>
+                <p>协调员会拆解问题、核对公开与计算证据、选择 6 位互补委员，最后只发布证据支持的共识、分歧与条件结论。</p>
               </div>
               <ol aria-label="投研委员会研究步骤">
                 <li><b>01</b><span>制定计划与证据清单</span></li>
@@ -4045,12 +4045,12 @@ function ResearchAssistant({
               <div>
                 <span className="committee-empty-kicker">单专家研究</span>
                 <strong>让问题落到已归档证据上</strong>
-                <p>{role?.name ?? "通用模式"}会围绕当前标的组织事实、判断与缺口；每次提问独立分析，不自动沿用旧结论。</p>
+                <p>{role?.name ?? "通用模式"}会围绕当前标的组织公开事实、可审计计算与条件结论；本地笔记保持独立，不进入 AI 分析。</p>
               </div>
               <ol aria-label="投研大师证据范围">
                 <li><b>01</b><span>已归档行情</span></li>
                 <li><b>02</b><span>关联资料与财务</span></li>
-                <li><b>03</b><span>历史笔记与待验证项</span></li>
+                <li><b>03</b><span>公开资料与可复核条件</span></li>
               </ol>
               <div className="assistant-question-list" aria-label="投资问题示例">
                 {[
@@ -5325,7 +5325,7 @@ export function App() {
         </nav>
         <div className="side-foot">
           <span className="local-dot">● 本地优先 · 数据私有</span>
-        <span>v0.3.34</span>
+        <span>v0.3.54</span>
         </div>
       </aside>
       <main id="content">

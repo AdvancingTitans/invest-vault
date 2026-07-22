@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "invest-vault"
-version = "0.3.34"
+version = "0.3.54"
 description = "Local-first investment research ledger."
 license = { file = "LICENSE" }
 requires-python = ">=3.9"

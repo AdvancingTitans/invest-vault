@@ -15,10 +15,10 @@ codesign --force --deep --sign - \
 package_stage="$(mktemp -d)"
 cp -R "src-tauri/target/release/bundle/macos/投资札记.app" "$package_stage/投资札记.app"
 ln -s /Applications "$package_stage/Applications"
-hdiutil create -volname "投资札记 0.3.34" \
+hdiutil create -volname "投资札记 0.3.54" \
   -srcfolder "$package_stage" \
   -ov -format UDZO \
-  "src-tauri/target/release/bundle/dmg/Invest-Vault_0.3.34-local-aarch64.dmg"
+  "src-tauri/target/release/bundle/dmg/Invest-Vault_0.3.54-local-aarch64.dmg"
 ```
 
 The `hdiutil` step intentionally avoids Finder/AppleScript automation while retaining a visible Applications destination. It is suitable for an unsigned local build. Public distribution still requires Apple signing and notarization.

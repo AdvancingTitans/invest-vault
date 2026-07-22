@@ -1,3 +1,4 @@
+import sqlite3
 from datetime import datetime
 from pathlib import Path
 
@@ -159,3 +160,149 @@ def test_permanent_delete_migration_purges_legacy_holding_tombstones(tmp_path: P
     with Vault(database) as migrated:
         assert migrated.connection.execute("SELECT COUNT(*) FROM holding_records").fetchone()[0] == 0
         assert migrated.connection.execute("SELECT 1 FROM schema_migrations WHERE version = 11").fetchone()
+
+
+def test_research_performance_v16_preserves_v15_metrics_and_adds_summary(tmp_path: Path) -> None:
+    database = tmp_path / "vault.sqlite3"
+    now = "2026-07-22T10:00:00+00:00"
+    run_id = "run-v15"
+    with Vault(database) as vault:
+        vault.connection.execute(
+            """INSERT INTO research_threads
+            (thread_id, thread_type, title, security_id, portfolio_id, provider_type,
+             provider_thread_ref, role_id, status, created_at, updated_at)
+            VALUES ('thread-v15', 'committee', 'v15 migration', NULL, NULL, 'fixture',
+                    NULL, 'general', 'completed', ?, ?)""",
+            (now, now),
+        )
+        vault.connection.execute(
+            """INSERT INTO research_runs
+            (run_id, thread_id, workflow_version, status, current_stage, user_request_json,
+             plan_json, started_at, completed_at, failure_json)
+            VALUES (?, 'thread-v15', 'v15', 'completed', 'completed', '{}', NULL, ?, ?, NULL)""",
+            (run_id, now, now),
+        )
+        vault.connection.commit()
+
+    with sqlite3.connect(database) as connection:
+        connection.execute("DELETE FROM schema_migrations WHERE version = 16")
+        connection.execute("DROP TABLE research_performance_summaries")
+        connection.execute(
+            "ALTER TABLE research_call_metrics RENAME TO research_call_metrics_v16"
+        )
+        connection.executescript(
+            """
+            CREATE TABLE research_call_metrics (
+                metric_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                task_id TEXT,
+                stage TEXT NOT NULL,
+                role_id TEXT,
+                section_key TEXT,
+                provider_type TEXT NOT NULL,
+                model TEXT NOT NULL,
+                input_tokens INTEGER,
+                system_tokens INTEGER,
+                evidence_tokens INTEGER,
+                schema_tokens INTEGER,
+                output_tokens INTEGER,
+                reasoning_tokens INTEGER,
+                estimated_input_tokens INTEGER,
+                evidence_count INTEGER,
+                domain_tokens_json TEXT NOT NULL DEFAULT '{}',
+                latency_ms INTEGER,
+                timed_out INTEGER NOT NULL DEFAULT 0,
+                skill_invoked INTEGER NOT NULL DEFAULT 0,
+                cited_evidence_count INTEGER,
+                available_evidence_count INTEGER,
+                framework_coverage_json TEXT,
+                covered_expert_count INTEGER,
+                error_json TEXT,
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (run_id) REFERENCES research_runs(run_id) ON DELETE CASCADE,
+                FOREIGN KEY (task_id) REFERENCES research_tasks(task_id) ON DELETE SET NULL
+            );
+            DROP TABLE research_call_metrics_v16;
+            CREATE INDEX research_call_metrics_run_stage
+            ON research_call_metrics(run_id, stage, created_at);
+            """
+        )
+        connection.execute(
+            """INSERT INTO research_call_metrics
+            (metric_id, run_id, stage, role_id, provider_type, model,
+             estimated_input_tokens, evidence_count, domain_tokens_json, latency_ms,
+             timed_out, skill_invoked, cited_evidence_count, available_evidence_count,
+             started_at, completed_at)
+            VALUES ('metric-v15', ?, 'expert_packet', 'buffett', 'fixture', 'fixture-model',
+                    1234, 4, '{"company-financial-quality": 900}', 2500, 0, 0, 2, 4, ?, ?)""",
+            (run_id, now, now),
+        )
+        connection.commit()
+
+    with Vault(database) as migrated:
+        assert migrated.connection.execute(
+            "SELECT 1 FROM schema_migrations WHERE version = 16"
+        ).fetchone()
+        metric_columns = {
+            str(row["name"])
+            for row in migrated.connection.execute("PRAGMA table_info(research_call_metrics)")
+        }
+        assert {
+            "node_id",
+            "token_budget",
+            "retry_count",
+            "usage_source",
+            "estimated_system_tokens",
+            "estimated_context_tokens",
+            "estimated_output_tokens",
+        } <= metric_columns
+        metric = migrated.connection.execute(
+            """SELECT stage, role_id, estimated_input_tokens, retry_count, usage_source,
+                      node_id, token_budget FROM research_call_metrics
+               WHERE metric_id = 'metric-v15'"""
+        ).fetchone()
+        assert tuple(metric) == (
+            "expert_packet",
+            "buffett",
+            1234,
+            0,
+            "estimated",
+            None,
+            None,
+        )
+        assert migrated.connection.execute(
+            "SELECT status FROM research_runs WHERE run_id = ?", (run_id,)
+        ).fetchone()["status"] == "completed"
+
+        migrated.connection.execute(
+            """INSERT INTO research_performance_summaries
+            (run_id, evidence_count, domain_distribution_json, unused_evidence_count,
+             cited_evidence_count, citation_rate, packet_count, semantic_revision_count,
+             duration_ms, retry_count, section_count, section_llm_call_count,
+             final_context_tokens, completion_status, failure_stage, failure_agent,
+             failure_node_id, failure_provider, failure_token_estimate,
+             failure_token_budget, failure_json, updated_at)
+            VALUES (?, 7, '{"financial": 4}', 1, 6, 0.95, 18, 8, 600000, 1, 8, 0,
+                    22802, 'completed', 'final_edit', 'report_editor', 'final-edit',
+                    'fixture', 30001, 30000, '{"message": "token budget"}', ?)""",
+            (run_id, now),
+        )
+        migrated.connection.commit()
+        summary = migrated.connection.execute(
+            """SELECT evidence_count, packet_count, semantic_revision_count,
+                      section_llm_call_count, final_context_tokens, failure_node_id,
+                      failure_token_estimate, failure_token_budget
+               FROM research_performance_summaries WHERE run_id = ?""",
+            (run_id,),
+        ).fetchone()
+        assert tuple(summary) == (7, 18, 8, 0, 22802, "final-edit", 30001, 30000)
+
+    with Vault(database) as reopened:
+        assert reopened.connection.execute(
+            "SELECT COUNT(*) FROM research_call_metrics WHERE metric_id = 'metric-v15'"
+        ).fetchone()[0] == 1
+        assert reopened.connection.execute(
+            "SELECT COUNT(*) FROM research_performance_summaries WHERE run_id = ?", (run_id,)
+        ).fetchone()[0] == 1

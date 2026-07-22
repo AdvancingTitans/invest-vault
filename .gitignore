@@ -16,3 +16,4 @@ __pycache__/
 /web/*.tsbuildinfo
 /web/vite.config.js
 /web/vite.config.d.ts
+/web/.ux-redesign-draft/

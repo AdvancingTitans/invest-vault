@@ -1,0 +1,16 @@
+{
+  "source": "phase64-controlled-quality-baseline",
+  "expert_count": 6,
+  "necessary_evidence_ids": [
+    "EVIDENCE-FINANCIAL-PIPELINE",
+    "EVIDENCE-MARKET-PIPELINE",
+    "EVIDENCE-PORTFOLIO-PIPELINE"
+  ],
+  "evidence_recall": 1.0,
+  "mandatory_framework_coverage": 1.0,
+  "citation_validity": 0.95,
+  "contradiction_preservation": 1.0,
+  "packet_count": 39,
+  "semantic_revision_count": 45,
+  "section_llm_call_count": 8
+}

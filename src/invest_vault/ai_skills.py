@@ -12,6 +12,7 @@ from typing import Protocol
 from uuid import uuid4
 
 from stock_analysis.company_evidence import build_company_evidence
+from stock_analysis.execution_costs import build_execution_cost_model
 from stock_analysis.fund_research import build_fund_evidence
 
 from .ledger import Vault
@@ -20,8 +21,11 @@ from .providers import (
     fetch_cny_exchange_rate,
     fetch_company_supplemental_evidence,
     fetch_financial_snapshot,
+    fetch_fund_redemption_fee_schedule,
     fetch_fund_snapshot,
     fetch_global_index_price_volume,
+    fetch_hk_financial_snapshot,
+    fetch_hk_valuation_financial_history,
     fetch_index_overview,
     fetch_peer_valuations,
     fetch_profit_forecast,
@@ -43,6 +47,55 @@ MARKET_OVERVIEW_SECURITY_IDS = {
 }
 # Compatibility alias for existing imports and archived notes.
 MARKET_OVERVIEW_SECURITY_ID = GLOBAL_MARKET_OVERVIEW_SECURITY_ID
+
+
+def _daily_high_low_spread_bps(rows: list[dict[str, object]]) -> float | None:
+    """Estimate a labelled spread proxy when a market has no public live depth feed."""
+
+    clean = [
+        (float(row["high"]), float(row["low"]))
+        for row in rows[-61:]
+        if isinstance(row.get("high"), (int, float))
+        and isinstance(row.get("low"), (int, float))
+        and float(row["low"]) > 0
+        and float(row["high"]) >= float(row["low"])
+    ]
+    if len(clean) < 20:
+        return None
+    denominator = 3 - 2 * math.sqrt(2)
+    estimates: list[float] = []
+    for previous, current in zip(clean, clean[1:]):
+        beta = math.log(previous[0] / previous[1]) ** 2 + math.log(current[0] / current[1]) ** 2
+        gamma = math.log(max(previous[0], current[0]) / min(previous[1], current[1])) ** 2
+        alpha = max(
+            0.0,
+            (math.sqrt(2 * beta) - math.sqrt(beta)) / denominator
+            - math.sqrt(gamma / denominator),
+        )
+        estimate = 2 * (math.exp(alpha) - 1) / (1 + math.exp(alpha)) * 10_000
+        if estimate > 0 and math.isfinite(estimate):
+            estimates.append(estimate)
+    estimates.sort()
+    return round(estimates[len(estimates) // 2], 4) if estimates else None
+
+
+def _execution_price_volume(history: dict[str, object], *, market: str) -> dict[str, object]:
+    """Shape public daily history into explicit turnover and volatility model inputs."""
+
+    rows = list(history.get("rows") or [])
+    metrics = summarize_price_volume_history(rows)
+    closes = [float(row["close"]) for row in rows[-61:] if isinstance(row.get("close"), (int, float))]
+    returns = [math.log(current / previous) for previous, current in zip(closes, closes[1:]) if previous > 0]
+    if len(returns) >= 20:
+        mean = sum(returns) / len(returns)
+        variance = sum((value - mean) ** 2 for value in returns) / (len(returns) - 1)
+        metrics["annualized_volatility_60d_pct"] = math.sqrt(variance * 252) * 100
+    amounts = [float(row["amount"]) for row in rows[-20:] if isinstance(row.get("amount"), (int, float))]
+    liquidity = {}
+    if amounts:
+        key = "average_turnover_20d_local" if market == "hk" else "average_turnover_20d_cny"
+        liquidity[key] = sum(amounts) / len(amounts)
+    return {**history, "metrics": metrics, "liquidity": liquidity}
 
 
 class ResearchSkillLayer(Protocol):
@@ -206,7 +259,7 @@ FRAMEWORK_REQUIREMENTS: dict[str, tuple[tuple[str, str | None, str], ...]] = {
         ("资产负债表与盈利稳定性", "company-financial-quality", "available"),
         ("历史估值分位与保守价值情景", "security-valuation-evidence", "conditional"),
         ("市场基准与历史波动", "market-context-evidence", "available"),
-        ("权威清算价值与下行保护原文", None, "conditional"),
+        ("资产覆盖、盈利韧性与清算情景适用性", "company-financial-quality", "conditional"),
     ),
     "klarman": (
         ("财务质量与资产风险", "company-financial-quality", "available"),
@@ -749,15 +802,21 @@ class AppResearchSkillLayer:
         return [dict(item) for item in SKILL_CATALOG]
 
     def _company_pack(self, symbol: str, as_of: str) -> dict[str, object]:
-        key = (symbol, as_of)
+        normalized_as_of = "".join(character for character in as_of if character.isdigit())[:8]
+        if len(normalized_as_of) != 8:
+            raise ValueError("公司证据截止日期格式无效")
+        key = (symbol, normalized_as_of)
         if key not in self._upstream_company_packs:
-            self._upstream_company_packs[key] = build_company_evidence(symbol, as_of)
+            self._upstream_company_packs[key] = build_company_evidence(symbol, normalized_as_of)
         return self._upstream_company_packs[key]
 
     def _fund_pack(self, symbol: str, as_of: str) -> dict[str, object]:
-        key = (symbol, as_of)
+        normalized_as_of = "".join(character for character in as_of if character.isdigit())[:8]
+        if len(normalized_as_of) != 8:
+            raise ValueError("基金证据截止日期格式无效")
+        key = (symbol, normalized_as_of)
         if key not in self._upstream_fund_packs:
-            self._upstream_fund_packs[key] = build_fund_evidence(symbol, as_of)
+            self._upstream_fund_packs[key] = build_fund_evidence(symbol, normalized_as_of)
         return self._upstream_fund_packs[key]
 
     def _cny_rate(self, currency: str, as_of: str) -> dict[str, object]:
@@ -937,6 +996,9 @@ class AppResearchSkillLayer:
         gaps: list[str] = []
         current_order_books: list[dict[str, object]] = []
         execution_models: list[dict[str, object]] = []
+        order_book_boundaries: list[dict[str, str]] = []
+        fund_disclosures: list[dict[str, object]] = []
+        security_trend_metrics: list[dict[str, object]] = []
 
         if security_id in MARKET_OVERVIEW_SECURITY_IDS:
             security_ids = [
@@ -950,30 +1012,143 @@ class AppResearchSkillLayer:
 
         for held_security_id in security_ids:
             symbol = held_security_id.split(":")[2]
+            upstream_symbol = f"{symbol}.HK" if held_security_id.startswith("HK:") else symbol
+            execution_market = "hk" if held_security_id.startswith("HK:") else "a"
             try:
                 if held_security_id.endswith(":FUND"):
                     pack = self._fund_pack(symbol, target)
                 else:
-                    upstream_symbol = f"{symbol}.HK" if held_security_id.startswith("HK:") else symbol
                     pack = self._company_pack(upstream_symbol, target)
             except Exception as error:
                 gaps.append(f"{symbol}当前盘口与交易成本代理暂不可得：{error}")
                 continue
             microstructure = pack.get("microstructure")
             execution = pack.get("execution_cost_model")
+            price_volume = pack.get("price_volume") or {}
+            price_rows = list(price_volume.get("rows") or [])
+            if (
+                not held_security_id.endswith(":FUND")
+                and (len(price_rows) < 60 or not any(row.get("amount") for row in price_rows))
+            ):
+                try:
+                    price_volume = _execution_price_volume(
+                        fetch_security_trading_history(held_security_id, limit=260),
+                        market=execution_market,
+                    )
+                except Exception as error:
+                    gaps.append(f"{symbol}连续量价暂不可得：{error}")
+            if held_security_id.endswith(":FUND") and not price_volume.get("rows"):
+                disclosed_fund = self._ensure_fund(held_security_id)
+                profile_fees = ((pack.get("profile") or {}).get("fees") or {})
+                purchase_fee = profile_fees.get("front_end_rate_pct")
+                try:
+                    redemption_schedule = fetch_fund_redemption_fee_schedule(symbol)
+                except Exception as error:
+                    redemption_schedule = {"rows": [], "error": str(error)}
+                microstructure = {
+                    "available": False,
+                    "applicable": False,
+                    "symbol": symbol,
+                    "reason": "为开放式基金，按净值申赎，不适用五档盘口",
+                }
+                execution = {
+                    "available": purchase_fee is not None or bool(redemption_schedule.get("rows")),
+                    "symbol": symbol,
+                    "instrument_type": "open_ended_fund",
+                    "market": "fund_nav_subscription_redemption",
+                    "currency": "CNY",
+                    "model_status": "partial_open_ended_fund_fee_schedule",
+                    "purchase_fee_pct": purchase_fee,
+                    "source_purchase_fee_pct": profile_fees.get("front_end_source_rate_pct"),
+                    "redemption_fee_status": "公开期限费率表已取得",
+                    "redemption_fee_schedule": redemption_schedule,
+                    "missing_inputs": [],
+                    "scenarios": [],
+                    "limitations": [
+                        "开放式基金按确认净值申赎，不使用场内价差、盘口深度或成交冲击模型。",
+                        "赎回成本须按公开期限费率、实际持有天数和先进先出规则匹配。",
+                    ],
+                }
+                fund_disclosures.append({
+                    "security_id": held_security_id,
+                    "name": disclosed_fund.get("name") or symbol,
+                    "latest_disclosed_holdings": list(disclosed_fund.get("holdings_periods") or [])[:2],
+                    "scale_history": list(disclosed_fund.get("scale_history") or []),
+                    "nav_history": list(disclosed_fund.get("nav_history") or [])[:20],
+                    "redemption_fee_schedule": redemption_schedule,
+                    "disclosure_boundary": "定期报告持仓不是实时完整仓位；公开规模变化同时受净值和申赎影响，不能冒充真实净申赎。",
+                })
+                try:
+                    fund_history = fetch_security_price_history(held_security_id, limit=260)
+                except Exception:
+                    pass
+                else:
+                    security_trend_metrics.append({
+                        "security_id": held_security_id,
+                        "name": disclosed_fund.get("name") or symbol,
+                        **summarize_price_volume_history(list(fund_history.get("rows") or [])),
+                    })
+            elif isinstance(execution, dict) and execution.get("available"):
+                execution = {
+                    **execution,
+                    "spread_input": "current_order_book",
+                }
+            elif isinstance(price_volume, dict):
+                spread_bps = _daily_high_low_spread_bps(list(price_volume.get("rows") or []))
+                if spread_bps is not None:
+                    execution = build_execution_cost_model(
+                        symbol=upstream_symbol,
+                        price_volume=price_volume,
+                        microstructure={"spread_bps": spread_bps},
+                        market=execution_market,
+                        currency="HKD" if execution_market == "hk" else "CNY",
+                    )
+                    execution = {
+                        **execution,
+                        "spread_input": "daily_high_low_estimate",
+                        "limitations": [
+                            "当前公开五档不可得，价差采用日线高低价估算，不代表实时可成交价差。",
+                            *list(execution.get("limitations") or []),
+                        ],
+                    }
             if isinstance(microstructure, dict) and microstructure.get("available"):
                 current_order_books.append({"security_id": held_security_id, **microstructure})
+            elif isinstance(microstructure, dict) and microstructure.get("applicable") is False:
+                order_book_boundaries.append({
+                    "security_id": held_security_id,
+                    "boundary": str(microstructure.get("reason") or "该品种不适用五档盘口"),
+                })
             else:
                 reason = microstructure.get("reason") if isinstance(microstructure, dict) else None
-                gaps.append(f"{symbol}当前五档盘口不可得{f'：{reason}' if reason else ''}")
+                if reason == "market-specific order book not connected":
+                    reason = "当前市场未接入可靠的公开五档盘口"
+                boundary = f"当前五档盘口不可得{f'：{reason}' if reason else ''}"
+                order_book_boundaries.append({"security_id": held_security_id, "boundary": boundary})
+                if not (isinstance(execution, dict) and execution.get("available")):
+                    gaps.append(f"{symbol}{boundary}")
             if isinstance(execution, dict) and execution.get("available"):
                 execution_models.append({"security_id": held_security_id, **execution})
             else:
-                gaps.append(f"{symbol}交易成本代理未形成")
+                missing_inputs = "、".join(str(item) for item in (execution or {}).get("missing_inputs") or [])
+                gaps.append(
+                    f"{symbol}交易成本估算仍缺少{missing_inputs}"
+                    if missing_inputs else f"{symbol}交易成本估算所需公开数据暂不完整"
+                )
+            if not held_security_id.endswith(":FUND") and price_volume.get("rows"):
+                security_trend_metrics.append({
+                    "security_id": held_security_id,
+                    "name": str(pack.get("name") or symbol),
+                    **dict(price_volume.get("metrics") or summarize_price_volume_history(
+                        list(price_volume.get("rows") or [])
+                    )),
+                })
 
         value = {
             "current_order_book_snapshots": current_order_books,
+            "order_book_boundaries": order_book_boundaries,
             "execution_cost_models": execution_models,
+            "fund_disclosures": fund_disclosures,
+            "security_trend_metrics": security_trend_metrics,
             "fund_scale_history": list((fund_payload or {}).get("scale_history") or []),
             "systemic_liquidity_boundaries": {
                 "financing_conditions": "未建立统一、可核验的融资余额、融资利率与期限结构序列",
@@ -986,13 +1161,6 @@ class AppResearchSkillLayer:
                 "不能替代券商逐笔成交、冲击成本或系统性流动性压力测试。"
             ),
         }
-        gaps.extend(
-            [
-                "缺少统一融资条件与信用利差期限序列",
-                "缺少基金真实净申赎与可核验赎回压力",
-                "缺少历史逐笔盘口深度；当前五档不得外推为历史流动性",
-            ]
-        )
         return self._result("execution-liquidity-evidence", value, gaps, target)
 
     def _drawdown(self, payload: dict[str, object]) -> dict[str, object]:
@@ -1031,7 +1199,34 @@ class AppResearchSkillLayer:
                 }
                 for row in list(payload.get("periods") or [])
             ]
-            latest = periods[0] if periods else {}
+            annual_periods = [
+                row for row in periods if str(row.get("period_label") or "").endswith("FY")
+            ]
+            for index, row in enumerate(annual_periods):
+                previous = annual_periods[index + 1] if index + 1 < len(annual_periods) else {}
+                current_equity = row.get("stockholders_equity")
+                previous_equity = previous.get("stockholders_equity")
+                net_profit = row.get("parent_net_profit")
+                if (
+                    row.get("roe") is None
+                    and isinstance(net_profit, (int, float))
+                    and isinstance(current_equity, (int, float))
+                    and current_equity != 0
+                    and isinstance(previous_equity, (int, float))
+                    and previous_equity != 0
+                ):
+                    row["roe"] = net_profit / ((current_equity + previous_equity) / 2) * 100
+            required_fields = (
+                "revenue", "parent_net_profit", "roe", "gross_margin",
+                "debt_asset_ratio", "operating_cash_flow", "free_cash_flow",
+            )
+            latest = next(
+                (
+                    row for row in periods
+                    if sum(row.get(field) is not None for field in required_fields) >= 4
+                ),
+                periods[0] if periods else {},
+            )
             missing_fields = [
                 label
                 for field, label in (
@@ -1042,7 +1237,10 @@ class AppResearchSkillLayer:
                 if latest.get(field) is None
             ]
             if missing_fields:
-                gaps.append(f"{payload.get('name') or payload.get('symbol') or '公司'}最新报告期缺少：{'、'.join(missing_fields)}")
+                gaps.append(
+                    f"{payload.get('name') or payload.get('symbol') or '公司'}"
+                    f"最新可形成完整分析的报告期仍缺少：{'、'.join(missing_fields)}"
+                )
             upstream_pack = payload.get("stock_analysis_evidence_pack")
             if inherit_stock_analysis and upstream_pack is None:
                 try:
@@ -1081,6 +1279,13 @@ class AppResearchSkillLayer:
                     gaps.append(f"{symbol}：{error}")
                 continue
             upstream_symbol = f"{symbol}.HK" if security_id.startswith("HK:") else symbol
+            if security_id.startswith("HK:"):
+                try:
+                    payloads.append(fetch_hk_financial_snapshot(symbol))
+                except Exception as fallback_error:
+                    gaps.append(f"{symbol}：港股公开财务表暂不可得：{fallback_error}")
+                else:
+                    continue
             try:
                 pack = self._company_pack(upstream_symbol, as_of.isoformat())
             except Exception as error:
@@ -1108,7 +1313,29 @@ class AppResearchSkillLayer:
             gaps = [] if value.get("pe_ttm") is not None or value.get("pb") is not None else ["行情源未提供PE/PB"]
             symbol = security_id.split(":")[2]
             try:
-                financial = self._financial(symbol, target_trade_date())
+                if security_id.startswith("HK:"):
+                    financial = fetch_hk_valuation_financial_history(symbol)
+                    converted_periods = []
+                    for period in financial.get("periods") or []:
+                        rate = self._cny_rate("HKD", str(period.get("notice_date") or ""))
+                        hkd_to_cny = float(rate["rate"])
+                        converted_periods.append({
+                            **period,
+                            "basic_eps": (
+                                float(period["basic_eps"]) / hkd_to_cny
+                                if period.get("basic_eps") is not None else None
+                            ),
+                            "bps": (
+                                float(period["bps"]) / hkd_to_cny
+                                if period.get("bps") is not None else None
+                            ),
+                            "currency": "HKD",
+                            "fx_as_of": rate.get("as_of"),
+                            "hkd_to_cny": hkd_to_cny,
+                        })
+                    financial = {**financial, "periods": converted_periods}
+                else:
+                    financial = self._financial(symbol, target_trade_date())
                 history = fetch_security_trading_history(security_id, limit=1250)
                 historical = build_historical_valuation_series(financial, list(history.get("rows") or []))
             except Exception as error:
@@ -1127,8 +1354,6 @@ class AppResearchSkillLayer:
             except Exception as error:
                 peers = None
                 gaps.append(f"候选可比公司横截面暂不可得：{error}")
-            else:
-                gaps.append("已生成行业候选可比公司及同日估值；业务可比性仍需用户确认")
             value.update({
                 "historical_series": historical,
                 "historical_percentiles": {
@@ -1136,7 +1361,12 @@ class AppResearchSkillLayer:
                     "pb_reported_bps_percentile": _latest_percentile(historical, "pb_reported_bps"),
                     "sample_count": len(historical),
                 },
-                "historical_method": "取财报披露日或此前最近交易日的前复权收盘价；PE按累计EPS年化，PB按披露BPS计算。它是可复算代理序列，不冒充行情源历史TTM口径。",
+                "historical_method": (
+                    "港股年度指标采用次年6月30日作为保守公开可得日，并按该日港元兑人民币参考汇率换算；"
+                    "A股取财报披露日或此前最近交易日。PE按累计EPS年化，PB按披露BPS计算；均为可复算代理序列，不冒充行情源历史TTM口径。"
+                    if security_id.startswith("HK:")
+                    else "取财报披露日或此前最近交易日的前复权收盘价；PE按累计EPS年化，PB按披露BPS计算。它是可复算代理序列，不冒充行情源历史TTM口径。"
+                ),
                 "consensus_forecast": forecast,
                 "peer_valuations": peers,
             })
@@ -1954,7 +2184,9 @@ class AppResearchSkillLayer:
                     valuations.extend(
                         [item.get("value") for item in result.get("evidence") or [] if item.get("value")]
                     )
-                    valuation_gaps.extend(str(item) for item in result.get("gaps") or [])
+                    valuation_gaps.extend(
+                        f"{held_security_id}：{item}" for item in result.get("gaps") or []
+                    )
                 except Exception as error:
                     valuation_gaps.append(f"{held_security_id}：{error}")
             results.append(self._result(
@@ -1976,7 +2208,9 @@ class AppResearchSkillLayer:
                     supplements.extend(
                         [item.get("value") for item in result.get("evidence") or [] if item.get("value")]
                     )
-                    supplemental_gaps.extend(str(item) for item in result.get("gaps") or [])
+                    supplemental_gaps.extend(
+                        f"{held_security_id}：{item}" for item in result.get("gaps") or []
+                    )
                 except Exception as error:
                     supplemental_gaps.append(f"{held_security_id}：{error}")
             results.append(self._result(

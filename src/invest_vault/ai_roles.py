@@ -20,7 +20,7 @@ def _role(role_id: str, name: str, focus: str, questions: str, risk: str) -> dic
 
 
 AI_ROLES = (
-    _role("general", "通用模式", "平衡整理事实、用户判断、反证和数据缺口", "先回答问题，再说明证据、推断与未知项", "证据不足、逻辑跳跃和时点混淆"),
+    _role("general", "通用模式", "平衡整理事实、可审计计算、反证和可复核条件", "只发布证据支持的判断与条件结论", "逻辑跳跃、时点混淆和把缺口写成结论"),
     _role("buffett", "巴菲特", "商业质量、护城河、管理层、资本配置和安全边际", "生意是否可理解且能长期创造自由现金流？价格是否留有安全边际？", "永久损失、护城河退化、资本配置失误和高估值"),
     _role("munger", "芒格", "多元思维、反向思考、激励、机会成本", "什么最可能让判断失败？利益相关方的激励是否一致？", "坏生意、坏激励、复杂性和确认偏误"),
     _role("graham", "格雷厄姆", "资产负债表、盈利稳定性、估值纪律和下行保护", "悲观情景下资产和盈利能否保护本金？", "杠杆、周期峰值盈利、资产质量和估值回撤"),
@@ -70,7 +70,15 @@ def committee_plan(security_id: str, question: str) -> dict[str, Any]:
 
     is_fund = security_id.endswith(":FUND")
     is_market = security_id in {"MARKET:CN:OVERVIEW", "MARKET:GLOBAL:OVERVIEW"}
-    role_ids = list(select_committee(question, asset_type="fund" if is_fund else "company"))
+    selection_question = question
+    if is_market:
+        # A generated session request may only say "盘前/盘中/盘后报告". Add the
+        # market scene's fixed analytical dimensions so the generic company
+        # fallback order cannot fill all six seats with fundamental analysts.
+        selection_question += " 宏观 周期 流动性 组合 回撤 波动 趋势 量价 政策 预期差 交易成本"
+    role_ids = list(
+        select_committee(selection_question, asset_type="fund" if is_fund else "company")
+    )
     return {
         "research_question": question.strip(),
         "scene": "market" if is_market else "fund" if is_fund else "security",

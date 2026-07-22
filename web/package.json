@@ -1,7 +1,7 @@
 {
   "name": "invest-vault-web",
   "private": true,
-  "version": "0.3.34",
+  "version": "0.3.54",
   "type": "module",
   "scripts": {
     "dev": "vite",

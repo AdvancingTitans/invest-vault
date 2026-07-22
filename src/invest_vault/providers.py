@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import csv
+import gzip
 import html
+import io
 import json
 import math
 import re
@@ -85,19 +88,31 @@ def fetch_cny_exchange_rate(currency: str, on_date: date | str | None = None) ->
         return {"currency": "CNY", "rate": 1.0, "as_of": as_of, "source": "identity"}
     if normalized not in {"HKD", "USD", "JPY", "KRW"}:
         raise ValueError(f"暂不支持{normalized}兑人民币汇率")
-    url = f"https://api.frankfurter.app/{urllib.parse.quote(as_of)}?from={normalized}&to=CNY"
-    request = urllib.request.Request(url, headers={"User-Agent": "Invest-Vault/0.3"})
-    with urllib.request.urlopen(request, timeout=12) as response:  # nosec B310 - fixed HTTPS host
-        payload = json.loads(response.read().decode("utf-8"))
-    rate = (payload.get("rates") or {}).get("CNY")
-    if not isinstance(rate, (int, float)) or rate <= 0:
-        raise ValueError(f"{as_of}的{normalized}兑人民币汇率不可得")
+    end = date.fromisoformat(as_of)
+    start = end - timedelta(days=7)
+
+    def ecb_observation(unit: str) -> tuple[str, float]:
+        params = urllib.parse.urlencode({
+            "startPeriod": start.isoformat(), "endPeriod": end.isoformat(), "format": "csvdata",
+        })
+        url = f"https://data-api.ecb.europa.eu/service/data/EXR/D.{unit}.EUR.SP00.A?{params}"
+        rows = list(csv.DictReader(io.StringIO(_request(url).decode("utf-8", "replace"))))
+        valid = [row for row in rows if _number(row.get("OBS_VALUE")) not in (None, 0)]
+        if not valid:
+            raise ValueError(f"ECB未返回{unit}参考汇率")
+        latest = valid[-1]
+        return str(latest["TIME_PERIOD"]), float(latest["OBS_VALUE"])
+
+    currency_day, currency_per_eur = ecb_observation(normalized)
+    cny_day, cny_per_eur = ecb_observation("CNY")
+    rate = cny_per_eur / currency_per_eur
+    effective_day = min(currency_day, cny_day)
     return {
         "currency": normalized,
         "rate": float(rate),
-        "as_of": str(payload.get("date") or as_of),
-        "source": "Frankfurter/ECB reference rates",
-        "source_ref": url,
+        "as_of": effective_day,
+        "source": "欧洲央行参考汇率",
+        "source_ref": "https://data-api.ecb.europa.eu/service/data/EXR/",
     }
 
 
@@ -269,7 +284,11 @@ def _request(url: str) -> bytes:
         headers={"Referer": referer, "User-Agent": "Mozilla/5.0 InvestVault/0.1"},
     )
     with opener.open(request, timeout=6) as response:
-        return response.read()
+        payload = response.read()
+        # Some Eastmoney endpoints return gzip bytes without a usable
+        # Content-Encoding header. Detect the wire format so downstream JSON
+        # decoders always receive the original document bytes.
+        return gzip.decompress(payload) if payload.startswith(b"\x1f\x8b") else payload
 
 
 def _eastmoney_json(url: str, request: Callable[[str], bytes]) -> dict[str, Any]:
@@ -290,6 +309,51 @@ def _eastmoney_json(url: str, request: Callable[[str], bytes]) -> dict[str, Any]
                 time_module.sleep(0.8)
     assert last_error is not None
     raise last_error
+
+
+def _html_text(fragment: str) -> str:
+    value = re.sub(r"<br\s*/?>", " ", fragment, flags=re.IGNORECASE)
+    value = re.sub(r"<[^>]+>", "", value)
+    return re.sub(r"\s+", " ", html.unescape(value)).strip()
+
+
+def _html_table_rows(fragment: str) -> list[list[str]]:
+    rows: list[list[str]] = []
+    for row in re.findall(r"<tr\b[^>]*>(.*?)</tr>", fragment, flags=re.IGNORECASE | re.DOTALL):
+        cells = [
+            _html_text(cell)
+            for cell in re.findall(r"<t[dh]\b[^>]*>(.*?)</t[dh]>", row, flags=re.IGNORECASE | re.DOTALL)
+        ]
+        if cells:
+            rows.append(cells)
+    return rows
+
+
+def _html_section_table(document: str, heading: str) -> list[list[str]]:
+    start = -1
+    while True:
+        start = document.find(heading, start + 1)
+        if start < 0:
+            return []
+        table_start = document.find("<table", start)
+        if 0 <= table_start - start < 500:
+            table_end = document.find("</table>", table_start)
+            if table_end >= 0:
+                return _html_table_rows(document[table_start : table_end + len("</table>")])
+
+
+def _loose_number(value: object) -> float | None:
+    normalized = str(value or "").replace(",", "").replace("%", "").strip()
+    if normalized in {"", "--", "-", "—"}:
+        return None
+    negative = normalized.startswith("(") and normalized.endswith(")")
+    normalized = normalized.strip("()")
+    result = _number(normalized)
+    return -result if negative and result is not None else result
+
+
+def _etnet_url(page: str, symbol: str) -> str:
+    return f"https://www.etnet.com.hk/www/tc/stocks/realtime/{page}?code={symbol.zfill(5)}"
 
 
 def fetch_public_quote(symbol: str, request: Callable[[str], bytes] = _request) -> dict[str, object]:
@@ -405,14 +469,103 @@ def fetch_security_live_quote(
         }
 
 
+def fetch_hk_profit_forecast(
+    symbol: str,
+    request: Callable[[str], bytes] = _request,
+) -> dict[str, object]:
+    """Read a public Hong Kong broker-consensus table without inventing forecasts."""
+
+    if not re.fullmatch(r"\d{5}", symbol):
+        raise ValueError("港股盈利预测需要五位证券代码")
+    source_ref = _etnet_url("quote_profit.php", symbol)
+    document = request(source_ref).decode("utf-8", "replace")
+    consensus_rows = _html_section_table(document, "綜合盈利預測")
+    consensus = []
+    for cells in consensus_rows[1:]:
+        if len(cells) < 7 or not re.fullmatch(r"20\d{2}", cells[0]):
+            continue
+        consensus.append(
+            {
+                "year": int(cells[0]),
+                "parent_net_profit_million_cny": _loose_number(cells[1]),
+                "eps_cny": (
+                    round(float(eps_fen) / 100, 6)
+                    if (eps_fen := _loose_number(cells[2])) is not None
+                    else None
+                ),
+                "dividend_per_share_cny": (
+                    round(float(dividend_fen) / 100, 6)
+                    if (dividend_fen := _loose_number(cells[3])) is not None
+                    else None
+                ),
+                "book_value_per_share_cny": _loose_number(cells[4]),
+                "net_profit_high_million_cny": _loose_number(cells[5]),
+                "net_profit_low_million_cny": _loose_number(cells[6]),
+            }
+        )
+    detail_rows = _html_section_table(document, "盈利預測概覽")
+    revisions = []
+    for cells in detail_rows[1:]:
+        if len(cells) < 8 or not re.fullmatch(r"20\d{2}", cells[0]):
+            continue
+        date_text = cells[-1]
+        try:
+            publish_date = datetime.strptime(date_text, "%d/%m/%Y").date().isoformat()
+        except ValueError:
+            publish_date = date_text
+        revisions.append(
+            {
+                "year": int(cells[0]),
+                "parent_net_profit_million_cny": _loose_number(cells[1]),
+                "eps_cny": (
+                    round(float(eps_fen) / 100, 6)
+                    if (eps_fen := _loose_number(cells[2])) is not None
+                    else None
+                ),
+                "dividend_per_share_cny": (
+                    round(float(dividend_fen) / 100, 6)
+                    if (dividend_fen := _loose_number(cells[3])) is not None
+                    else None
+                ),
+                "institution": cells[4],
+                "rating": None if cells[5] == "--" else cells[5],
+                "target_price_hkd": _loose_number(cells[6]),
+                "publish_date": publish_date,
+            }
+        )
+    revisions.sort(key=lambda row: str(row["publish_date"]), reverse=True)
+    institutions = {str(row["institution"]) for row in revisions if row["institution"]}
+    if not consensus or not institutions:
+        raise ValueError("港股公开页面未返回可核验的一致预测样本")
+    latest = max((str(row["publish_date"]) for row in revisions), default="")
+    earliest = min((str(row["publish_date"]) for row in revisions), default="")
+    return {
+        "symbol": symbol,
+        "as_of": latest,
+        "consensus": consensus,
+        "revision_history": revisions[:60],
+        "coverage": {
+            "institutions": len(institutions),
+            "records": len(revisions),
+            "earliest": earliest or None,
+            "latest": latest or None,
+        },
+        "source": "经济通公开盈利预测",
+        "source_ref": source_ref,
+        "interpretation_boundary": "预测为公开券商样本汇总，不代表公司指引；币种、样本数、更新时间和预测区间须与结论同时呈现。",
+    }
+
+
 def fetch_profit_forecast(
     symbol: str,
     request: Callable[[str], bytes] = _request,
 ) -> dict[str, object]:
     """Read public F10 consensus forecasts and retain institution-level revisions."""
 
+    if re.fullmatch(r"\d{5}", symbol):
+        return fetch_hk_profit_forecast(symbol, request=request)
     if not re.fullmatch(r"\d{6}", symbol):
-        raise ValueError("盈利预测目前仅支持A股")
+        raise ValueError("盈利预测需要六位A股或五位港股证券代码")
     code = f"{'SH' if symbol.startswith(('5', '6', '9')) else 'SZ'}{symbol}"
     source_ref = f"https://emweb.securities.eastmoney.com/PC_HSF10/ProfitForecast/Index?code={code}"
     payload = json.loads(request(source_ref.replace("/Index?", "/PageAjax?")).decode("utf-8-sig"))
@@ -478,11 +631,218 @@ def fetch_profit_forecast(
     }
 
 
+def _etnet_market_cap_100m(value: str) -> float | None:
+    normalized = value.replace(",", "").strip()
+    match = re.fullmatch(r"([0-9.]+)(億|百萬|萬)?", normalized)
+    if not match:
+        return None
+    amount = float(match.group(1))
+    return amount if match.group(2) == "億" else amount / 100 if match.group(2) == "百萬" else amount / 10_000
+
+
+def fetch_hk_peer_valuations(
+    symbol: str,
+    request: Callable[[str], bytes] = _request,
+) -> dict[str, object]:
+    """Build a public Hong Kong same-industry peer set and score comparability."""
+
+    if not re.fullmatch(r"\d{5}", symbol):
+        raise ValueError("港股可比公司需要五位证券代码")
+    profile_ref = _etnet_url("quote_ci_brief.php", symbol)
+    profile = request(profile_ref).decode("utf-8", "replace")
+    industry_match = re.search(
+        r"industry_detail\.php\?nature=([A-Z]{3})&(?:amp;)?subtype=all[^>]*>(.*?)</a>",
+        profile,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    business_match = re.search(
+        r">主要業務</td><td[^>]*>(.*?)</td>", profile, flags=re.IGNORECASE | re.DOTALL
+    )
+    if not industry_match:
+        raise ValueError("港股公司背景未返回可核验的行业分类")
+    industry_code = industry_match.group(1).upper()
+    industry_name = _html_text(industry_match.group(2)).split(" (")[0]
+    primary_business = _html_text(business_match.group(1)) if business_match else ""
+    source_ref = (
+        "https://www.etnet.com.hk/www/tc/stocks/industry_detail.php?"
+        + urllib.parse.urlencode({"nature": industry_code, "subtype": "all"})
+    )
+    document = request(source_ref).decode("utf-8", "replace")
+    table_start = document.find("代號")
+    table_end = document.find("P/E Range為", table_start)
+    rows = _html_table_rows(document[table_start:table_end] if table_start >= 0 else "")
+    candidates = []
+    for cells in rows:
+        if len(cells) < 10 or not re.fullmatch(r"\d{5}", cells[0]):
+            continue
+        candidates.append(
+            {
+                "symbol": cells[0],
+                "name": cells[1],
+                "price": _loose_number(cells[3]),
+                "market_cap_100m": _etnet_market_cap_100m(cells[6]),
+                "currency": cells[7],
+                "dividend_yield_percent": _loose_number(cells[8]),
+                "pe_ttm": _loose_number(cells[9]),
+            }
+        )
+    target = next((row for row in candidates if row["symbol"] == symbol), None)
+    if target is None:
+        raise ValueError("港股行业横截面未包含目标公司")
+    target_cap = target.get("market_cap_100m")
+    peers = []
+    for row in candidates:
+        if row["symbol"] == symbol or str(row["symbol"]).startswith("8"):
+            continue
+        size_score = 0.0
+        market_cap = row.get("market_cap_100m")
+        if isinstance(target_cap, (int, float)) and isinstance(market_cap, (int, float)) and target_cap > 0 and market_cap > 0:
+            size_score = max(0.0, 30.0 - 15.0 * abs(math.log10(market_cap / target_cap)))
+        score = 50.0 + (10.0 if row.get("currency") == target.get("currency") else 0.0)
+        score += 10.0 if row.get("pe_ttm") is not None else 0.0
+        score += size_score
+        peers.append(
+            {
+                **row,
+                "comparability_score": round(score, 2),
+                "comparability_basis": ["同一公开业务类别", "市值规模接近度", "交易币种一致性", "同日PE可得性"],
+            }
+        )
+    peers.sort(key=lambda row: float(row["comparability_score"]), reverse=True)
+    peers = peers[:8]
+    if not peers:
+        raise ValueError("港股行业横截面未形成有效同行样本")
+    return {
+        "industry": industry_name,
+        "industry_code": industry_code,
+        "primary_business": primary_business,
+        "status": "system_assessed",
+        "rows": peers,
+        "source": "经济通港股公司背景与行业横截面",
+        "source_ref": source_ref,
+        "profile_source_ref": profile_ref,
+        "comparison_boundary": "系统按同一公开业务类别、市值规模接近度、交易币种及同日PE可得性评分；综合平台公司收入结构差异仍须在结论中保留，但无需用户确认。",
+    }
+
+
+def fetch_hk_valuation_financial_history(
+    symbol: str,
+    request: Callable[[str], bytes] = _request,
+) -> dict[str, object]:
+    """Read five annual HK EPS/BVPS observations for a look-ahead-safe valuation proxy."""
+
+    if not re.fullmatch(r"\d{5}", symbol):
+        raise ValueError("港股历史估值需要五位证券代码")
+    source_ref = _etnet_url("quote_ci_pl.php", symbol)
+    document = request(source_ref).decode("utf-8", "replace")
+    market_section = _html_section_table(document, "市場價值指標")
+    if not market_section:
+        raise ValueError("港股公开财务页未返回年度每股指标")
+    year_columns = [
+        (index, int(match.group(1)))
+        for index, cell in enumerate(market_section[0])
+        if (match := re.search(r"(20\d{2})/", cell))
+    ]
+    eps_row = next((row for row in market_section if row and row[0].startswith("每股盈利")), [])
+    bps_row = next((row for row in market_section if row and row[0].startswith("每股帳面資產淨值")), [])
+    if not year_columns or len(eps_row) <= year_columns[-1][0] or len(bps_row) <= year_columns[-1][0]:
+        raise ValueError("港股年度每股指标样本不足")
+    periods = []
+    for column, year in year_columns:
+        eps_fen = _loose_number(eps_row[column])
+        periods.append(
+            {
+                "period": f"{year}-12-31",
+                # Use the following 30 June as a conservative public-availability
+                # cutoff; this avoids treating year-end accounts as known early.
+                "notice_date": f"{year + 1}-06-30",
+                "basic_eps": round(float(eps_fen) / 100, 6) if eps_fen is not None else None,
+                "bps": _loose_number(bps_row[column]),
+                "currency": "CNY",
+            }
+        )
+    return {
+        "symbol": symbol,
+        "periods": periods,
+        "source": "经济通港股年度财务",
+        "source_ref": source_ref,
+        "availability_rule": "为避免前视偏差，年度每股指标统一自次年6月30日起进入历史估值代理；不冒充精确公告日。",
+    }
+
+
+def fetch_hk_financial_snapshot(
+    symbol: str,
+    request: Callable[[str], bytes] = _request,
+) -> dict[str, object]:
+    """Read the latest complete HK annual financial snapshot from public tables."""
+
+    if not re.fullmatch(r"\d{5}", symbol):
+        raise ValueError("港股财务快照需要五位证券代码")
+    pages = {
+        page: request(_etnet_url(page, symbol)).decode("utf-8", "replace")
+        for page in ("quote_ci_pl.php", "quote_ci_ratio.php", "quote_ci_cashflow.php")
+    }
+
+    def row_value(page: str, label: str) -> float | None:
+        row = next(
+            (cells for cells in _html_table_rows(pages[page]) if cells and cells[0].startswith(label)),
+            [],
+        )
+        return _loose_number(row[1]) if len(row) > 1 else None
+
+    year_match = re.search(r"(20\d{2})/12\s*-\s*末期", pages["quote_ci_pl.php"])
+    if not year_match:
+        raise ValueError("港股公开财务页未返回完整年度")
+    year = int(year_match.group(1))
+    operating_cash_flow = row_value("quote_ci_cashflow.php", "經營活動之現金流量")
+    investing_cash_flow = row_value("quote_ci_cashflow.php", "投資活動之現金流量")
+    free_cash_flow_lite = (
+        operating_cash_flow + investing_cash_flow
+        if operating_cash_flow is not None and investing_cash_flow is not None
+        else None
+    )
+    period = {
+        "period": f"{year}-12-31",
+        "period_label": f"{year} FY",
+        "notice_date": f"{year + 1}-06-30",
+        "revenue": row_value("quote_ci_pl.php", "營業額 / 收益"),
+        "parent_net_profit": row_value("quote_ci_pl.php", "股東應佔溢利"),
+        "basic_eps": (
+            round(float(eps_fen) / 100, 6)
+            if (eps_fen := row_value("quote_ci_pl.php", "每股盈利")) is not None
+            else None
+        ),
+        "bps": row_value("quote_ci_pl.php", "每股帳面資產淨值"),
+        "roe": row_value("quote_ci_ratio.php", "股東資金回報率"),
+        "gross_margin": row_value("quote_ci_ratio.php", "毛利率"),
+        "debt_asset_ratio": row_value("quote_ci_ratio.php", "總負債 / 總資產比率"),
+        "operating_cash_flow": operating_cash_flow,
+        "free_cash_flow": free_cash_flow_lite,
+        "free_cash_flow_lite": free_cash_flow_lite,
+        "currency": "CNY",
+        "amount_unit": "thousand_cny",
+        "free_cash_flow_method": "经营活动现金流加投资活动现金流；投资现金流包含投资买卖，作为保守现金余量代理，不冒充严格资本开支口径。",
+    }
+    return {
+        "security_id": f"HK:HKEX:{symbol}:STOCK",
+        "symbol": f"{symbol}.HK",
+        "name": "腾讯控股" if symbol == "00700" else symbol,
+        "periods": [period],
+        "source": "经济通港股公开财务表",
+        "source_ref": _etnet_url("quote_ci_pl.php", symbol),
+        "source_refs": [_etnet_url(page, symbol) for page in pages],
+        "verification_boundary": "聚合财务按次年6月30日作为保守公开可得日；关键结论仍应回到发行人或港交所原文复核。",
+    }
+
+
 def fetch_peer_valuations(
     symbol: str,
     request: Callable[[str], bytes] = _request,
 ) -> dict[str, object]:
-    """Propose a bounded same-sector peer set; the user remains the peer-set owner."""
+    """Build a scored same-industry peer set with explicit system judgement."""
+
+    if re.fullmatch(r"\d{5}", symbol):
+        return fetch_hk_peer_valuations(symbol, request=request)
 
     industry = fetch_stock_industry(symbol, request=request)
     classifications = list(industry.get("classification_rows") or [])
@@ -506,28 +866,44 @@ def fetch_peer_valuations(
     payload = _eastmoney_json(url, request)
     raw = (payload.get("data") or {}).get("diff") or []
     rows = list(raw.values()) if isinstance(raw, dict) else list(raw)
-    peers = [
-        {
+    target_market_cap = next(
+        (_number(row.get("f20")) for row in rows if str(row.get("f12") or "") == symbol), None
+    )
+    peers = []
+    for row in rows:
+        peer_symbol = str(row.get("f12") or "")
+        peer_name = str(row.get("f14") or "")
+        if peer_symbol == symbol or not peer_name:
+            continue
+        market_cap = _number(row.get("f20"))
+        pe = _number(row.get("f9"))
+        pb = _number(row.get("f23"))
+        size_score = 0.0
+        if target_market_cap and market_cap and target_market_cap > 0 and market_cap > 0:
+            size_score = max(0.0, 30.0 - 15.0 * abs(math.log10(market_cap / target_market_cap)))
+        score = 50.0 + (10.0 if pe is not None else 0.0) + (10.0 if pb is not None else 0.0) + size_score
+        peers.append({
             "symbol": str(row.get("f12") or ""),
             "name": str(row.get("f14") or ""),
             "price": _number(row.get("f2")),
             "pe_dynamic": _number(row.get("f9")),
             "pb": _number(row.get("f23")),
-            "market_cap": _number(row.get("f20")),
-        }
-        for row in rows
-        if str(row.get("f12") or "") != symbol and str(row.get("f14") or "")
-    ][:8]
+            "market_cap": market_cap,
+            "comparability_score": round(score, 2),
+            "comparability_basis": ["同一公开行业分类", "市值规模接近度", "同日PE/PB可得性"],
+        })
+    peers.sort(key=lambda row: float(row["comparability_score"]), reverse=True)
+    peers = peers[:8]
     if not peers:
         raise ValueError("行业候选可比公司返回为空")
     return {
         "industry": industry.get("industry"),
         "sector_code": sector_code,
-        "status": "provisional_requires_user_confirmation",
+        "status": "system_assessed",
         "rows": peers,
         "source": "东方财富行业成分当前估值",
         "source_ref": f"https://quote.eastmoney.com/center/boardlist.html#boards-{sector_code}",
-        "comparison_boundary": "这是按当前行业分类和市值生成的候选集合；用户确认业务可比性后才能升级为正式可比公司横截面。",
+        "comparison_boundary": "系统按同一公开行业分类、市值规模接近度及同日估值可得性评分；业务模式或收入结构差异已作为可比性边界，不要求用户确认，也不把低分同行用于强结论。",
     }
 
 
@@ -538,6 +914,48 @@ def fetch_company_supplemental_evidence(
     request: Callable[[str], bytes] = _request,
 ) -> dict[str, object]:
     """Collect bounded official operating/management facts plus sourced topic leads."""
+
+    if re.fullmatch(r"\d{5}", symbol):
+        source_ref = _etnet_url("quote_ci_brief.php", symbol)
+        document = request(source_ref).decode("utf-8", "replace")
+        rows = _html_table_rows(document)
+        business = next((row[1] for row in rows if len(row) > 1 and row[0] == "主要業務"), "")
+        chair = next((row[1] for row in rows if len(row) > 1 and row[0] == "主席名稱"), "")
+        board = next((row[1:] for row in rows if len(row) > 1 and row[0] == "董事會成員名單"), [])
+        searches = []
+        for topic, terms in (
+            ("资本配置与股东回报", ("回购", "分红")),
+            ("业务与竞争", ("业务", "竞争")),
+            ("治理与关联交易", ("治理", "关联交易")),
+        ):
+            items, errors = [], []
+            for term in terms:
+                try:
+                    result = fetch_public_news(f"{name} {term}", size=8, request=request)
+                except Exception as error:
+                    errors.append(str(error))
+                else:
+                    items.extend(result.get("items") or [])
+            searches.append({
+                "topic": topic,
+                "items": list({str(item.get("url") or item.get("title")): item for item in items}.values())[:16],
+                "errors": errors,
+            })
+        official_sections = [
+            {"topic": "主要业务", "items": [{"description": business}] if business else [], "source_ref": source_ref},
+            {
+                "topic": "董事会与管理层",
+                "items": ([{"chair": chair}] if chair else []) + ([{"board": board}] if board else []),
+                "source_ref": source_ref,
+            },
+        ]
+        return {
+            "official_sections": official_sections,
+            "topic_searches": searches,
+            "source": "经济通港股公司背景与带链接公开资讯",
+            "source_ref": source_ref,
+            "verification_boundary": "公司背景页用于核对主要业务和现任治理结构；资本配置、薪酬考核与关联交易结论仍回到发行人或港交所公告原文。",
+        }
 
     code = f"{'SH' if symbol.startswith(('5', '6', '9')) else 'SZ'}{symbol}"
     base = "https://emweb.securities.eastmoney.com/PC_HSF10"
@@ -659,23 +1077,65 @@ def fetch_security_trading_history(
     else:
         raise ValueError("该市场交易历史尚未通过稳定性验证")
     params = urllib.parse.urlencode({"param": f"{provider_code},day,,,{limit},qfq"})
-    payload = json.loads(
-        request(f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?{params}").decode("utf-8")
-    )
-    data = (payload.get("data") or {}).get(provider_code) or {}
-    raw_rows = data.get("qfqday") or data.get("day") or []
-    rows = [
-        {
-            "date": str(row[0]),
-            "open": _number(row[1]),
-            "close": _number(row[2]),
-            "high": _number(row[3]) if len(row) > 3 else None,
-            "low": _number(row[4]) if len(row) > 4 else None,
-            "volume": _number(row[5]) if len(row) > 5 else None,
-        }
-        for row in raw_rows
-        if len(row) > 2 and _number(row[2]) not in (None, 0)
-    ][-limit:]
+    tencent_ref = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?{params}"
+    try:
+        payload = json.loads(request(tencent_ref).decode("utf-8"))
+        data = (payload.get("data") or {}).get(provider_code) or {}
+        raw_rows = data.get("qfqday") or data.get("day") or []
+        rows = [
+            {
+                "date": str(row[0]),
+                "open": _number(row[1]),
+                "close": _number(row[2]),
+                "high": _number(row[3]) if len(row) > 3 else None,
+                "low": _number(row[4]) if len(row) > 4 else None,
+                "volume": _number(row[5]) if len(row) > 5 else None,
+            }
+            for row in raw_rows
+            if len(row) > 2 and _number(row[2]) not in (None, 0)
+        ][-limit:]
+    except Exception:
+        data, rows = {}, []
+    source = "腾讯前复权日线"
+    source_ref = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+    if len(rows) < 2 or not any(row.get("amount") for row in rows):
+        primary_rows = rows
+        primary_source_ref = source_ref
+        secid = f"{116 if region == 'HK' else 1 if symbol.startswith(('5', '6', '9')) else 0}.{symbol}"
+        query = urllib.parse.urlencode(
+            {
+                "secid": secid,
+                "fields1": "f1,f2,f3,f4,f5,f6",
+                "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+                "klt": 101,
+                "fqt": 1,
+                "end": 20500101,
+                "lmt": min(max(limit, 2), 2000),
+            }
+        )
+        source_ref = f"https://push2his.eastmoney.com/api/qt/stock/kline/get?{query}"
+        payload = _eastmoney_json(source_ref, request)
+        eastmoney_data = payload.get("data") or {}
+        fallback_rows = [
+            {
+                "date": fields[0],
+                "open": _number(fields[1]),
+                "close": _number(fields[2]),
+                "high": _number(fields[3]),
+                "low": _number(fields[4]),
+                "volume": _number(fields[5]),
+                "amount": _number(fields[6]),
+            }
+            for item in eastmoney_data.get("klines") or []
+            if len(fields := str(item).split(",")) >= 7 and _number(fields[2]) not in (None, 0)
+        ][-limit:]
+        if len(fallback_rows) >= 2:
+            rows = fallback_rows
+            data = {"qt": {provider_code: [None, eastmoney_data.get("name")]}}
+            source = "东方财富前复权日线"
+        else:
+            rows = primary_rows
+            source_ref = primary_source_ref
     if len(rows) < 2:
         raise ValueError("交易历史样本不足")
     quote_fields = (data.get("qt") or {}).get(provider_code) or []
@@ -685,8 +1145,8 @@ def fetch_security_trading_history(
         "rows": rows,
         "sample_count": len(rows),
         "as_of": rows[-1]["date"],
-        "source": "腾讯前复权日线",
-        "source_ref": "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get",
+        "source": source,
+        "source_ref": source_ref,
     }
 
 
@@ -999,6 +1459,40 @@ def fetch_fund_snapshot(
     )[:5]
     result["data_gaps"] = data_gaps
     return result
+
+
+def fetch_fund_redemption_fee_schedule(
+    symbol: str,
+    request: Callable[[str], bytes] = _request,
+) -> dict[str, object]:
+    """Return the published holding-period redemption schedule for an open-ended fund."""
+
+    if not re.fullmatch(r"\d{6}", symbol):
+        raise ValueError("基金代码格式无效")
+    source_ref = f"https://fundf10.eastmoney.com/jjfl_{symbol}.html"
+    body = request(source_ref)
+    text = body.decode("utf-8", "replace")
+    section = re.search(
+        r"赎回费率.*?<tbody>(.*?)</tbody>", text, flags=re.IGNORECASE | re.DOTALL
+    )
+    rows = []
+    if section:
+        for raw_row in re.findall(r"<tr[^>]*>(.*?)</tr>", section.group(1), re.IGNORECASE | re.DOTALL):
+            cells = [
+                _html_text(cell)
+                for cell in re.findall(r"<td[^>]*>(.*?)</td>", raw_row, re.IGNORECASE | re.DOTALL)
+            ]
+            if len(cells) >= 2 and (rate := _loose_number(cells[1])) is not None:
+                rows.append({"holding_period": cells[0], "redemption_fee_percent": rate})
+    if not rows:
+        raise ValueError("公开费率页未返回可核验赎回费率期限表")
+    return {
+        "symbol": symbol,
+        "rows": rows,
+        "source": "东方财富基金费率公开页",
+        "source_ref": source_ref,
+        "calculation_note": "实际赎回费率按基金份额持有期限及先进先出规则匹配。",
+    }
 
 
 def fetch_stock_industry(
@@ -2192,11 +2686,20 @@ def fetch_global_index_price_volume(
 
     results: dict[str, dict[str, object]] = {}
     us_symbols = {"usINX": ".INX", "usIXIC": ".IXIC", "usDJI": ".DJI"}
+    eastmoney_secids = {
+        "sh000001": "1.000001", "sz399001": "0.399001", "sz399006": "0.399006",
+        "sh000300": "1.000300", "sh000688": "1.000688", "sz399005": "0.399005",
+        "bj899050": "0.899050", "hkHSI": "100.HSI", "hkHSCEI": "100.HSCEI",
+        "hkHSTECH": "124.HSTECH",
+    }
     for code, name, market, _currency in GLOBAL_INDEX_CODES:
         params = urllib.parse.urlencode({"param": f"{code},day,,,{limit},qfq"})
-        payload = json.loads(
-            request(f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?{params}").decode("utf-8")
-        )
+        try:
+            payload = json.loads(
+                request(f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?{params}").decode("utf-8")
+            )
+        except Exception:
+            payload = {}
         data = (payload.get("data") or {}).get(code) or {}
         raw_rows = data.get("qfqday") or data.get("day") or []
         rows = [
@@ -2214,6 +2717,33 @@ def fetch_global_index_price_volume(
         ][-limit:]
         source = "腾讯指数日线"
         source_ref = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+        if len(rows) < 2 and code in eastmoney_secids:
+            query = urllib.parse.urlencode(
+                {
+                    "secid": eastmoney_secids[code],
+                    "fields1": "f1,f2,f3,f4,f5,f6",
+                    "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+                    "klt": 101,
+                    "fqt": 1,
+                    "end": 20500101,
+                    "lmt": limit,
+                }
+            )
+            source_ref = f"https://push2his.eastmoney.com/api/qt/stock/kline/get?{query}"
+            try:
+                fallback = _eastmoney_json(source_ref, request)
+            except Exception:
+                fallback = {}
+            rows = [
+                {
+                    "date": fields[0], "open": _number(fields[1]), "close": _number(fields[2]),
+                    "high": _number(fields[3]), "low": _number(fields[4]),
+                    "volume": _number(fields[5]), "amount": _number(fields[6]),
+                }
+                for item in ((fallback.get("data") or {}).get("klines") or [])
+                if len(fields := str(item).split(",")) >= 7 and _number(fields[2]) not in (None, 0)
+            ][-limit:]
+            source = "东方财富指数日线"
         if len(rows) < 2 and code == "bj899050":
             try:
                 query = urllib.parse.urlencode(

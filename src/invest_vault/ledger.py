@@ -493,7 +493,274 @@ class Vault:
                     (session, f"% {session}报告（%", f"行情阶段%{session}%"),
                 )
             self.connection.execute("INSERT INTO schema_migrations(version) VALUES (14)")
+        self._migrate_research_pipeline_v15()
+        self._migrate_research_performance_v16()
         self.connection.commit()
+
+    def _migrate_research_pipeline_v15(self) -> None:
+        """Add durable checkpoints for the packetized research pipeline."""
+        # Plan P0-P3: persist complete evidence, incremental expert state, claims,
+        # report sections, and per-call observability without changing legacy tables.
+        self.connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS research_evidence_records (
+                evidence_id TEXT PRIMARY KEY,
+                security_id TEXT,
+                domain TEXT NOT NULL,
+                subtype TEXT NOT NULL,
+                entity_id TEXT,
+                as_of TEXT,
+                observed_at TEXT NOT NULL,
+                source_tier TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                source_ref TEXT NOT NULL,
+                quality_status TEXT NOT NULL,
+                value_json TEXT NOT NULL,
+                compact_text TEXT NOT NULL,
+                token_estimate INTEGER NOT NULL CHECK (token_estimate >= 0),
+                content_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(content_hash)
+            );
+            CREATE INDEX IF NOT EXISTS research_evidence_records_run_domain
+            ON research_evidence_records(domain, observed_at DESC);
+
+            CREATE TABLE IF NOT EXISTS research_evidence_packets (
+                packet_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                role_id TEXT NOT NULL,
+                sequence_number INTEGER NOT NULL CHECK (sequence_number >= 0),
+                objective TEXT NOT NULL,
+                required_outputs_json TEXT NOT NULL,
+                evidence_ids_json TEXT NOT NULL,
+                known_gaps_json TEXT NOT NULL,
+                token_estimate INTEGER NOT NULL CHECK (token_estimate >= 0),
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(run_id, role_id, sequence_number),
+                FOREIGN KEY (run_id) REFERENCES research_runs(run_id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS research_evidence_packets_run_status
+            ON research_evidence_packets(run_id, status, role_id);
+
+            CREATE TABLE IF NOT EXISTS research_expert_states (
+                state_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                role_id TEXT NOT NULL,
+                revision INTEGER NOT NULL CHECK (revision >= 0),
+                processed_packet_id TEXT,
+                state_json TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(run_id, role_id, revision),
+                FOREIGN KEY (run_id) REFERENCES research_runs(run_id) ON DELETE CASCADE,
+                FOREIGN KEY (processed_packet_id) REFERENCES research_evidence_packets(packet_id)
+                    ON DELETE SET NULL
+            );
+            CREATE INDEX IF NOT EXISTS research_expert_states_latest
+            ON research_expert_states(run_id, role_id, revision DESC);
+
+            CREATE TABLE IF NOT EXISTS research_claims (
+                claim_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                claim_key TEXT NOT NULL,
+                role_id TEXT NOT NULL,
+                topic TEXT NOT NULL,
+                claim_text TEXT NOT NULL,
+                status TEXT NOT NULL,
+                confidence TEXT NOT NULL,
+                supporting_evidence_ids_json TEXT NOT NULL,
+                contradicting_evidence_ids_json TEXT NOT NULL,
+                conditions_json TEXT NOT NULL,
+                as_of TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(run_id, claim_key),
+                FOREIGN KEY (run_id) REFERENCES research_runs(run_id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS research_claims_run_topic
+            ON research_claims(run_id, topic, status);
+
+            CREATE TABLE IF NOT EXISTS research_claim_boards (
+                board_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                revision INTEGER NOT NULL CHECK (revision >= 1),
+                board_json TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(run_id, revision),
+                FOREIGN KEY (run_id) REFERENCES research_runs(run_id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS research_claim_conflicts (
+                conflict_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                claim_key TEXT NOT NULL,
+                supporting_evidence_ids_json TEXT NOT NULL,
+                contradicting_evidence_ids_json TEXT NOT NULL,
+                roles_json TEXT NOT NULL,
+                resolved INTEGER NOT NULL DEFAULT 0 CHECK (resolved IN (0, 1)),
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(run_id, claim_key),
+                FOREIGN KEY (run_id) REFERENCES research_runs(run_id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS research_risk_reviews (
+                review_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL UNIQUE,
+                state_json TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (run_id) REFERENCES research_runs(run_id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS research_report_sections (
+                section_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                section_key TEXT NOT NULL,
+                sequence_number INTEGER NOT NULL CHECK (sequence_number >= 0),
+                title TEXT NOT NULL,
+                status TEXT NOT NULL,
+                input_json TEXT NOT NULL,
+                output_json TEXT,
+                rendered_markdown TEXT,
+                attempt INTEGER NOT NULL DEFAULT 0 CHECK (attempt >= 0),
+                error_json TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                completed_at TEXT,
+                UNIQUE(run_id, section_key),
+                UNIQUE(run_id, sequence_number),
+                FOREIGN KEY (run_id) REFERENCES research_runs(run_id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS research_report_sections_run_status
+            ON research_report_sections(run_id, status, sequence_number);
+
+            CREATE TABLE IF NOT EXISTS research_call_metrics (
+                metric_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                task_id TEXT,
+                stage TEXT NOT NULL,
+                role_id TEXT,
+                section_key TEXT,
+                provider_type TEXT NOT NULL,
+                model TEXT NOT NULL,
+                input_tokens INTEGER CHECK (input_tokens IS NULL OR input_tokens >= 0),
+                system_tokens INTEGER CHECK (system_tokens IS NULL OR system_tokens >= 0),
+                evidence_tokens INTEGER CHECK (evidence_tokens IS NULL OR evidence_tokens >= 0),
+                schema_tokens INTEGER CHECK (schema_tokens IS NULL OR schema_tokens >= 0),
+                output_tokens INTEGER CHECK (output_tokens IS NULL OR output_tokens >= 0),
+                reasoning_tokens INTEGER CHECK (reasoning_tokens IS NULL OR reasoning_tokens >= 0),
+                estimated_input_tokens INTEGER
+                    CHECK (estimated_input_tokens IS NULL OR estimated_input_tokens >= 0),
+                evidence_count INTEGER CHECK (evidence_count IS NULL OR evidence_count >= 0),
+                domain_tokens_json TEXT NOT NULL DEFAULT '{}',
+                latency_ms INTEGER CHECK (latency_ms IS NULL OR latency_ms >= 0),
+                timed_out INTEGER NOT NULL DEFAULT 0 CHECK (timed_out IN (0, 1)),
+                skill_invoked INTEGER NOT NULL DEFAULT 0 CHECK (skill_invoked IN (0, 1)),
+                cited_evidence_count INTEGER
+                    CHECK (cited_evidence_count IS NULL OR cited_evidence_count >= 0),
+                available_evidence_count INTEGER
+                    CHECK (available_evidence_count IS NULL OR available_evidence_count >= 0),
+                framework_coverage_json TEXT,
+                covered_expert_count INTEGER
+                    CHECK (covered_expert_count IS NULL OR covered_expert_count >= 0),
+                error_json TEXT,
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (run_id) REFERENCES research_runs(run_id) ON DELETE CASCADE,
+                FOREIGN KEY (task_id) REFERENCES research_tasks(task_id) ON DELETE SET NULL
+            );
+            CREATE INDEX IF NOT EXISTS research_call_metrics_run_stage
+            ON research_call_metrics(run_id, stage, created_at);
+            """
+        )
+        self.connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (15)")
+
+    def _migrate_research_performance_v16(self) -> None:
+        """Add run/node performance observability without rewriting v15 research data."""
+
+        if self.connection.execute(
+            "SELECT 1 FROM schema_migrations WHERE version = 16"
+        ).fetchone() is not None:
+            return
+
+        metric_columns = {
+            str(row["name"])
+            for row in self.connection.execute("PRAGMA table_info(research_call_metrics)")
+        }
+        additions = (
+            ("node_id", "TEXT"),
+            ("token_budget", "INTEGER CHECK (token_budget IS NULL OR token_budget >= 0)"),
+            ("retry_count", "INTEGER NOT NULL DEFAULT 0 CHECK (retry_count >= 0)"),
+            ("usage_source", "TEXT NOT NULL DEFAULT 'estimated'"),
+            (
+                "estimated_system_tokens",
+                "INTEGER CHECK (estimated_system_tokens IS NULL OR estimated_system_tokens >= 0)",
+            ),
+            (
+                "estimated_context_tokens",
+                "INTEGER CHECK (estimated_context_tokens IS NULL OR estimated_context_tokens >= 0)",
+            ),
+            (
+                "estimated_output_tokens",
+                "INTEGER CHECK (estimated_output_tokens IS NULL OR estimated_output_tokens >= 0)",
+            ),
+        )
+        for name, definition in additions:
+            if name not in metric_columns:
+                self.connection.execute(
+                    f"ALTER TABLE research_call_metrics ADD COLUMN {name} {definition}"
+                )
+
+        self.connection.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS research_call_metrics_run_stage_node
+            ON research_call_metrics(run_id, stage, node_id, created_at);
+
+            CREATE TABLE IF NOT EXISTS research_performance_summaries (
+                run_id TEXT PRIMARY KEY,
+                evidence_count INTEGER NOT NULL DEFAULT 0 CHECK (evidence_count >= 0),
+                domain_distribution_json TEXT NOT NULL DEFAULT '{}',
+                unused_evidence_count INTEGER NOT NULL DEFAULT 0
+                    CHECK (unused_evidence_count >= 0),
+                cited_evidence_count INTEGER NOT NULL DEFAULT 0
+                    CHECK (cited_evidence_count >= 0),
+                citation_rate REAL CHECK (
+                    citation_rate IS NULL OR (citation_rate >= 0 AND citation_rate <= 1)
+                ),
+                packet_count INTEGER NOT NULL DEFAULT 0 CHECK (packet_count >= 0),
+                semantic_revision_count INTEGER NOT NULL DEFAULT 0
+                    CHECK (semantic_revision_count >= 0),
+                duration_ms INTEGER CHECK (duration_ms IS NULL OR duration_ms >= 0),
+                retry_count INTEGER NOT NULL DEFAULT 0 CHECK (retry_count >= 0),
+                section_count INTEGER NOT NULL DEFAULT 0 CHECK (section_count >= 0),
+                section_llm_call_count INTEGER NOT NULL DEFAULT 0
+                    CHECK (section_llm_call_count >= 0),
+                final_context_tokens INTEGER
+                    CHECK (final_context_tokens IS NULL OR final_context_tokens >= 0),
+                completion_status TEXT NOT NULL DEFAULT 'pending',
+                usage_source TEXT NOT NULL DEFAULT 'estimated',
+                failure_stage TEXT,
+                failure_agent TEXT,
+                failure_node_id TEXT,
+                failure_provider TEXT,
+                failure_token_estimate INTEGER CHECK (
+                    failure_token_estimate IS NULL OR failure_token_estimate >= 0
+                ),
+                failure_token_budget INTEGER CHECK (
+                    failure_token_budget IS NULL OR failure_token_budget >= 0
+                ),
+                failure_json TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (run_id) REFERENCES research_runs(run_id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS research_performance_summaries_status
+            ON research_performance_summaries(completion_status, updated_at);
+            """
+        )
+        self.connection.execute("INSERT INTO schema_migrations(version) VALUES (16)")
 
     def _purge_legacy_deleted_records(self) -> None:
         """Remove tombstones created before explicit deletion became permanent."""
@@ -518,6 +785,15 @@ class Vault:
             )
         ]
         for note_id in deleted_notes:
+            evidence_prefix = f"EVIDENCE-NOTE-{note_id}%"
+            connection.execute(
+                "DELETE FROM research_evidence_links WHERE evidence_id LIKE ?",
+                (evidence_prefix,),
+            )
+            connection.execute(
+                "DELETE FROM research_evidence_records WHERE evidence_id LIKE ?",
+                (evidence_prefix,),
+            )
             connection.execute("DELETE FROM ai_quick_notes WHERE accepted_note_id = ?", (note_id,))
             connection.execute("DELETE FROM attachments WHERE note_id = ?", (note_id,))
             connection.execute("DELETE FROM note_material_refs WHERE note_id = ?", (note_id,))

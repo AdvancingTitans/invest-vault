@@ -163,6 +163,17 @@ class ResearchStore:
         connection = self.vault.connection
         connection.execute("BEGIN IMMEDIATE")
         try:
+            # Plan P1: user-authored evidence is a derived local copy and must
+            # follow the source note's existing permanent-deletion semantics.
+            evidence_prefix = f"EVIDENCE-NOTE-{note_id}%"
+            connection.execute(
+                "DELETE FROM research_evidence_links WHERE evidence_id LIKE ?",
+                (evidence_prefix,),
+            )
+            connection.execute(
+                "DELETE FROM research_evidence_records WHERE evidence_id LIKE ?",
+                (evidence_prefix,),
+            )
             connection.execute("DELETE FROM ai_quick_notes WHERE accepted_note_id = ?", (note_id,))
             connection.execute("DELETE FROM attachments WHERE note_id = ?", (note_id,))
             connection.execute("DELETE FROM note_material_refs WHERE note_id = ?", (note_id,))

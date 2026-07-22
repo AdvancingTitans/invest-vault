@@ -35,6 +35,22 @@ def test_deleting_a_note_removes_revisions_timeline_and_attachment_file(tmp_path
                 "SELECT storage_path FROM attachments WHERE note_id = ?", (note_id,)
             ).fetchone()[0]
         )
+        evidence_id = f"EVIDENCE-NOTE-{note_id}"
+        vault.connection.execute(
+            """INSERT INTO research_evidence_records
+            (evidence_id, security_id, domain, subtype, entity_id, as_of, observed_at,
+             source_tier, provider, source_ref, quality_status, value_json, compact_text,
+             token_estimate, content_hash)
+            VALUES (?, 'CN:SSE:600519:STOCK', 'user-judgement', 'note', NULL, NULL,
+                    '2026-07-22T00:00:00Z', 'user_authored', 'Invest Vault本地笔记', '',
+                    'available', '{"body":"修订笔记"}', '用户笔记：修订笔记', 8, ?)""",
+            (evidence_id, f"hash-{note_id}"),
+        )
+        vault.connection.execute(
+            "INSERT INTO research_evidence_links VALUES ('run-test', NULL, ?, 'available')",
+            (evidence_id,),
+        )
+        vault.connection.commit()
 
         research.delete_note(note_id)
 
@@ -42,6 +58,14 @@ def test_deleting_a_note_removes_revisions_timeline_and_attachment_file(tmp_path
         assert vault.connection.execute("SELECT COUNT(*) FROM notes WHERE note_id = ?", (note_id,)).fetchone()[0] == 0
         assert vault.connection.execute("SELECT COUNT(*) FROM note_revisions WHERE note_id = ?", (note_id,)).fetchone()[0] == 0
         assert vault.connection.execute("SELECT COUNT(*) FROM timeline_events WHERE reference_id = ?", (note_id,)).fetchone()[0] == 0
+        assert vault.connection.execute(
+            "SELECT COUNT(*) FROM research_evidence_records WHERE evidence_id LIKE ?",
+            (f"{evidence_id}%",),
+        ).fetchone()[0] == 0
+        assert vault.connection.execute(
+            "SELECT COUNT(*) FROM research_evidence_links WHERE evidence_id LIKE ?",
+            (f"{evidence_id}%",),
+        ).fetchone()[0] == 0
 
 
 def test_backup_restore_and_markdown_export_are_verifiable(tmp_path: Path) -> None:
